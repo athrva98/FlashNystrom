@@ -88,9 +88,21 @@ kernel1_bwd_tc(
     Element* sKt_ptr = sQ_ptr  + Traits::kSmemQElems;
     Element* sdO_ptr = sKt_ptr + Traits::kSmemKVElems;
     Element* sS2_ptr = sdO_ptr + Traits::kSmemQElems;
+    // sP and sdS overlay sS2's space (sS2 is no longer needed after GEMM2)
+    // sS2 has kSmemKVElems elems = 64*D. sP+sdS need 2*cosize(SmemLayoutPdS) = 2*64*64.
+    // For D>=64: 64*D >= 2*64*64 iff D >= 128. For D=64: 64*64 < 2*64*64, need separate.
     int kPdSElems = static_cast<int>(cosize(typename Traits::SmemLayoutPdS{}));
-    Element* sP_ptr  = sS2_ptr + Traits::kSmemKVElems;
-    Element* sdS_ptr = sP_ptr  + kPdSElems;
+    Element* sP_ptr;
+    Element* sdS_ptr;
+    if constexpr (Traits::kHeadDim >= 128) {
+        // overlay on sS2 (saves 2*kPdSElems elems = 16KB)
+        sP_ptr  = sS2_ptr;
+        sdS_ptr = sS2_ptr + kPdSElems;
+    } else {
+        // D=64: sS2 too small, allocate after
+        sP_ptr  = sS2_ptr + Traits::kSmemKVElems;
+        sdS_ptr = sP_ptr  + kPdSElems;
+    }
 
     auto sQ  = make_tensor(make_smem_ptr(sQ_ptr),  typename Traits::SmemLayoutQ{});
     auto sKt = make_tensor(make_smem_ptr(sKt_ptr), typename Traits::SmemLayoutKV{});
@@ -112,7 +124,13 @@ kernel1_bwd_tc(
     auto sdStNS = make_tensor(sdS.data().get(), typename Traits::SmemLayoutPdStransposedNoSwizzle{});
 
     // Zero-init SMEM
-    int total_elems = Traits::kSmemQElems*2 + Traits::kSmemKVElems*2 + kPdSElems*2;
+    int total_elems;
+    if constexpr (Traits::kHeadDim >= 128) {
+        // sP+sdS overlay sS2, so total = sQ + sKt + sdO + sS2 (sP/sdS inside sS2)
+        total_elems = Traits::kSmemQElems*2 + Traits::kSmemKVElems*2;
+    } else {
+        total_elems = Traits::kSmemQElems*2 + Traits::kSmemKVElems*2 + kPdSElems*2;
+    }
     for (int i = tidx; i < total_elems; i += Traits::kNThreads)
         reinterpret_cast<Element*>(smem_)[i] = Element(0);
     __syncthreads();
@@ -300,7 +318,12 @@ void launch_kernel1_bwd(
             dim3 grid((N+Traits::kBlockM-1)/Traits::kBlockM, BH);
             dim3 block(Traits::kNThreads);
             int kPdS = static_cast<int>(cosize(typename Traits::SmemLayoutPdS{}));
-            size_t smem = (Traits::kSmemQElems*2 + Traits::kSmemKVElems*2 + kPdS*2) * sizeof(scalar_t);
+            size_t smem;
+            if constexpr (kHeadDim >= 128) {
+                smem = (Traits::kSmemQElems*2 + Traits::kSmemKVElems*2) * sizeof(scalar_t);
+            } else {
+                smem = (Traits::kSmemQElems*2 + Traits::kSmemKVElems*2 + kPdS*2) * sizeof(scalar_t);
+            }
             if (smem > 48*1024) {
                 FN_CHECK(smem <= get_max_smem_per_block(), "kernel1_bwd: smem");
                 FN_CUDA_CHECK(cudaFuncSetAttribute(kernel1_bwd_tc<Traits>,

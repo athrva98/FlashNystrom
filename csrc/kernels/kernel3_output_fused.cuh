@@ -111,7 +111,7 @@ struct K3Traits {
 
 
 template <typename Traits>
-__global__ void __launch_bounds__(Traits::kNThreads)
+__global__ void __launch_bounds__(Traits::kNThreads, 3)
 kernel3_fused_tc(
     const typename Traits::Element* __restrict__ q_tilde_ptr,  // (B*H, m, D)
     const typename Traits::Element* __restrict__ k_ptr,        // (B*H, N, D), pre-scaled
