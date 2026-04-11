@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel", "torch>=2.0", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-nystrom"
+version = "0.1.0"
+description = "FlashAttention-style CUDA kernels for NystromFormer approximate attention"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "flash-attn>=2.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["flash_nystrom*"]

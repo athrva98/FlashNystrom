@@ -1,0 +1,32 @@
+# ============================================================================
+# FlashNystrom Bazel Configuration
+# ============================================================================
+
+# C++ standard
+build --cxxopt=/std:c++17
+build --host_cxxopt=/std:c++17
+
+# CUDA configuration
+build --@rules_cuda//cuda:enable=True
+build --@rules_cuda//cuda:compiler=nvcc
+build --@rules_cuda//cuda:archs=sm_80,sm_90a,sm_120
+build --@rules_cuda//cuda:runtime=static
+
+# Windows-specific
+build --spawn_strategy=local
+build --enable_runfiles
+
+# Optimized build by default
+build -c opt
+
+# Show nvcc verbose output for debugging register/smem usage
+build:profile --@rules_cuda//cuda:copts=--ptxas-options=-v
+
+# Debug build
+build:dbg -c dbg
+build:dbg --@rules_cuda//cuda:copts=-G,-lineinfo
+
+# Suppress noisy warnings
+build --copt=/wd4244
+build --copt=/wd4267
+build --copt=/wd4819
