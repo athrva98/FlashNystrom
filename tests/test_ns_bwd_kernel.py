@@ -275,40 +275,44 @@ class TestNSBwdEndToEnd:
 
 @pytest.mark.skipif(not HAS_DK2INV_DEBUG, reason="_C.debug_compute_dk2inv not built")
 class TestComputeDK2Inv:
-    """Regression: compute_dk2inv must compute the EXACT dL/dZ_N = dstep2 @ B^T,
-    where B = softmax(Q_tilde @ K_s^T) @ V, with NO assumption on NS convergence.
-
-    The previous implementation used dstep2 @ (K2 @ step2)^T which is only correct
-    when K2 @ Z_N = I (full convergence). At newton_iter=6 that approximation
-    introduces ~38% relerr in dK2_inv, which propagates through the entire NS
-    backward chain and breaks training accuracy. This test locks in the correct
-    formula.
+    """Regression: the fused compute_dk2inv kernel walks N once and emits both
+        dK2_inv = dstep2 @ B^T              (∂L/∂Z_N, no NS-convergence assumption)
+        D3      = sum_d B[i, d] * dO3[i, d] (kernel3 row-correction)
+    where B = softmax(Q_tilde @ K_s^T) @ V. Both outputs are pinned element-wise
+    against an autograd-style PyTorch reference at FP32 noise.
     """
 
-    def _ref(self, q_tilde, k_s, v, lse3, dstep2):
+    def _ref(self, q_tilde, k_s, v, dO3, lse3, dstep2):
         # B = softmax(Q_tilde @ K_s^T) @ V, computed exactly using lse3.
         scores = q_tilde @ k_s.transpose(-2, -1)        # (BH, m, N)
         A = torch.exp(scores - lse3.unsqueeze(-1))      # (BH, m, N)
         B = A @ v                                        # (BH, m, D)
-        return dstep2 @ B.transpose(-2, -1)             # (BH, m, m)
+        dK2_inv = dstep2 @ B.transpose(-2, -1)          # (BH, m, m)
+        D3 = (B * dO3).sum(dim=-1)                      # (BH, m)
+        return dK2_inv, D3
 
     def _run(self, BH, m, N, D, seed=0, atol=1e-5):
         torch.manual_seed(seed)
         q_tilde = torch.randn(BH, m, D, device="cuda", dtype=torch.float32)
         k_s     = torch.randn(BH, N, D, device="cuda", dtype=torch.float32)
         v       = torch.randn(BH, N, D, device="cuda", dtype=torch.float32)
+        dO3     = torch.randn(BH, m, D, device="cuda", dtype=torch.float32)
         # lse3 must match what kernel3 forward produces: row-LSE of Q_tilde @ K_s^T.
         scores = q_tilde @ k_s.transpose(-2, -1)
         lse3 = torch.logsumexp(scores, dim=-1)           # (BH, m)
         dstep2 = torch.randn(BH, m, D, device="cuda", dtype=torch.float32)
 
-        dK2_inv_ref = self._ref(q_tilde, k_s, v, lse3, dstep2)
-        dK2_inv_cuda = _C.debug_compute_dk2inv(q_tilde, k_s, v, lse3, dstep2)
+        dK2_inv_ref, D3_ref = self._ref(q_tilde, k_s, v, dO3, lse3, dstep2)
+        dK2_inv_cuda, D3_cuda = _C.debug_compute_dk2inv(q_tilde, k_s, v, dO3, lse3, dstep2)
 
-        rerr = relerr(dK2_inv_cuda, dK2_inv_ref)
-        merr = maxerr(dK2_inv_cuda, dK2_inv_ref)
-        assert rerr < atol, (f"dK2_inv relerr={rerr:.2e}, max abs err={merr:.2e}, "
-                             f"BH={BH}, m={m}, N={N}, D={D}")
+        rerr_dki = relerr(dK2_inv_cuda, dK2_inv_ref)
+        merr_dki = maxerr(dK2_inv_cuda, dK2_inv_ref)
+        rerr_d3  = relerr(D3_cuda, D3_ref)
+        merr_d3  = maxerr(D3_cuda, D3_ref)
+        assert rerr_dki < atol, (f"dK2_inv relerr={rerr_dki:.2e}, max abs={merr_dki:.2e}, "
+                                  f"BH={BH}, m={m}, N={N}, D={D}")
+        assert rerr_d3 < atol, (f"D3 relerr={rerr_d3:.2e}, max abs={merr_d3:.2e}, "
+                                f"BH={BH}, m={m}, N={N}, D={D}")
 
     def test_BH1_m32_N64_D64(self):
         self._run(BH=1, m=32, N=64, D=64)

@@ -396,21 +396,23 @@ std::vector<torch::Tensor> debug_kernel2_inv_bwd_full(
 }
 
 // Debug hook for compute_dk2inv: drives the kernel directly with FP32 inputs
-// (BH, m, D)/(BH, N, D). Returns dK2_inv (BH, m, m) FP32.
-torch::Tensor debug_compute_dk2inv(
+// (BH, m, D)/(BH, N, D). Returns (dK2_inv, D3) FP32.
+std::vector<torch::Tensor> debug_compute_dk2inv(
     torch::Tensor q_tilde, // (BH, m, D) FP32
     torch::Tensor k_s,     // (BH, N, D) FP32
     torch::Tensor v,       // (BH, N, D) FP32
+    torch::Tensor dO3,     // (BH, m, D) FP32
     torch::Tensor lse3,    // (BH, m)   FP32
     torch::Tensor dstep2   // (BH, m, D) FP32
 ) {
     CHECK_DEVICE(q_tilde); CHECK_DEVICE(k_s); CHECK_DEVICE(v);
-    CHECK_DEVICE(lse3); CHECK_DEVICE(dstep2);
+    CHECK_DEVICE(dO3); CHECK_DEVICE(lse3); CHECK_DEVICE(dstep2);
     CHECK_CONTIGUOUS(q_tilde); CHECK_CONTIGUOUS(k_s); CHECK_CONTIGUOUS(v);
-    CHECK_CONTIGUOUS(lse3); CHECK_CONTIGUOUS(dstep2);
+    CHECK_CONTIGUOUS(dO3); CHECK_CONTIGUOUS(lse3); CHECK_CONTIGUOUS(dstep2);
     TORCH_CHECK(q_tilde.dtype() == torch::kFloat32, "q_tilde must be FP32");
     TORCH_CHECK(k_s.dtype() == torch::kFloat32, "k_s must be FP32");
     TORCH_CHECK(v.dtype() == torch::kFloat32, "v must be FP32");
+    TORCH_CHECK(dO3.dtype() == torch::kFloat32, "dO3 must be FP32");
     TORCH_CHECK(lse3.dtype() == torch::kFloat32, "lse3 must be FP32");
     TORCH_CHECK(dstep2.dtype() == torch::kFloat32, "dstep2 must be FP32");
     TORCH_CHECK(q_tilde.dim() == 3, "q_tilde must be (BH, m, D)");
@@ -422,6 +424,7 @@ torch::Tensor debug_compute_dk2inv(
     const int N  = static_cast<int>(k_s.size(1));
     TORCH_CHECK(k_s.size(0) == BH && v.size(0) == BH, "BH mismatch");
     TORCH_CHECK(k_s.size(2) == D && v.size(2) == D, "D mismatch");
+    TORCH_CHECK(dO3.sizes() == q_tilde.sizes(), "dO3 shape mismatch");
     TORCH_CHECK(lse3.size(0) == BH && lse3.size(1) == m, "lse3 shape mismatch");
     TORCH_CHECK(dstep2.sizes() == q_tilde.sizes(), "dstep2 shape mismatch");
 
@@ -430,17 +433,20 @@ torch::Tensor debug_compute_dk2inv(
 
     auto opts_f32 = q_tilde.options();
     auto dK2_inv = torch::empty({BH, m, m}, opts_f32);
+    auto D3      = torch::empty({BH, m},    opts_f32);
 
     flash_nystrom::launch_compute_dk2inv<float>(
         q_tilde.data_ptr<float>(),
         k_s.data_ptr<float>(),
         v.data_ptr<float>(),
+        dO3.data_ptr<float>(),
         lse3.data_ptr<float>(),
         dstep2.data_ptr<float>(),
         dK2_inv.data_ptr<float>(),
+        D3.data_ptr<float>(),
         BH, N, D, m, stream);
 
-    return dK2_inv;
+    return {dK2_inv, D3};
 }
 
 } // namespace flash_nystrom
@@ -464,9 +470,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q_tilde"), py::arg("k_tilde"), py::arg("K2"),
           py::arg("dZ0"), py::arg("dK2_in"));
     m.def("debug_compute_dk2inv", &flash_nystrom::debug_compute_dk2inv,
-          "Debug: compute dK2_inv = dstep2 @ B^T where B = softmax(Qt @ Ks^T) @ V. "
-          "Returns (BH, m, m) FP32.",
-          py::arg("q_tilde"), py::arg("k_s"), py::arg("v"),
+          "Debug: fused compute_dk2inv. Walks N once and returns "
+          "(dK2_inv, D3) where dK2_inv = dstep2 @ B^T and D3 = diag(B @ dO3^T), "
+          "B = softmax(Qt @ Ks^T) @ V.",
+          py::arg("q_tilde"), py::arg("k_s"), py::arg("v"), py::arg("dO3"),
           py::arg("lse3"), py::arg("dstep2"));
     m.def("debug_kernel2_inv_bwd_full", &flash_nystrom::debug_kernel2_inv_bwd_full,
           "Debug: full launch_kernel2_inv_bwd (per-iter loop + final softmax bwd). "

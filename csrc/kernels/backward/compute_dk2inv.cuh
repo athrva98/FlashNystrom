@@ -8,43 +8,44 @@
 namespace flash_nystrom {
 
 // =============================================================================
-// dK2_inv = ∂L/∂Z_N — exact, no approximation in NS convergence.
+// dK2_inv = ∂L/∂Z_N    AND    D3[i] = sum_n A3[i, n] * (dO3[i, :] · V[n, :])
 //
-// Forward: step2 = Z_N @ B   where Z_N is the NS approximation of K2_inv,
-//                            and B = softmax(Q_tilde @ K_s^T) @ V (the true
-//                            "kernel3-without-Z_N" output).
-// True backward: ∂L/∂Z_N = ∂L/∂step2 @ B^T.
+// Both outputs share the same B = softmax(Q_tilde @ K_s^T) @ V (the kernel3
+// inner product before the K2_inv multiply). The kernel walks N once,
+// accumulates B in SMEM, and emits both gradient pieces:
 //
-// The previous version used dK2_inv = dstep2 @ (K2 @ step2)^T, which only
-// equals the true backward when K2 @ Z_N = I (full NS convergence). At
-// newton_iter=6 this introduces ~38% relative error in dK2_inv — that error
-// then propagates through the entire NS unrolled backward.
+//   dK2_inv[i, j] = sum_d dstep2[i, d] * B[j, d]            (m × m output)
+//   D3[i]         = sum_d B[i, d] * dO3[i, d]              (m vector output)
 //
-// This kernel recomputes B exactly from saved q_tilde, k_s, v, lse3:
-//   A[i, n] = exp(q_tilde[i] · k_s[n] - lse3[i])         (m × N)
-//   B[i, d] = sum_n A[i, n] * V[n, d]                     (m × D)
-//   dK2_inv[i, j] = sum_d dstep2[i, d] * B[j, d]          (m × m)
+// The D3 identity comes from algebra:
+//   D3[i] = sum_n A[i, n] * (dO3[i, :] · V[n, :])
+//         = sum_n A[i, n] * sum_d dO3[i, d] * V[n, d]
+//         = sum_d dO3[i, d] * sum_n A[i, n] * V[n, d]
+//         = sum_d dO3[i, d] * B[i, d]
+// so D3 is a free byproduct of B — one m·D pass over GMEM dO3 after the tile
+// loop completes. This replaces the standalone precompute_d3 kernel that
+// re-walked N for the same information.
 //
-// Tiled over N with TILE_N = 32 to fit SMEM.
-//
-// SMEM (FP32 throughout for accuracy, m ≤ 64, D ∈ {64, 128}, TILE_N = 32):
-//   sQ [m*D]        ─ q_tilde, persistent
-//   sB [m*D]        ─ B accumulator, persistent
-//   sKV [TILE_N*D]  ─ K_tile then V_tile (aliased), per tile
-//   sA [m*TILE_N]   ─ A_tile, per tile
-//   sLSE [m]        ─ lse3, persistent
-// At m=64, D=128:  32 + 32 + 16 + 8 + 0.25 ≈ 88 KB (opt-in required).
-// At m=64, D=64:   16 + 16 + 8 + 8 + 0.25 ≈ 48 KB.
+// Tiled over N with TILE_N = 32 to fit SMEM:
+//   sQ  [m·D]        ─ q_tilde, persistent
+//   sB  [m·D]        ─ B accumulator, persistent (then read for dK2_inv & D3)
+//   sKV [TILE_N·D]   ─ K_tile then V_tile (aliased), per tile
+//   sA  [m·TILE_N]   ─ A_tile, per tile
+//   sLSE [m]         ─ lse3, persistent
+// At m=64, D=128:  32 + 32 + 16 + 8 + 0.25  ≈ 88 KB (opt-in required).
+// At m=64, D=64:   16 + 16 +  8 + 8 + 0.25  ≈ 48 KB.
 // =============================================================================
 
 template <typename scalar_t>
 __global__ void compute_dk2inv_kernel(
-    const scalar_t* __restrict__ q_tilde,  // (BH, m, D)    elem_type
-    const scalar_t* __restrict__ k_s,      // (BH, N, D)    elem_type, scaled K
-    const scalar_t* __restrict__ v,        // (BH, N, D)    elem_type
-    const float*    __restrict__ lse3,     // (BH, m)        FP32
-    const float*    __restrict__ dstep2,   // (BH, m, D)     FP32
-    float*          __restrict__ dK2_inv,  // (BH, m, m)     FP32 output
+    const scalar_t* __restrict__ q_tilde,  // (BH, m, D)
+    const scalar_t* __restrict__ k_s,      // (BH, N, D)  scaled K
+    const scalar_t* __restrict__ v,        // (BH, N, D)
+    const scalar_t* __restrict__ dO3,      // (BH, m, D)  precomputed K2_inv^T @ dstep2
+    const float*    __restrict__ lse3,     // (BH, m)
+    const float*    __restrict__ dstep2,   // (BH, m, D)
+    float*          __restrict__ dK2_inv,  // (BH, m, m)  output
+    float*          __restrict__ D3,       // (BH, m)     output
     int N, int D, int m
 ) {
     constexpr int TILE_N = 32;
@@ -59,12 +60,14 @@ __global__ void compute_dk2inv_kernel(
     float* sA   = sKV  + TILE_N * D;                // (m, TILE_N)
     float* sLSE = sA   + m * TILE_N;                // (m)
 
-    const scalar_t* qt   = q_tilde + bh * m * D;
-    const scalar_t* ks   = k_s     + bh * N * D;
-    const scalar_t* vv   = v       + bh * N * D;
+    const scalar_t* qt    = q_tilde + bh * m * D;
+    const scalar_t* ks    = k_s     + bh * N * D;
+    const scalar_t* vv    = v       + bh * N * D;
+    const scalar_t* dO3_b = dO3     + bh * m * D;
     const float*    lse_g = lse3    + bh * m;
     const float*    ds2   = dstep2  + bh * m * D;
     float*          dki   = dK2_inv + bh * m * m;
+    float*          d3_b  = D3      + bh * m;
 
     // Load q_tilde -> sQ (FP32), init sB = 0, load lse3 -> sLSE.
     for (int idx = tid; idx < m * D; idx += nthreads) sQ[idx] = to_float(qt[idx]);
@@ -72,7 +75,7 @@ __global__ void compute_dk2inv_kernel(
     for (int i = tid; i < m; i += nthreads)            sLSE[i] = lse_g[i];
     __syncthreads();
 
-    // Tile over N
+    // Tile over N — accumulate B[i, d] += sum_{n in tile} A[i, n] * V[n, d].
     for (int n0 = 0; n0 < N; n0 += TILE_N) {
         int tile_len = (N - n0 < TILE_N) ? (N - n0) : TILE_N;
 
@@ -83,9 +86,7 @@ __global__ void compute_dk2inv_kernel(
         }
         __syncthreads();
 
-        // 2. Compute A_tile[i, n] = exp(q_tilde[i] · K_tile[n] - lse[i]).
-        //    For n >= tile_len, set A = 0 so it contributes nothing to B.
-        //    For i >= m, no thread reads/writes (m guarded).
+        // 2. A_tile[i, n] = exp(q_tilde[i] · K_tile[n] - lse[i]).  Padded n -> 0.
         for (int idx = tid; idx < m * TILE_N; idx += nthreads) {
             int i = idx / TILE_N, n = idx % TILE_N;
             if (n < tile_len) {
@@ -122,12 +123,24 @@ __global__ void compute_dk2inv_kernel(
         for (int d = 0; d < D; d++) acc += ds2[i * D + d] * sB[j * D + d];
         dki[idx] = acc;
     }
+
+    // D3[i] = sum_d B[i, d] * dO3[i, d]   — one m·D pass over GMEM dO3.
+    // Each thread handles a stride of i values; the inner D loop reads B
+    // from SMEM (cached) and dO3 from GMEM.
+    for (int i = tid; i < m; i += nthreads) {
+        float acc = 0.0f;
+        const scalar_t* dO3_i = dO3_b + i * D;
+        for (int d = 0; d < D; d++) acc += sB[i * D + d] * to_float(dO3_i[d]);
+        d3_b[i] = acc;
+    }
 }
 
 template <typename scalar_t>
 void launch_compute_dk2inv(
     const scalar_t* q_tilde, const scalar_t* k_s, const scalar_t* v,
-    const float* lse3, const float* dstep2, float* dK2_inv,
+    const scalar_t* dO3,
+    const float* lse3, const float* dstep2,
+    float* dK2_inv, float* D3,
     int BH, int N, int D, int m, cudaStream_t stream
 ) {
     constexpr int TILE_N = 32;
@@ -141,7 +154,7 @@ void launch_compute_dk2inv(
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
     }
     compute_dk2inv_kernel<scalar_t><<<grid, block, smem, stream>>>(
-        q_tilde, k_s, v, lse3, dstep2, dK2_inv, N, D, m);
+        q_tilde, k_s, v, dO3, lse3, dstep2, dK2_inv, D3, N, D, m);
     FN_CUDA_KERNEL_CHECK();
 }
 
