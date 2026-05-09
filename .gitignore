@@ -28,3 +28,6 @@ docs/*.toc
 .claude/
 *.pyd
 *.so
+# Benchmark output artifacts (regenerated each run)
+benchmarks/*.txt
+benchmarks/*_results.json

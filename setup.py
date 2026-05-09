@@ -44,6 +44,7 @@ ext_modules = [
         sources=[
             "csrc/flash_nystrom.cu",
             "csrc/flash_nystrom_kernels.cu",
+            "csrc/kernels/backward/kernel2_inv_bwd.cu",
         ],
         include_dirs=[
             os.path.join(this_dir, "csrc"),

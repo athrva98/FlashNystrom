@@ -17,6 +17,11 @@ def iterative_pinverse(matrix: torch.Tensor, n_iter: int = 6) -> torch.Tensor:
 
     Must be float32 — fp16 will diverge. 6 iterations is plenty for m<=64.
     The formula looks scary but its just matrix multiply in a loop.
+
+    Z_0 init: Z_0 = A^T / (||A||_1 * ||A||_inf). This is the standard
+    Cauchy-interpolation bound that guarantees ||Z_0 A - I|| < 1 in operator
+    norm, which is what NS needs for convergence. Both norms are autograd-
+    differentiable so the chain rule includes their max() contributions.
     """
     assert matrix.dtype == torch.float32, "Newton-Schulz requires float32"
 
@@ -94,7 +99,7 @@ def nystrom_attention_reference(  # noqa: C901
     kernel_2 = F.softmax(q_tilde @ k_tilde.transpose(-2, -1), dim=-1)  # (B, H, m, m)
     kernel_3 = F.softmax(q_tilde @ k_s.transpose(-2, -1), dim=-1)  # (B, H, m, N)
 
-    # Pseudoinverse (always in FP32)
+    # Pseudoinverse via Newton-Schulz iteration (always FP32).
     kernel_2_f32 = kernel_2.float()
     kernel_2_inv = iterative_pinverse(kernel_2_f32, n_iter=newton_iter).to(q.dtype)
 

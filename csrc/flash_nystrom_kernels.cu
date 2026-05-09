@@ -20,6 +20,8 @@
 #include "kernels/backward/precompute_di.cuh"
 #include "kernels/backward/kernel1_bwd.cuh"
 #include "kernels/backward/kernel3_bwd.cuh"
+#include "kernels/backward/compute_dO3.cuh"
+#include "kernels/backward/precompute_d3.cuh"
 #include "kernels/backward/compute_dk2inv.cuh"
 #include "kernels/backward/kernel2_inv_bwd.cuh"
 #include "kernels/backward/landmark_bwd.cuh"
@@ -48,7 +50,7 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     launch_scale_inplace<elem_type>(k_m, total, p.scale, p.stream);
 
     launch_kernel2_inv<elem_type>(qt, kt,
-        p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr,
+        p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
         p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream);
 
     launch_kernel3_output_fused<elem_type>(qt, k_m, v,
@@ -88,7 +90,7 @@ static void run_nystrom_fwd_fp32_impl(NystromParams &p) {
     launch_scale_inplace<T>(k_m, total, p.scale, p.stream);
 
     launch_kernel2_inv<T>(qt, kt,
-        p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr,
+        p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
         p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream);
 
     launch_kernel3_scalar<T>(qt, k_m, v,
@@ -149,16 +151,36 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
     launch_kernel1_bwd<elem_type>(q_s, k_tilde, step2, p.lse1_ptr, p.D1_ptr, dO,
         dQ, p.dstep2_ptr, p.dK_tilde_ptr, BH, N, D, m, p.stream);
 
-    launch_kernel3_bwd<elem_type>(q_tilde, k_s, v, p.k2_inv_ptr, p.lse3_ptr,
-        p.dstep2_ptr, dV, dK, p.dQ_tilde_ptr, p.dK2_inv_ptr, BH, N, D, m, p.stream);
+    // dO3 = K2_inv^T @ dstep2 — precomputed in GMEM for both FP16/BF16
+    // (TC path) and FP32 (scalar path). Required by precompute_d3 and used
+    // directly by the TC kernel3_bwd.
+    auto* dO3 = static_cast<elem_type*>(p.dO3_ptr);
+    launch_compute_dO3<elem_type>(p.k2_inv_ptr, p.dstep2_ptr, dO3,
+        BH, D, m, p.stream);
 
-    // Compute dK2_inv separately in FP32 to avoid amplification from IFT backward.
-    // kernel3_bwd no longer accumulates dK2_inv (was removed for numerical stability).
-    launch_compute_dk2inv<elem_type>(q_tilde, k_tilde, step2, p.lse2_ptr,
-        p.dstep2_ptr, p.dK2_inv_ptr, BH, D, m, p.stream);
+    // D3[i] = sum_n A3[i, n] * (dO3[i, :] · V[n, :]) — global rowsum needed
+    // by kernel3_bwd's softmax-bwd. The kernel previously computed it
+    // per-tile, which is wrong whenever N > Bc (== 64).
+    launch_precompute_d3<elem_type>(q_tilde, k_s, v, dO3, p.lse3_ptr,
+        p.D3_ptr, BH, N, D, m, p.stream);
+
+    launch_kernel3_bwd<elem_type>(q_tilde, k_s, v, p.k2_inv_ptr, p.lse3_ptr,
+        p.D3_ptr, p.dstep2_ptr, dV, dK, p.dQ_tilde_ptr, p.dK2_inv_ptr,
+        static_cast<const elem_type*>(dO3),
+        BH, N, D, m, p.stream);
+
+    // Compute dK2_inv = ∂L/∂Z_N exactly (no NS-convergence approximation).
+    // We need B = softmax(Q_tilde @ K_s^T) @ V (the "kernel3 without Z_N" output)
+    // because step2 = Z_N @ B and ∂L/∂Z_N = dstep2 @ B^T. The previous formula
+    // dstep2 @ (K2 @ step2)^T only equals this when K2 @ Z_N = I (full NS convergence).
+    launch_compute_dk2inv<elem_type>(q_tilde, k_s, v, p.lse3_ptr,
+        p.dstep2_ptr, p.dK2_inv_ptr, BH, N, D, m, p.stream);
 
     launch_kernel2_inv_bwd<elem_type>(q_tilde, k_tilde, p.lse2_ptr,
-        p.k2_inv_ptr, p.dK2_inv_ptr, p.dQ_tilde_ptr, p.dK_tilde_ptr,
+        p.k2_inv_ptr, p.dK2_inv_ptr,
+        p.ns_iterates_ptr, p.k2_softmax_ptr,
+        p.dQ_tilde_ptr, p.dK_tilde_ptr,
+        p.ns_dZ_workspace_ptr, p.ns_dK2_workspace_ptr,
         BH, D, m, p.newton_iter, p.stream);
 
     launch_landmark_bwd<elem_type>(p.dQ_tilde_ptr, p.dK_tilde_ptr, dQ, dK,

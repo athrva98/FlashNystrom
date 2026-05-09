@@ -12,6 +12,8 @@
 #include <c10/cuda/CUDAStream.h>
 
 #include "flash_nystrom.h"
+#include "kernels/backward/kernel2_inv_bwd.cuh"  // for debug hooks
+#include "kernels/backward/compute_dk2inv.cuh"   // for debug hooks
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -77,12 +79,11 @@ std::vector<torch::Tensor> nystrom_fwd(
                      "conv_kernel_size > 0 but conv_weight not provided");
     }
 
-    // FP32 with D=128 may exceed SMEM limits on some GPUs.
-    // The kernel launcher will check and abort if SMEM is insufficient.
-    if (dtype == at::ScalarType::Float && D == 128) {
-        TORCH_WARN_ONCE("FlashNystrom FP32 with D=128 uses scalar kernels with large SMEM. "
-                         "Consider FP16/BF16 for better performance.");
-    }
+    // FP32 scalar kernels need 4 bytes/elem vs 2 for FP16/BF16.
+    // At D=128, m=64: SMEM = ~144KB which exceeds all GPU limits.
+    TORCH_CHECK(!(dtype == at::ScalarType::Float && D == 128),
+                "FP32 with D=128 is not supported (scalar kernel SMEM overflow). "
+                "Use FP16 or BF16 for D=128.");
 
     const at::cuda::CUDAGuard device_guard(q.device());
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -102,6 +103,9 @@ std::vector<torch::Tensor> nystrom_fwd(
     auto softmax1_lse = torch::empty({B, H, N}, opts_f32);
     auto softmax2_lse = torch::empty({B, H, m}, opts_f32);
     auto softmax3_lse = torch::empty({B, H, m}, opts_f32);
+    // Saved-for-backward tensors (always allocated; the unrolled NS backward needs them).
+    auto ns_iterates  = torch::empty({B, H, static_cast<int64_t>(newton_iter + 1), m, m}, opts_f32);
+    auto k2_softmax   = torch::empty({B, H, m, m}, opts_f32);
     NystromParams params = {};
     params.batch_size = static_cast<int>(B);
     params.num_heads = static_cast<int>(H);
@@ -123,7 +127,8 @@ std::vector<torch::Tensor> nystrom_fwd(
     params.softmax1_lse_ptr = softmax1_lse.data_ptr<float>();
     params.softmax2_lse_ptr = softmax2_lse.data_ptr<float>();
     params.softmax3_lse_ptr = softmax3_lse.data_ptr<float>();
-    params.ns_iterates_ptr = nullptr;  // IFT backward doesn't need iterates
+    params.ns_iterates_ptr = ns_iterates.data_ptr<float>();
+    params.k2_softmax_ptr  = k2_softmax.data_ptr<float>();
     params.conv_weight_ptr = conv_weight.has_value() ? conv_weight.value().data_ptr() : nullptr;
     params.stream = stream;
 
@@ -134,7 +139,7 @@ std::vector<torch::Tensor> nystrom_fwd(
     }
 
     return {output, q_s, k_s, q_tilde, k_tilde, kernel2_inv, step2,
-            softmax1_lse, softmax2_lse, softmax3_lse};
+            softmax1_lse, softmax2_lse, softmax3_lse, ns_iterates, k2_softmax};
 }
 
 // -- backward --
@@ -146,6 +151,7 @@ std::vector<torch::Tensor> nystrom_bwd(
     torch::Tensor q_tilde, torch::Tensor k_tilde,
     torch::Tensor kernel2_inv, torch::Tensor step2,
     torch::Tensor softmax1_lse, torch::Tensor softmax2_lse, torch::Tensor softmax3_lse,
+    torch::Tensor ns_iterates, torch::Tensor k2_softmax,
     torch::Tensor v, torch::Tensor output,
     int64_t num_landmarks, int64_t newton_iter, int64_t conv_kernel_size,
     c10::optional<torch::Tensor> conv_weight
@@ -153,6 +159,10 @@ std::vector<torch::Tensor> nystrom_bwd(
     const auto dtype = dO.scalar_type();
     const int64_t B = dO.size(0), H = dO.size(1), N = dO.size(2), D = dO.size(3);
     const int64_t m = num_landmarks;
+
+    TORCH_CHECK(!(dtype == at::ScalarType::Float && D == 128),
+                "FP32 backward with D=128 is not supported (scalar kernel SMEM overflow). "
+                "Use FP16 or BF16 for D=128.");
 
     const at::cuda::CUDAGuard device_guard(dO.device());
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -171,6 +181,16 @@ std::vector<torch::Tensor> nystrom_bwd(
     auto dK_tilde  = torch::zeros({B, H, m, D}, opts_f32);
     auto dK2_inv   = torch::zeros({B, H, m, m}, opts_f32);
     auto D1        = torch::empty({B, H, N}, opts_f32);
+    auto D3        = torch::empty({B, H, m}, opts_f32);
+
+    // Workspaces for the unrolled NS backward.
+    auto ns_dZ_ws  = torch::empty({B, H, m, m}, opts_f32);
+    auto ns_dK2_ws = torch::empty({B, H, m, m}, opts_f32);
+
+    // dO3 intermediate (always allocated — used by precompute_d3 and the TC
+    // kernel3_bwd). Allocated in input dtype: FP16/BF16 for the TC path,
+    // FP32 for the FP32 scalar path.
+    auto dO3 = torch::empty({B, H, m, D}, opts);
 
     // dconv_weight (FP32 accumulator, converted back to dtype at the end)
     torch::Tensor dconv_weight;
@@ -199,7 +219,8 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.lse1_ptr = softmax1_lse.data_ptr<float>();
     params.lse2_ptr = softmax2_lse.data_ptr<float>();
     params.lse3_ptr = softmax3_lse.data_ptr<float>();
-    params.ns_iterates_ptr = nullptr;  // IFT backward doesn't need iterates
+    params.ns_iterates_ptr = ns_iterates.data_ptr<float>();
+    params.k2_softmax_ptr  = k2_softmax.data_ptr<float>();
     params.conv_weight_ptr = conv_weight.has_value() ? conv_weight.value().data_ptr() : nullptr;
 
     params.dO_ptr = dO.data_ptr();
@@ -214,6 +235,10 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.dK_tilde_ptr = dK_tilde.data_ptr<float>();
     params.dK2_inv_ptr = dK2_inv.data_ptr<float>();
     params.D1_ptr = D1.data_ptr<float>();
+    params.D3_ptr = D3.data_ptr<float>();
+    params.dO3_ptr = dO3.data_ptr();
+    params.ns_dZ_workspace_ptr  = ns_dZ_ws.data_ptr<float>();
+    params.ns_dK2_workspace_ptr = ns_dK2_ws.data_ptr<float>();
     params.stream = stream;
 
     if (dtype == at::ScalarType::Float) {
@@ -231,6 +256,193 @@ std::vector<torch::Tensor> nystrom_bwd(
     return {dQ, dK, dV, dconv_out};
 }
 
+// ===== Debug entry points for kernel2_inv backward isolation tests =====
+// These call the NS bwd kernels directly with FP32 inputs, no autograd path,
+// no parameter struct. Used by tests/test_ns_bwd_kernel.py to verify the
+// kernels match PyTorch element-wise.
+
+std::vector<torch::Tensor> debug_ns_bwd_step(
+    torch::Tensor K2,        // (BH, m, m) FP32 — softmax K2
+    torch::Tensor Z_j,       // (BH, m, m) FP32 — Z_j iterate
+    torch::Tensor dZ_in      // (BH, m, m) FP32 — dZ_{j+1}
+) {
+    CHECK_DEVICE(K2); CHECK_DEVICE(Z_j); CHECK_DEVICE(dZ_in);
+    CHECK_CONTIGUOUS(K2); CHECK_CONTIGUOUS(Z_j); CHECK_CONTIGUOUS(dZ_in);
+    TORCH_CHECK(K2.dtype() == torch::kFloat32, "K2 must be FP32");
+    TORCH_CHECK(Z_j.dtype() == torch::kFloat32, "Z_j must be FP32");
+    TORCH_CHECK(dZ_in.dtype() == torch::kFloat32, "dZ_in must be FP32");
+    TORCH_CHECK(K2.dim() == 3, "K2 must be (BH, m, m)");
+    TORCH_CHECK(K2.sizes() == Z_j.sizes() && K2.sizes() == dZ_in.sizes(),
+                "K2, Z_j, dZ_in must all have shape (BH, m, m)");
+    TORCH_CHECK(K2.size(1) == K2.size(2), "K2 must be square in last two dims");
+
+    const int BH = static_cast<int>(K2.size(0));
+    const int m  = static_cast<int>(K2.size(1));
+
+    const at::cuda::CUDAGuard device_guard(K2.device());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    auto opts_f32 = K2.options();
+    auto dZ_out  = torch::empty({BH, m, m}, opts_f32);
+    auto dK2_acc = torch::zeros({BH, m, m}, opts_f32);
+
+    flash_nystrom::launch_ns_bwd_step_test(
+        K2.data_ptr<float>(),
+        Z_j.data_ptr<float>(),
+        dZ_in.data_ptr<float>(),
+        dZ_out.data_ptr<float>(),
+        dK2_acc.data_ptr<float>(),
+        BH, m, stream);
+
+    return {dZ_out, dK2_acc};
+}
+
+std::vector<torch::Tensor> debug_ns_bwd_final(
+    torch::Tensor q_tilde,   // (BH, m, D) FP32
+    torch::Tensor k_tilde,   // (BH, m, D) FP32
+    torch::Tensor K2,        // (BH, m, m) FP32 — softmax K2
+    torch::Tensor dZ0,       // (BH, m, m) FP32 — dZ_0 from NS unroll
+    torch::Tensor dK2_in     // (BH, m, m) FP32 — dK2 accumulator from NS unroll
+) {
+    CHECK_DEVICE(q_tilde); CHECK_DEVICE(k_tilde);
+    CHECK_DEVICE(K2); CHECK_DEVICE(dZ0); CHECK_DEVICE(dK2_in);
+    CHECK_CONTIGUOUS(q_tilde); CHECK_CONTIGUOUS(k_tilde);
+    CHECK_CONTIGUOUS(K2); CHECK_CONTIGUOUS(dZ0); CHECK_CONTIGUOUS(dK2_in);
+    TORCH_CHECK(q_tilde.dtype() == torch::kFloat32, "q_tilde must be FP32");
+    TORCH_CHECK(k_tilde.dtype() == torch::kFloat32, "k_tilde must be FP32");
+    TORCH_CHECK(K2.dtype() == torch::kFloat32, "K2 must be FP32");
+    TORCH_CHECK(dZ0.dtype() == torch::kFloat32, "dZ0 must be FP32");
+    TORCH_CHECK(dK2_in.dtype() == torch::kFloat32, "dK2_in must be FP32");
+
+    const int BH = static_cast<int>(K2.size(0));
+    const int m  = static_cast<int>(K2.size(1));
+    const int D  = static_cast<int>(q_tilde.size(2));
+
+    const at::cuda::CUDAGuard device_guard(K2.device());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    auto opts_f32 = K2.options();
+    auto dQ_tilde_out = torch::zeros({BH, m, D}, opts_f32);
+    auto dK_tilde_out = torch::zeros({BH, m, D}, opts_f32);
+    auto dK2_inout    = dK2_in.clone();  // kernel modifies in place (adds dZ0^T/c)
+
+    flash_nystrom::launch_ns_bwd_final_test(
+        q_tilde.data_ptr<float>(),
+        k_tilde.data_ptr<float>(),
+        K2.data_ptr<float>(),
+        dZ0.data_ptr<float>(),
+        dK2_inout.data_ptr<float>(),
+        dQ_tilde_out.data_ptr<float>(),
+        dK_tilde_out.data_ptr<float>(),
+        BH, D, m, stream);
+
+    return {dQ_tilde_out, dK_tilde_out, dK2_inout};
+}
+
+// Debug hook for the FULL launch_kernel2_inv_bwd. Drives the production
+// orchestration (per-iter loop + final softmax-bwd step) with explicit FP32
+// inputs. Compares against the PyTorch autograd-through-Newton-Schulz reference
+// in tests/test_ns_bwd_kernel.py.
+std::vector<torch::Tensor> debug_kernel2_inv_bwd_full(
+    torch::Tensor q_tilde,    // (BH, m, D) FP32
+    torch::Tensor k_tilde,    // (BH, m, D) FP32
+    torch::Tensor K2_softmax, // (BH, m, m) FP32 — softmax(QK^T) output
+    torch::Tensor ns_iterates,// (BH, niter+1, m, m) FP32 — Z_0 .. Z_N from forward
+    torch::Tensor dK2_inv_in, // (BH, m, m) FP32 — gradient w.r.t. Z_N
+    int64_t newton_iter
+) {
+    CHECK_DEVICE(q_tilde); CHECK_DEVICE(k_tilde); CHECK_DEVICE(K2_softmax);
+    CHECK_DEVICE(ns_iterates); CHECK_DEVICE(dK2_inv_in);
+    CHECK_CONTIGUOUS(q_tilde); CHECK_CONTIGUOUS(k_tilde); CHECK_CONTIGUOUS(K2_softmax);
+    CHECK_CONTIGUOUS(ns_iterates); CHECK_CONTIGUOUS(dK2_inv_in);
+    TORCH_CHECK(q_tilde.dtype() == torch::kFloat32, "q_tilde must be FP32");
+    TORCH_CHECK(k_tilde.dtype() == torch::kFloat32, "k_tilde must be FP32");
+    TORCH_CHECK(K2_softmax.dtype() == torch::kFloat32, "K2_softmax must be FP32");
+    TORCH_CHECK(ns_iterates.dtype() == torch::kFloat32, "ns_iterates must be FP32");
+    TORCH_CHECK(dK2_inv_in.dtype() == torch::kFloat32, "dK2_inv_in must be FP32");
+
+    const int BH = static_cast<int>(q_tilde.size(0));
+    const int m  = static_cast<int>(q_tilde.size(1));
+    const int D  = static_cast<int>(q_tilde.size(2));
+    TORCH_CHECK(K2_softmax.size(0) == BH && K2_softmax.size(1) == m && K2_softmax.size(2) == m,
+                "K2_softmax shape mismatch");
+    TORCH_CHECK(ns_iterates.dim() == 4 && ns_iterates.size(0) == BH &&
+                ns_iterates.size(1) == newton_iter + 1 &&
+                ns_iterates.size(2) == m && ns_iterates.size(3) == m,
+                "ns_iterates must have shape (BH, newton_iter+1, m, m)");
+    TORCH_CHECK(dK2_inv_in.size(0) == BH && dK2_inv_in.size(1) == m && dK2_inv_in.size(2) == m,
+                "dK2_inv_in shape mismatch");
+
+    const at::cuda::CUDAGuard device_guard(q_tilde.device());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    auto opts_f32 = q_tilde.options();
+    auto dQ_tilde = torch::zeros({BH, m, D}, opts_f32);
+    auto dK_tilde = torch::zeros({BH, m, D}, opts_f32);
+    auto dZ_ws    = torch::empty({BH, m, m}, opts_f32);
+    auto dK2_ws   = torch::empty({BH, m, m}, opts_f32);
+
+    flash_nystrom::launch_kernel2_inv_bwd<float>(
+        q_tilde.data_ptr<float>(), k_tilde.data_ptr<float>(),
+        /*lse2=*/nullptr, /*k2_inv=*/nullptr,
+        dK2_inv_in.data_ptr<float>(),
+        ns_iterates.data_ptr<float>(),
+        K2_softmax.data_ptr<float>(),
+        dQ_tilde.data_ptr<float>(), dK_tilde.data_ptr<float>(),
+        dZ_ws.data_ptr<float>(), dK2_ws.data_ptr<float>(),
+        BH, D, m, static_cast<int>(newton_iter), stream);
+
+    return {dQ_tilde, dK_tilde};
+}
+
+// Debug hook for compute_dk2inv: drives the kernel directly with FP32 inputs
+// (BH, m, D)/(BH, N, D). Returns dK2_inv (BH, m, m) FP32.
+torch::Tensor debug_compute_dk2inv(
+    torch::Tensor q_tilde, // (BH, m, D) FP32
+    torch::Tensor k_s,     // (BH, N, D) FP32
+    torch::Tensor v,       // (BH, N, D) FP32
+    torch::Tensor lse3,    // (BH, m)   FP32
+    torch::Tensor dstep2   // (BH, m, D) FP32
+) {
+    CHECK_DEVICE(q_tilde); CHECK_DEVICE(k_s); CHECK_DEVICE(v);
+    CHECK_DEVICE(lse3); CHECK_DEVICE(dstep2);
+    CHECK_CONTIGUOUS(q_tilde); CHECK_CONTIGUOUS(k_s); CHECK_CONTIGUOUS(v);
+    CHECK_CONTIGUOUS(lse3); CHECK_CONTIGUOUS(dstep2);
+    TORCH_CHECK(q_tilde.dtype() == torch::kFloat32, "q_tilde must be FP32");
+    TORCH_CHECK(k_s.dtype() == torch::kFloat32, "k_s must be FP32");
+    TORCH_CHECK(v.dtype() == torch::kFloat32, "v must be FP32");
+    TORCH_CHECK(lse3.dtype() == torch::kFloat32, "lse3 must be FP32");
+    TORCH_CHECK(dstep2.dtype() == torch::kFloat32, "dstep2 must be FP32");
+    TORCH_CHECK(q_tilde.dim() == 3, "q_tilde must be (BH, m, D)");
+    TORCH_CHECK(k_s.dim() == 3 && v.dim() == 3, "k_s, v must be (BH, N, D)");
+
+    const int BH = static_cast<int>(q_tilde.size(0));
+    const int m  = static_cast<int>(q_tilde.size(1));
+    const int D  = static_cast<int>(q_tilde.size(2));
+    const int N  = static_cast<int>(k_s.size(1));
+    TORCH_CHECK(k_s.size(0) == BH && v.size(0) == BH, "BH mismatch");
+    TORCH_CHECK(k_s.size(2) == D && v.size(2) == D, "D mismatch");
+    TORCH_CHECK(lse3.size(0) == BH && lse3.size(1) == m, "lse3 shape mismatch");
+    TORCH_CHECK(dstep2.sizes() == q_tilde.sizes(), "dstep2 shape mismatch");
+
+    const at::cuda::CUDAGuard device_guard(q_tilde.device());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    auto opts_f32 = q_tilde.options();
+    auto dK2_inv = torch::empty({BH, m, m}, opts_f32);
+
+    flash_nystrom::launch_compute_dk2inv<float>(
+        q_tilde.data_ptr<float>(),
+        k_s.data_ptr<float>(),
+        v.data_ptr<float>(),
+        lse3.data_ptr<float>(),
+        dstep2.data_ptr<float>(),
+        dK2_inv.data_ptr<float>(),
+        BH, N, D, m, stream);
+
+    return dK2_inv;
+}
+
 } // namespace flash_nystrom
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -243,4 +455,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("conv_weight") = c10::nullopt);
     m.def("backward", &flash_nystrom::nystrom_bwd,
           "FlashNystrom backward (CUDA)");
+    m.def("debug_ns_bwd_step", &flash_nystrom::debug_ns_bwd_step,
+          "Debug: single NS backward iteration (returns dZ_j, dK2_contrib).",
+          py::arg("K2"), py::arg("Z_j"), py::arg("dZ_in"));
+    m.def("debug_ns_bwd_final", &flash_nystrom::debug_ns_bwd_final,
+          "Debug: NS backward final step (Z_0 init grad + softmax bwd). "
+          "Returns (dQ_tilde, dK_tilde, dK2_after_init).",
+          py::arg("q_tilde"), py::arg("k_tilde"), py::arg("K2"),
+          py::arg("dZ0"), py::arg("dK2_in"));
+    m.def("debug_compute_dk2inv", &flash_nystrom::debug_compute_dk2inv,
+          "Debug: compute dK2_inv = dstep2 @ B^T where B = softmax(Qt @ Ks^T) @ V. "
+          "Returns (BH, m, m) FP32.",
+          py::arg("q_tilde"), py::arg("k_s"), py::arg("v"),
+          py::arg("lse3"), py::arg("dstep2"));
+    m.def("debug_kernel2_inv_bwd_full", &flash_nystrom::debug_kernel2_inv_bwd_full,
+          "Debug: full launch_kernel2_inv_bwd (per-iter loop + final softmax bwd). "
+          "Returns (dQ_tilde, dK_tilde) FP32.",
+          py::arg("q_tilde"), py::arg("k_tilde"), py::arg("K2_softmax"),
+          py::arg("ns_iterates"), py::arg("dK2_inv_in"), py::arg("newton_iter"));
 }

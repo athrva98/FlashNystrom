@@ -46,10 +46,18 @@ struct K3Traits {
         MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>>;
 
     // 4 warps along M, 1 along N — same as kernel1
+    // Used for forward GEMM1/GEMM2 and backward GEMM1/GEMM_dP/GEMM_dQt
     using TiledMma = decltype(make_tiled_mma(
         MMA_Atom_Arch{},
         Layout<Shape<_4, _1, _1>>{},
         Tile<Int<kBlockM>, Int<kBlockN>, _16>{}));
+
+    // 2 warps along M, 2 along N — for backward GEMM_dK and GEMM_dV
+    // Output shape: (kBlockN × kHeadDim) = (Bc × D)
+    using TiledMmaDKV = decltype(make_tiled_mma(
+        MMA_Atom_Arch{},
+        Layout<Shape<_2, _2, _1>>{},
+        Tile<Int<kBlockN>, Int<kHeadDim>, _16>{}));
 
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
@@ -100,11 +108,18 @@ struct K3Traits {
         Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>, elem_type>{},
         GmemLayoutAtom{}, Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));
 
-    // SMEM: Q_tilde (persistent) + KV (double-buffered not yet, single for now)
-    static constexpr int kSmemQElems  = static_cast<int>(cosize(SmemLayoutQ{}));
-    static constexpr int kSmemKVElems = static_cast<int>(cosize(SmemLayoutKV{}));
-    // K and V tiles share one SMEM slot, loaded sequentially per tile iteration.
+    // SMEM sizes (element counts, not bytes)
+    static constexpr int kSmemQElems   = static_cast<int>(cosize(SmemLayoutQ{}));
+    static constexpr int kSmemKVElems  = static_cast<int>(cosize(SmemLayoutKV{}));
+    static constexpr int kSmemPdSElems = static_cast<int>(cosize(SmemLayoutPdS{}));
+
+    // Forward: sQt (persistent) + sKV (single, reloaded per tile)
     static constexpr int kSmemBytes = (kSmemQElems + kSmemKVElems) * sizeof(Element);
+
+    // Backward: sQt + sdO3 + sKV + sPdS (4 buffers)
+    // sdO3 uses SmemLayoutKV (same shape as sQt since kBlockM == kBlockN)
+    static constexpr int kSmemBwdElems = kSmemQElems + kSmemKVElems * 2 + kSmemPdSElems;
+    static constexpr int kSmemBwdBytes = kSmemBwdElems * sizeof(Element);
 };
 
 // -- the actual kernel --

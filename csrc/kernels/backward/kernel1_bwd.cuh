@@ -56,6 +56,20 @@ __global__ void kernel1_bwd_scalar_kernel(
 }
 
 // -- tensor core kernel (fp16/bf16) --
+//
+// ALL 5 GEMMs use tensor cores.
+//
+// 3-buffer SMEM layout: slot (Q or dO) + sKt + sS2 (step2, then P/dS)
+// D=128: 16KB + 16KB + 16KB = 48KB — fits 2 blocks/SM without opt-in
+//
+// TiledMma (4,1,1):    GEMM1 (S=Q@Kt), GEMM2 (dP=dO@S2), GEMM3 (dQ=dS@Kt)
+// TiledMmaDKV (2,2,1): GEMM4 (dKt=dS^T@Q), GEMM5 (dS2=P^T@dO)
+//
+// Timeline:
+//  GEMM1 → softmax → swap(Q→dO) → GEMM2 → softmax_bwd
+//  → write P to sS2 → GEMM5(TC) → atomicAdd dstep2
+//  → write dS to sS2 + reload Q → GEMM4(TC) → atomicAdd dKt
+//  → GEMM3(TC) → write dQ
 
 
 template <typename Traits>
@@ -83,59 +97,35 @@ kernel1_bwd_tc(
     int tile_rows = min(kBlockM, N - row_start);
     bool full = (tile_rows == kBlockM);
 
+    // 3-buffer SMEM: slot (Q or dO) + sKt (K_tilde, persistent) + sS2 (step2, then P/dS)
     extern __shared__ char smem_[];
-    Element* sQ_ptr  = reinterpret_cast<Element*>(smem_);
-    Element* sKt_ptr = sQ_ptr  + Traits::kSmemQElems;
-    Element* sdO_ptr = sKt_ptr + Traits::kSmemKVElems;
-    Element* sS2_ptr = sdO_ptr + Traits::kSmemQElems;
-    // sP and sdS overlay sS2's space (sS2 is no longer needed after GEMM2)
-    // sS2 has kSmemKVElems elems = 64*D. sP+sdS need 2*cosize(SmemLayoutPdS) = 2*64*64.
-    // For D>=64: 64*D >= 2*64*64 iff D >= 128. For D=64: 64*64 < 2*64*64, need separate.
-    int kPdSElems = static_cast<int>(cosize(typename Traits::SmemLayoutPdS{}));
-    Element* sP_ptr;
-    Element* sdS_ptr;
-    if constexpr (Traits::kHeadDim >= 128) {
-        // overlay on sS2 (saves 2*kPdSElems elems = 16KB)
-        sP_ptr  = sS2_ptr;
-        sdS_ptr = sS2_ptr + kPdSElems;
-    } else {
-        // D=64: sS2 too small, allocate after
-        sP_ptr  = sS2_ptr + Traits::kSmemKVElems;
-        sdS_ptr = sP_ptr  + kPdSElems;
-    }
+    Element* slot_ptr = reinterpret_cast<Element*>(smem_);
+    Element* sKt_ptr  = slot_ptr + Traits::kSmemQElems;
+    Element* sS2_ptr  = sKt_ptr + Traits::kSmemKVElems;
 
-    auto sQ  = make_tensor(make_smem_ptr(sQ_ptr),  typename Traits::SmemLayoutQ{});
-    auto sKt = make_tensor(make_smem_ptr(sKt_ptr), typename Traits::SmemLayoutKV{});
-    auto sdO = make_tensor(make_smem_ptr(sdO_ptr), typename Traits::SmemLayoutQ{});
-    auto sS2 = make_tensor(make_smem_ptr(sS2_ptr), typename Traits::SmemLayoutKV{});
-    auto sP  = make_tensor(make_smem_ptr(sP_ptr),  typename Traits::SmemLayoutPdS{});
-    auto sdS = make_tensor(make_smem_ptr(sdS_ptr), typename Traits::SmemLayoutPdS{});
+    auto sSlot = make_tensor(make_smem_ptr(slot_ptr), typename Traits::SmemLayoutQ{});
+    auto sKt   = make_tensor(make_smem_ptr(sKt_ptr),  typename Traits::SmemLayoutKV{});
+    auto sS2   = make_tensor(make_smem_ptr(sS2_ptr),  typename Traits::SmemLayoutKV{});
 
-    // Transposed views
-    auto sKtt  = make_tensor(sKt.data(),  typename Traits::SmemLayoutKVtransposed{});
-    auto sKttNS = make_tensor(sKt.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
-    auto sQt   = make_tensor(sQ.data(),   typename Traits::SmemLayoutKVtransposed{});
-    auto sQtNS = make_tensor(sQ.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
-    auto sdOt  = make_tensor(sdO.data(),  typename Traits::SmemLayoutKVtransposed{});
-    auto sdOtNS = make_tensor(sdO.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
-    auto sPt   = make_tensor(sP.data(),   typename Traits::SmemLayoutPdStransposed{});
-    auto sPtNS = make_tensor(sP.data().get(), typename Traits::SmemLayoutPdStransposedNoSwizzle{});
-    auto sdSt  = make_tensor(sdS.data(),  typename Traits::SmemLayoutPdStransposed{});
-    auto sdStNS = make_tensor(sdS.data().get(), typename Traits::SmemLayoutPdStransposedNoSwizzle{});
+    // Transposed views for GEMM3 B-operand (Kt) and GEMM4/5 B-operand (slot)
+    // kBlockM == kBlockN == 64, so SmemLayoutQ == SmemLayoutKV — reuse KV transposed types
+    auto sKtt    = make_tensor(sKt.data(),       typename Traits::SmemLayoutKVtransposed{});
+    auto sKttNS  = make_tensor(sKt.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
+    auto sSlotT  = make_tensor(sSlot.data(),       typename Traits::SmemLayoutKVtransposed{});
+    auto sSlotTNS = make_tensor(sSlot.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
 
-    // Zero-init SMEM
-    int total_elems;
-    if constexpr (Traits::kHeadDim >= 128) {
-        // sP+sdS overlay sS2, so total = sQ + sKt + sdO + sS2 (sP/sdS inside sS2)
-        total_elems = Traits::kSmemQElems*2 + Traits::kSmemKVElems*2;
-    } else {
-        total_elems = Traits::kSmemQElems*2 + Traits::kSmemKVElems*2 + kPdSElems*2;
-    }
+    // PdS views on sS2 region (SmemLayoutPdS fits: cosize(PdS) = 64*64 <= cosize(KV) = 64*D)
+    auto sPdS    = make_tensor(make_smem_ptr(sS2_ptr), typename Traits::SmemLayoutPdS{});
+    auto sPdSt   = make_tensor(make_smem_ptr(sS2_ptr), typename Traits::SmemLayoutPdStransposed{});
+    auto sPdStNS = make_tensor(make_smem_ptr(sS2_ptr),  typename Traits::SmemLayoutPdStransposedNoSwizzle{});
+
+    // Zero-init all 3 buffers (needed for partial tiles: rows >= tile_rows and cols >= m)
+    constexpr int total_elems = Traits::kSmemQElems + Traits::kSmemKVElems*2;
     for (int i = tidx; i < total_elems; i += Traits::kNThreads)
         reinterpret_cast<Element*>(smem_)[i] = Element(0);
     __syncthreads();
 
-    // Load data to SMEM
+    // Load persistent buffers: K_tilde and step2
     typename Traits::GmemTiledCopy gmem_copy;
     auto gmem_thr = gmem_copy.get_thread_slice(tidx);
 
@@ -148,41 +138,58 @@ kernel1_bwd_tc(
         auto* kt=k_tilde_ptr+bh*m*D; auto* s2=step2_ptr+bh*m*D;
         for(int i=tidx;i<m*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D){sKt(r,c)=kt[r*D+c];sS2(r,c)=s2[r*D+c];}}
     }
+
+    // Load Q into slot
     if (full) {
-        auto gQ  = make_tensor(make_gmem_ptr(q_s_ptr+bh*N*D+row_start*D), Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
-        auto gdO = make_tensor(make_gmem_ptr(dO_ptr+bh*N*D+row_start*D),  Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
-        cute::copy(gmem_copy, gmem_thr.partition_S(gQ),  gmem_thr.partition_D(sQ));
-        cute::copy(gmem_copy, gmem_thr.partition_S(gdO), gmem_thr.partition_D(sdO));
+        auto gQ = make_tensor(make_gmem_ptr(q_s_ptr+bh*N*D+row_start*D), Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gQ), gmem_thr.partition_D(sSlot));
     } else {
-        auto* q=q_s_ptr+bh*N*D+row_start*D; auto* d=dO_ptr+bh*N*D+row_start*D;
-        for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D){sQ(r,c)=q[r*D+c];sdO(r,c)=d[r*D+c];}}
+        auto* q=q_s_ptr+bh*N*D+row_start*D;
+        for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D) sSlot(r,c)=q[r*D+c];}
     }
     cp_async_fence(); cp_async_wait<0>(); __syncthreads();
 
-    // MMA setup — primary TiledMma for S/dP (kBlockM × kBlockN)
+    // ======== TiledMma setup (GEMM1/2/3: kBlockM × kBlockN output) ========
     typename Traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
+
     auto smem_copy_A  = make_tiled_copy_A(typename Traits::SmemCopyAtom{}, tiled_mma);
     auto thr_copy_A   = smem_copy_A.get_thread_slice(tidx);
     auto smem_copy_B  = make_tiled_copy_B(typename Traits::SmemCopyAtom{}, tiled_mma);
     auto thr_copy_B   = smem_copy_B.get_thread_slice(tidx);
-    // For GEMM3: B uses transposed view of Kt (kHeadDim, kBlockN)
     auto smem_copy_Bt = make_tiled_copy_B(typename Traits::SmemCopyAtomTransposed{}, tiled_mma);
     auto thr_copy_Bt  = smem_copy_Bt.get_thread_slice(tidx);
 
-    // Identity tensor for physical row extraction
+    // Identity tensor for physical row/col of (kBlockM, kBlockN) accumulators
     auto cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
     auto tScS = thr_mma.partition_C(cS);
     auto tScS_rc = make_tensor(tScS.data(), convert_layout_acc_rowcol(tScS.layout()));
 
-    // GEMM1: S = Q @ Kt^T
+    // ======== TiledMmaDKV setup (GEMM4/5: kBlockN × kHeadDim output) ========
+    typename Traits::TiledMmaDKV tiled_mma_dkv;
+    auto thr_mma_dkv = tiled_mma_dkv.get_thread_slice(tidx);
+
+    // A-operand: P^T or dS^T from SmemLayoutPdStransposed (LDSM_T)
+    auto smem_copy_PdSt = make_tiled_copy_A(typename Traits::SmemCopyAtomTransposed{}, tiled_mma_dkv);
+    auto thr_copy_PdSt  = smem_copy_PdSt.get_thread_slice(tidx);
+
+    // B-operand: Q or dO from SmemLayoutKVtransposed (LDSM_T)
+    // kBlockM == kBlockN, so SmemLayoutQ == SmemLayoutKV — transposed views are compatible
+    auto smem_copy_SlotT = make_tiled_copy_B(typename Traits::SmemCopyAtomTransposed{}, tiled_mma_dkv);
+    auto thr_copy_SlotT  = smem_copy_SlotT.get_thread_slice(tidx);
+
+    // Identity tensor for (kBlockN, kHeadDim) accumulators — maps fragments to physical indices
+    auto cDKV = make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});
+    auto tDKVc = thr_mma_dkv.partition_C(cDKV);
+
+    // ======== GEMM1: S = Q @ Kt^T (slot has Q) ========
     auto acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_s);
-    gemm_smem(acc_s, thr_mma.partition_fragment_A(sQ), thr_mma.partition_fragment_B(sKt),
-              thr_copy_A.partition_S(sQ), thr_copy_B.partition_S(sKt),
+    gemm_smem(acc_s, thr_mma.partition_fragment_A(sSlot), thr_mma.partition_fragment_B(sKt),
+              thr_copy_A.partition_S(sSlot), thr_copy_B.partition_S(sKt),
               tiled_mma, smem_copy_A, smem_copy_B, thr_copy_A, thr_copy_B);
 
-    // P = exp(S - LSE), mask cols >= m
+    // P = exp(S - LSE), mask cols >= m and rows >= tile_rows
     auto scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
     constexpr int nrow = decltype(size<0>(scores))::value;
 
@@ -197,82 +204,135 @@ kernel1_bwd_tc(
             scores(mi, ni) = (pc < m && pr < tile_rows) ? expf(scores(mi, ni) - lse_val) : 0.0f;
         }
     }
+    // acc_s = P in registers
 
-    // Write P to SMEM
-    {
-        auto rP = convert_type<Element>(acc_s);
-        auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
-        auto tc = sc.get_thread_slice(tidx);
-        cute::copy(sc, tc.retile_S(rP), tc.partition_D(sP));
+    // ======== Swap slot: Q → dO ========
+    __syncthreads();
+    if (full) {
+        auto gdO = make_tensor(make_gmem_ptr(dO_ptr+bh*N*D+row_start*D), Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gdO), gmem_thr.partition_D(sSlot));
+    } else {
+        auto* d=dO_ptr+bh*N*D+row_start*D;
+        for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D) sSlot(r,c)=d[r*D+c];}
     }
+    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
 
-    // GEMM2: dP = dO @ step2^T
+    // ======== GEMM2: dP = dO @ step2^T (slot=dO, sS2=step2) ========
     auto acc_dp = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_dp);
-    gemm_smem(acc_dp, thr_mma.partition_fragment_A(sdO), thr_mma.partition_fragment_B(sS2),
-              thr_copy_A.partition_S(sdO), thr_copy_B.partition_S(sS2),
+    gemm_smem(acc_dp, thr_mma.partition_fragment_A(sSlot), thr_mma.partition_fragment_B(sS2),
+              thr_copy_A.partition_S(sSlot), thr_copy_B.partition_S(sS2),
               tiled_mma, smem_copy_A, smem_copy_B, thr_copy_A, thr_copy_B);
 
     // Softmax backward: dS = P * (dP - D1)
-    auto dP = make_tensor(acc_dp.data(), convert_layout_acc_rowcol(acc_dp.layout()));
+    auto dP_rc = make_tensor(acc_dp.data(), convert_layout_acc_rowcol(acc_dp.layout()));
     const float* d1 = D1_ptr + bh*N + row_start;
     #pragma unroll
     for (int mi = 0; mi < nrow; mi++) {
         int pr = get<0>(tScS_rc(mi, 0));
         float d1v = (pr < tile_rows) ? d1[pr] : 0.0f;
         #pragma unroll
-        for (int ni = 0; ni < size<1>(dP); ni++)
-            dP(mi, ni) = scores(mi, ni) * (dP(mi, ni) - d1v);
+        for (int ni = 0; ni < size<1>(dP_rc); ni++)
+            dP_rc(mi, ni) = scores(mi, ni) * (dP_rc(mi, ni) - d1v);
+    }
+    // acc_dp = dS in registers
+    // sS2 is FREE (step2 no longer needed after GEMM2)
+
+    // ======== Write P to sS2 for GEMM5 (SmemLayoutPdS on sS2_ptr) ========
+    {
+        auto rP = convert_type<Element>(acc_s);
+        auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
+        auto tc = sc.get_thread_slice(tidx);
+        cute::copy(sc, tc.retile_S(rP), tc.partition_D(sPdS));
+    }
+    __syncthreads();
+
+    // ======== GEMM5 TC: dstep2 = P^T @ dO (TiledMmaDKV) ========
+    // A = P^T: SmemLayoutPdStransposed on sS2_ptr (LDSM_T)
+    // B = dO:  SmemLayoutKVtransposed on slot_ptr (LDSM_T)
+    {
+        auto acc_ds2 = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});
+        clear(acc_ds2);
+        gemm_smem(acc_ds2,
+                  thr_mma_dkv.partition_fragment_A(sPdStNS),
+                  thr_mma_dkv.partition_fragment_B(sSlotTNS),
+                  thr_copy_PdSt.partition_S(sPdSt),
+                  thr_copy_SlotT.partition_S(sSlotT),
+                  tiled_mma_dkv, smem_copy_PdSt, smem_copy_SlotT,
+                  thr_copy_PdSt, thr_copy_SlotT);
+
+        // atomicAdd results to dstep2 (FP32 global accumulator)
+        float* ds2 = dstep2_ptr + bh*m*D;
+        #pragma unroll
+        for (int fi = 0; fi < size(acc_ds2); fi++) {
+            int row = get<0>(tDKVc(fi));
+            int col = get<1>(tDKVc(fi));
+            if (row < m && col < D)
+                atomicAdd(&ds2[row * D + col], acc_ds2(fi));
+        }
     }
 
-    // Write dS to SMEM
+    // ======== Write dS to sS2 + reload Q into slot (parallel: different SMEM regions) ========
+    __syncthreads();  // GEMM5 done reading sS2 (P) and slot (dO)
+
+    // Write dS over P in sS2 (register → SMEM, synchronous)
     {
         auto rdS = convert_type<Element>(acc_dp);
         auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
         auto tc = sc.get_thread_slice(tidx);
-        cute::copy(sc, tc.retile_S(rdS), tc.partition_D(sdS));
+        cute::copy(sc, tc.retile_S(rdS), tc.partition_D(sPdS));
     }
-    __syncthreads();
 
-    // GEMM3: dQ_s = dS @ Kt^T (Br×m @ m×D -> Br×D)
-    auto acc_dq = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
-    clear(acc_dq);
-    gemm_smem(acc_dq, thr_mma.partition_fragment_A(sdS), thr_mma.partition_fragment_B(sKttNS),
-              thr_copy_A.partition_S(sdS), thr_copy_Bt.partition_S(sKtt),
-              tiled_mma, smem_copy_A, smem_copy_Bt, thr_copy_A, thr_copy_Bt);
+    // Reload Q into slot (GMEM → SMEM, async or scalar)
+    if (full) {
+        auto gQ = make_tensor(make_gmem_ptr(q_s_ptr+bh*N*D+row_start*D), Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gQ), gmem_thr.partition_D(sSlot));
+    } else {
+        auto* q=q_s_ptr+bh*N*D+row_start*D;
+        for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D) sSlot(r,c)=q[r*D+c];}
+    }
+    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
 
-    // GEMM4/5 MUST run BEFORE we write dQ to sQ (which overwrites Q data).
-    // GEMM4: dKt[j,d] += sum_i dS[i,j] * Q[i,d]
-    // GEMM5: dstep2[j,d] += sum_i P[i,j] * dO[i,d]
-    // Read dS/P from registers, Q/dO from sQ/sdO (still contains original data).
+    // ======== GEMM4 TC: dKt = dS^T @ Q (TiledMmaDKV) ========
+    // A = dS^T: SmemLayoutPdStransposed on sS2_ptr (LDSM_T)
+    // B = Q:    SmemLayoutKVtransposed on slot_ptr (LDSM_T)
     {
+        auto acc_dkt = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});
+        clear(acc_dkt);
+        gemm_smem(acc_dkt,
+                  thr_mma_dkv.partition_fragment_A(sPdStNS),
+                  thr_mma_dkv.partition_fragment_B(sSlotTNS),
+                  thr_copy_PdSt.partition_S(sPdSt),
+                  thr_copy_SlotT.partition_S(sSlotT),
+                  tiled_mma_dkv, smem_copy_PdSt, smem_copy_SlotT,
+                  thr_copy_PdSt, thr_copy_SlotT);
+
+        // atomicAdd results to dK_tilde (FP32 global accumulator)
         float* dk = dK_tilde_ptr + bh*m*D;
-        float* ds2 = dstep2_ptr + bh*m*D;
-
         #pragma unroll
-        for (int fi = 0; fi < size(acc_dp); fi++) {
-            int row = get<0>(tScS(fi));
-            int col = get<1>(tScS(fi));
-            if (row >= tile_rows || col >= m) continue;
-
-            float dS_val = acc_dp(fi);
-            float P_val  = acc_s(fi);
-
-            for (int d = 0; d < D; d++) {
-                float q_val  = to_float(sQ(row, d));
-                float dO_val = to_float(sdO(row, d));
-                atomicAdd(&dk[col * D + d],  dS_val * q_val);
-                atomicAdd(&ds2[col * D + d], P_val  * dO_val);
-            }
+        for (int fi = 0; fi < size(acc_dkt); fi++) {
+            int row = get<0>(tDKVc(fi));
+            int col = get<1>(tDKVc(fi));
+            if (row < m && col < D)
+                atomicAdd(&dk[row * D + col], acc_dkt(fi));
         }
     }
 
-    // NOW write dQ_s to GMEM (overwrites sQ with dQ values)
+    // ======== GEMM3 TC: dQ = dS @ Kt (TiledMma) ========
+    // A = dS: SmemLayoutPdS on sS2_ptr (LDSM_N, non-transposed)
+    // B = Kt: SmemLayoutKVtransposed on sKt_ptr (LDSM_T)
+    auto acc_dq = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+    clear(acc_dq);
+    gemm_smem(acc_dq, thr_mma.partition_fragment_A(sPdS), thr_mma.partition_fragment_B(sKttNS),
+              thr_copy_A.partition_S(sPdS), thr_copy_Bt.partition_S(sKtt),
+              tiled_mma, smem_copy_A, smem_copy_Bt, thr_copy_A, thr_copy_Bt);
+
+    // ======== Write dQ to GMEM via slot ========
     {
         auto rdQ = convert_type<Element>(acc_dq);
         auto sc = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{}, tiled_mma);
         auto tc = sc.get_thread_slice(tidx);
-        cute::copy(sc, tc.retile_S(rdQ), tc.partition_D(sQ));
+        cute::copy(sc, tc.retile_S(rdQ), tc.partition_D(sSlot));
         __syncthreads();
         Element* dq = dQ_s_ptr + bh*N*D + row_start*D;
         if (full) {
@@ -280,9 +340,9 @@ kernel1_bwd_tc(
             auto gc = make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                 typename Traits::GmemLayoutAtom{}, Layout<Shape<_1, Int<Traits::kGmemElemsPerLoad>>>{});
             auto gt = gc.get_thread_slice(tidx);
-            cute::copy(gc, gt.partition_S(sQ), gt.partition_D(gdQ));
+            cute::copy(gc, gt.partition_S(sSlot), gt.partition_D(gdQ));
         } else {
-            for (int i=tidx; i<tile_rows*D; i+=Traits::kNThreads) { int r=i/D,c=i%D; dq[i]=sQ(r,c); }
+            for (int i=tidx; i<tile_rows*D; i+=Traits::kNThreads) { int r=i/D,c=i%D; dq[i]=sSlot(r,c); }
         }
     }
 }
@@ -317,13 +377,8 @@ void launch_kernel1_bwd(
             using Traits = K1Traits<kHeadDim, scalar_t>;
             dim3 grid((N+Traits::kBlockM-1)/Traits::kBlockM, BH);
             dim3 block(Traits::kNThreads);
-            int kPdS = static_cast<int>(cosize(typename Traits::SmemLayoutPdS{}));
-            size_t smem;
-            if constexpr (kHeadDim >= 128) {
-                smem = (Traits::kSmemQElems*2 + Traits::kSmemKVElems*2) * sizeof(scalar_t);
-            } else {
-                smem = (Traits::kSmemQElems*2 + Traits::kSmemKVElems*2 + kPdS*2) * sizeof(scalar_t);
-            }
+            // 3-buffer layout: slot (Q/dO) + sKt + sS2 (reused for sdS)
+            size_t smem = (Traits::kSmemQElems + Traits::kSmemKVElems*2) * sizeof(scalar_t);
             if (smem > 48*1024) {
                 FN_CHECK(smem <= get_max_smem_per_block(), "kernel1_bwd: smem");
                 FN_CUDA_CHECK(cudaFuncSetAttribute(kernel1_bwd_tc<Traits>,

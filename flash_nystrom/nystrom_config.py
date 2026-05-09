@@ -12,7 +12,15 @@ class NystromConfig:
     """Number of landmark/inducing points for Nystrom approximation."""
 
     newton_iter: int = 6
-    """Number of Newton-Schulz iterations for pseudoinverse."""
+    """Number of Newton-Schulz iterations for pseudoinverse.
+
+    6 is the default from the original Nyströmformer paper. The backward is
+    an exact unrolled chain rule through every NS iteration (not IFT, not
+    truncated), so the gradient is correct regardless of whether NS has fully
+    converged to K2^+. Lower values (e.g. 3) are cheaper but make K2_inv less
+    accurate as a pseudoinverse approximation; higher values (e.g. 10-15)
+    give a tighter approximation but cost more flops in both forward and
+    backward."""
 
     conv_kernel_size: int = 3
     """Kernel size for depthwise conv1d residual connection. Set to 0 to disable."""

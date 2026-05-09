@@ -36,7 +36,8 @@ struct NystromParams {
     float* __restrict__ softmax1_lse_ptr; // (B, H, N)
     float* __restrict__ softmax2_lse_ptr; // (B, H, m)
     float* __restrict__ softmax3_lse_ptr; // (B, H, m)
-    float* __restrict__ ns_iterates_ptr;  // (B, H, newton_iter, m, m) FP32, or nullptr
+    float* __restrict__ ns_iterates_ptr;  // (B, H, newton_iter+1, m, m) FP32 — REQUIRED
+    float* __restrict__ k2_softmax_ptr;   // (B, H, m, m) FP32 — REQUIRED for backward
 
     cudaStream_t stream;
 
@@ -71,7 +72,8 @@ struct NystromBwdParams {
     const float* __restrict__ lse1_ptr;      // (B,H,N)
     const float* __restrict__ lse2_ptr;      // (B,H,m)
     const float* __restrict__ lse3_ptr;      // (B,H,m)
-    const float* __restrict__ ns_iterates_ptr; // (B,H,newton_iter,m,m) FP32
+    const float* __restrict__ ns_iterates_ptr; // (B,H,newton_iter+1,m,m) FP32 — Z_0..Z_N
+    const float* __restrict__ k2_softmax_ptr;  // (B,H,m,m) FP32 — softmax K2 (saved from fwd)
     const void* __restrict__ conv_weight_ptr;  // (H,ks) or nullptr
 
     // Gradient input
@@ -89,6 +91,14 @@ struct NystromBwdParams {
     float* __restrict__ dK_tilde_ptr;        // (B,H,m,D) FP32
     float* __restrict__ dK2_inv_ptr;         // (B,H,m,m) FP32
     float* __restrict__ D1_ptr;              // (B,H,N) FP32 precomputed dot(dO,O)
+    float* __restrict__ D3_ptr;              // (B,H,m) FP32 precomputed sum_n A3[i,n]*dP3[i,n]
+
+    // Intermediate for TC kernel3_bwd: dO3 = K2_inv^T @ dstep2, stored as elem_type
+    void* __restrict__ dO3_ptr;              // (B,H,m,D) FP16/BF16, or nullptr for FP32
+
+    // Workspace for unrolled NS backward.
+    float* __restrict__ ns_dZ_workspace_ptr;   // (B,H,m,m) FP32 — rolling dZ_j
+    float* __restrict__ ns_dK2_workspace_ptr;  // (B,H,m,m) FP32 — accumulated dK2 from NS
 
     cudaStream_t stream;
 

@@ -2,146 +2,67 @@
  * Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
  * Licensed under the Apache License, Version 2.0
  ******************************************************************************/
+// Header for the unrolled Newton-Schulz backward.
+// Declarations only — definitions live in kernel2_inv_bwd.cu so we don't
+// get multiple symbols when this header is included from both
+// flash_nystrom.cu (debug hooks) and flash_nystrom_kernels.cu (orchestration).
 #pragma once
-#include "utils.h"
+#include <cuda_runtime.h>
 
 namespace flash_nystrom {
 
-// kernel2inv backward via implicit function theorem
-// instead of unrolling all 6 N-S iterations backwards (nightmrae),
-// we use: dK2 = -K2_inv^T @ dK2_inv @ K2_inv^T
-// this is exact when N-S has converged (which it has after 6 iters)
+// -- Production launch wrapper used by run_nystrom_bwd_impl --
 //
-// For a converged pseudoinverse K2_inv ≈ pinv(K2):
-//   dK2 = -K2_inv^T @ dK2_inv @ K2_inv^T
-//
-// This is exact when N-S has converged and avoids the impossible task of
-// backpropagating through 6 iterations of nested matrix products.
-//
-// Then backprop through softmax(Qt @ Kt^T) = K2:
-//   dS2 = K2 * (dK2 - rowsum(dK2 * K2))
-//   dQ_tilde += dS2 @ K_tilde
-//   dK_tilde += dS2^T @ Q_tilde
-//
-// Grid: (BH), Block: 256
-// SMEM: 4 × m² floats (K2, K2_inv_local, dK2, temp) + scratch
-
-template <typename scalar_t>
-__global__ void kernel2_inv_bwd_kernel(
-    const scalar_t* __restrict__ q_tilde,     // (BH, m, D)
-    const scalar_t* __restrict__ k_tilde,     // (BH, m, D)
-    const float*    __restrict__ lse2,         // (BH, m)
-    const float*    __restrict__ k2_inv,       // (BH, m, m) — the forward output
-    const float*    __restrict__ dK2_inv_in,   // (BH, m, m) — gradient input
-    float*          __restrict__ dQ_tilde,     // (BH, m, D) FP32, atomicAdd
-    float*          __restrict__ dK_tilde,     // (BH, m, D) FP32, atomicAdd
-    int D, int m
-) {
-    const int bh = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int nthreads = blockDim.x;
-    const int mm = m * m;
-
-    extern __shared__ float smem[];
-    float* K2      = smem;               // recomputed softmax output
-    float* K2inv_s = smem + mm;          // copy of K2_inv
-    float* dK2     = smem + 2 * mm;      // gradient w.r.t. K2
-    float* T1      = smem + 3 * mm;      // temp
-    float* scratch = smem + 4 * mm;
-
-    const scalar_t* qt = q_tilde + bh * m * D;
-    const scalar_t* kt = k_tilde + bh * m * D;
-
-    // Recompute K2 = softmax(Qt @ Kt^T) from LSE2
-    const float* lse2_bh = lse2 + bh * m;
-    for (int idx = tid; idx < mm; idx += nthreads) {
-        int i = idx / m, j = idx % m;
-        float dot = 0.0f;
-        for (int d = 0; d < D; d++)
-            dot += to_float(qt[i * D + d]) * to_float(kt[j * D + d]);
-        K2[idx] = expf(dot - lse2_bh[i]);
-    }
-    __syncthreads();
-
-    // Load K2_inv into SMEM
-    const float* k2inv_bh = k2_inv + bh * mm;
-    for (int idx = tid; idx < mm; idx += nthreads) K2inv_s[idx] = k2inv_bh[idx];
-    __syncthreads();
-
-    // Implicit function theorem: dK2 = -K2_inv^T @ dK2_inv @ K2_inv^T
-    const float* dk2i = dK2_inv_in + bh * mm;
-
-    // Step 1: T1 = dK2_inv @ K2_inv^T
-    for (int idx = tid; idx < mm; idx += nthreads) {
-        int r = idx / m, c = idx % m;
-        float acc = 0.0f;
-        for (int k = 0; k < m; k++) acc += dk2i[r * m + k] * K2inv_s[c * m + k]; // K2inv^T[k,c] = K2inv[c,k]
-        T1[idx] = acc;
-    }
-    __syncthreads();
-
-    // Step 2: dK2 = -K2_inv^T @ T1
-    for (int idx = tid; idx < mm; idx += nthreads) {
-        int r = idx / m, c = idx % m;
-        float acc = 0.0f;
-        for (int k = 0; k < m; k++) acc += K2inv_s[k * m + r] * T1[k * m + c]; // K2inv^T[r,k] = K2inv[k,r]
-        dK2[idx] = -acc;
-    }
-    __syncthreads();
-
-    // Softmax backward: K2 = softmax(S2), dS2 = K2 * (dK2 - D2)
-    // D2[i] = sum_j(dK2[i,j] * K2[i,j])
-    for (int i = tid; i < m; i += nthreads) {
-        float D_i = 0.0f;
-        for (int j = 0; j < m; j++) D_i += dK2[i * m + j] * K2[i * m + j];
-        for (int j = 0; j < m; j++)
-            T1[i * m + j] = K2[i * m + j] * (dK2[i * m + j] - D_i);
-    }
-    // T1 = dS2
-    __syncthreads();
-
-    // dQ_tilde += dS2 @ K_tilde
-    float* dQt_bh = dQ_tilde + bh * m * D;
-    for (int idx = tid; idx < m * D; idx += nthreads) {
-        int i = idx / D, d = idx % D;
-        float sum = 0.0f;
-        for (int j = 0; j < m; j++) sum += T1[i * m + j] * to_float(kt[j * D + d]);
-        atomicAdd(&dQt_bh[idx], sum);
-    }
-
-    // dK_tilde += dS2^T @ Q_tilde
-    float* dKt_bh = dK_tilde + bh * m * D;
-    for (int idx = tid; idx < m * D; idx += nthreads) {
-        int j = idx / D, d = idx % D;
-        float sum = 0.0f;
-        for (int i = 0; i < m; i++) sum += T1[i * m + j] * to_float(qt[i * D + d]);
-        atomicAdd(&dKt_bh[idx], sum);
-    }
-}
-
+// Unrolls all NS backward iterations and runs the final softmax-bwd step.
+// Inputs:
+//   q_tilde, k_tilde     (BH, m, D)               — input/output dtype
+//   lse2                 (unused, kept for ABI)
+//   k2_inv               (unused — Z_N is in ns_iterates)
+//   dK2_inv_in           (BH, m, m)  FP32         — incoming gradient dZ_N
+//   ns_iterates          (BH, newton_iter+1, m, m) FP32 — Z_0 .. Z_N
+//   K2_softmax           (BH, m, m) FP32          — softmax(QK^T) output
+// Outputs (accumulated):
+//   dQ_tilde, dK_tilde   (BH, m, D) FP32
+// Workspace (caller-allocated):
+//   dZ_workspace         (BH, m, m) FP32 — rolling dZ
+//   dK2_workspace        (BH, m, m) FP32 — accumulator
 template <typename scalar_t>
 void launch_kernel2_inv_bwd(
     const scalar_t* q_tilde, const scalar_t* k_tilde,
-    const float* lse2, const float* k2_inv, const float* dK2_inv,
+    const float* lse2,
+    const float* k2_inv,
+    const float* dK2_inv_in,
+    const float* ns_iterates,
+    const float* K2_softmax,
     float* dQ_tilde, float* dK_tilde,
-    int BH, int D, int m, int newton_iter, cudaStream_t stream
-) {
-    (void)newton_iter;  // Not needed for IFT approach
+    float* dZ_workspace,
+    float* dK2_workspace,
+    int BH, int D, int m, int newton_iter, cudaStream_t stream);
 
-    dim3 grid(BH);
-    dim3 block(256);
-    size_t smem = (4 * m * m + 8) * sizeof(float);
+// -- Test-only standalone launchers (used by debug pybind hooks) --
+//
+// Single backward step. Caller provides:
+//   K2_in   (BH, m, m) FP32 — softmax K2
+//   Z_j_in  (BH, m, m) FP32 — Z_j (per-bh stride = m*m)
+//   dZ_in   (BH, m, m) FP32 — dZ_{j+1}
+//   dZ_out  (BH, m, m) FP32 — receives dZ_j (overwritten)
+//   dK2_acc (BH, m, m) FP32 — atomicAdd accumulator (caller zeroes if needed)
+void launch_ns_bwd_step_test(
+    const float* K2_in, const float* Z_j_in, const float* dZ_in,
+    float* dZ_out, float* dK2_acc,
+    int BH, int m, cudaStream_t stream);
 
-    if (smem > 48 * 1024) {
-        FN_CHECK(smem <= get_max_smem_per_block(), "kernel2_inv_bwd: insufficient smem");
-        FN_CUDA_CHECK(cudaFuncSetAttribute(kernel2_inv_bwd_kernel<scalar_t>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-    }
-
-    kernel2_inv_bwd_kernel<scalar_t><<<grid, block, smem, stream>>>(
-        q_tilde, k_tilde, lse2, k2_inv, dK2_inv,
-        dQ_tilde, dK_tilde, D, m);
-    FN_CUDA_KERNEL_CHECK();
-}
+// Final step. Caller provides:
+//   q_tilde, k_tilde (BH, m, D) FP32
+//   K2_in           (BH, m, m) FP32 — softmax K2
+//   dZ0_in          (BH, m, m) FP32 — dZ_0
+//   dK2_inout       (BH, m, m) FP32 — kernel adds dZ0^T/c then uses for softmax bwd
+//   dQ_tilde_out    (BH, m, D) FP32 — kernel does plain += (caller zeroes)
+//   dK_tilde_out    (BH, m, D) FP32 — kernel does plain += (caller zeroes)
+void launch_ns_bwd_final_test(
+    const float* q_tilde, const float* k_tilde,
+    const float* K2_in, const float* dZ0_in,
+    float* dK2_inout, float* dQ_tilde_out, float* dK_tilde_out,
+    int BH, int D, int m, cudaStream_t stream);
 
 } // namespace flash_nystrom

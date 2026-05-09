@@ -8,32 +8,33 @@
 
 namespace flash_nystrom {
 
-// kernel2inv: softmax(Q_tilde @ K_tilde^T) then newton-schulz pseudoinverse
-// everything runs in shared memory since its just m x m matrices (m is small)
-// 6 iterations of third-order N-S is more than enough for convergence
-// All operations are on (m, m) matrices in shared memory.
+// kernel2_inv: K2 = softmax(Q_tilde @ K_tilde^T), then Newton-Schulz pseudoinverse.
 //
-// Grid:  (B*H)    — one CTA per (batch, head)
-// Block: (256)    — threads cooperatively operate on (m, m) matrices
+// Forward Newton-Schulz iteration (third-order Higham polynomial):
 //
-// SMEM layout (all FP32):
-//   K2:    m*m   (kernel_2 after softmax, read-only during iterations)
-//   Z:     m*m   (current Newton-Schulz iterate)
-//   Zold:  m*m   (previous iterate, needed for final multiply)
-//   T1:    m*m   (temporary)
-//   T2:    m*m   (temporary)
-//   scratch: 8 floats (reduction workspace)
+//     M_j = K2 @ Z_j
+//     Z_{j+1} = (1/4) * Z_j * (13*I - M_j*(15*I - M_j*(7*I - M_j)))
+//             = (1/4) * Z_j * (13*I - 15*M_j + 7*M_j^2 - M_j^3)
 //
-// Total: 5 * m^2 * 4 + 32 bytes
-//   m=64:  80KB  (fits SM80 opt-in of ~100KB)
+// Initialization: Z_0 = K2^T / ||K2||_1.
+//
+// To enable the unrolled backward, ALL iterates Z_0, Z_1, ..., Z_{N} are
+// written to ns_iterates_out (BH, N+1, m, m). The forward output K2_inv = Z_N
+// is also written to kernel2_inv_out separately for kernel3.
+//
+// Iteration count is `newton_iter` (default 6, capped at 20 by binding).
+// For row-stochastic K2 with spread eigenvalues, 6 iters has residual O(1).
+// The backward consistency does NOT require convergence — autograd-through-NS
+// gives correct gradients of the actual approximation regardless.
 
 template <typename scalar_t>
 __global__ void kernel2_inv_kernel(
-    const scalar_t* __restrict__ q_tilde,   // (B*H, m, D)
-    const scalar_t* __restrict__ k_tilde,   // (B*H, m, D)
-    float* __restrict__ kernel2_inv_out,     // (B*H, m, m) FP32
-    float* __restrict__ softmax_lse_out,     // (B*H, m)
-    float* __restrict__ ns_iterates_out,     // (B*H, newton_iter, m, m) or nullptr
+    const scalar_t* __restrict__ q_tilde,    // (B*H, m, D)
+    const scalar_t* __restrict__ k_tilde,    // (B*H, m, D)
+    float* __restrict__ kernel2_inv_out,      // (B*H, m, m) FP32 — final K2_inv = Z_N
+    float* __restrict__ softmax_lse_out,      // (B*H, m)
+    float* __restrict__ ns_iterates_out,      // (B*H, newton_iter+1, m, m) FP32 — Z_0..Z_N
+    float* __restrict__ k2_softmax_out,       // (B*H, m, m) FP32 — the softmax K2 (for backward)
     int D, int m, int newton_iter
 ) {
     const int bh = blockIdx.x;
@@ -52,7 +53,7 @@ __global__ void kernel2_inv_kernel(
     const scalar_t* qt = q_tilde + bh * m * D;
     const scalar_t* kt = k_tilde + bh * m * D;
 
-    // Step 1: K2 = Q_tilde @ K_tilde^T (FP32 accumulation)
+    // Step 1: K2_logits = Q_tilde @ K_tilde^T (FP32 accumulation)
     for (int idx = tid; idx < mm; idx += nthreads) {
         int i = idx / m;
         int j = idx % m;
@@ -64,7 +65,7 @@ __global__ void kernel2_inv_kernel(
     }
     __syncthreads();
 
-    // Step 2: Row-wise softmax on K2, save logsumexp
+    // Step 2: Row-wise softmax on K2, save LSE
     float* lse_out = softmax_lse_out + bh * m;
 
     for (int row = 0; row < m; row++) {
@@ -94,13 +95,20 @@ __global__ void kernel2_inv_kernel(
     }
     __syncthreads();
 
-    // Step 3: Z_0 = K2^T / ||K2||_1
-    // K2 is row-stochastic (softmax output), so ||K2||_inf = 1.
-    // ||K2||_1 = max column sum.
+    // Step 2.5: write softmax K2 to GMEM for the backward kernel.
+    // The SMEM K2 will be overwritten by Z_0 below; preserve a copy.
+    if (k2_softmax_out != nullptr) {
+        float* k2sm_bh = k2_softmax_out + bh * mm;
+        for (int idx = tid; idx < mm; idx += nthreads) k2sm_bh[idx] = K2[idx];
+        __syncthreads();
+    }
 
+    // Step 3: Z_0 = K2^T / (||K2||_1 * ||K2||_inf).
+    // Both norms are computed and used as a piecewise-constant scalar — the
+    // gradient through their max() ops is handled in the backward final kernel.
     for (int j = tid; j < m; j += nthreads) {
         float col_sum = 0.0f;
-        for (int i = 0; i < m; i++) col_sum += K2[i * m + j];
+        for (int i = 0; i < m; i++) col_sum += K2[i * m + j];   // K2 >= 0 (softmax)
         T1[j] = col_sum;
     }
     __syncthreads();
@@ -110,30 +118,43 @@ __global__ void kernel2_inv_kernel(
         local_col_max = fmaxf(local_col_max, T1[j]);
     }
     float norm1 = block_reduce_max(local_col_max, scratch);
-    float inv_norm = 1.0f / (norm1 + 1e-12f);
+
+    // ||K2||_inf = max row sum. For a row-stochastic K2 this is ~1 but we
+    // compute it explicitly so the scaling matches the reference exactly.
+    float local_row_max = -FLT_MAX;
+    for (int i = tid; i < m; i += nthreads) {
+        float row_sum = 0.0f;
+        for (int j = 0; j < m; j++) row_sum += K2[i * m + j];
+        local_row_max = fmaxf(local_row_max, row_sum);
+    }
+    float norm_inf = block_reduce_max(local_row_max, scratch);
+
+    float inv_c = 1.0f / fmaxf(norm1 * norm_inf, 1e-12f);
 
     for (int idx = tid; idx < mm; idx += nthreads) {
         int row = idx / m;
         int col = idx % m;
-        Z[idx] = K2[col * m + row] * inv_norm;  // transpose
+        Z[idx] = K2[col * m + row] * inv_c;  // transpose
     }
     __syncthreads();
 
-    // Step 4: Newton-Schulz iterations (third order)
+    // Save Z_0 as the first iterate (index 0 in ns_iterates_out)
+    if (ns_iterates_out != nullptr) {
+        float* iter_out = ns_iterates_out + bh * (newton_iter + 1) * mm;
+        for (int idx = tid; idx < mm; idx += nthreads) iter_out[idx] = Z[idx];
+        __syncthreads();
+    }
+
+    // Step 4: Newton-Schulz iterations (third order Higham)
     // Z_{j+1} = 0.25 * Z_j * (13I - K2*Z_j * (15I - K2*Z_j * (7I - K2*Z_j)))
     //
-    // Requires Zold to preserve Z_j for the final 0.25 * Z_j @ (...) multiply.
-
+    // Save each iterate Z_{j+1} to GMEM (index j+1).
     for (int iter = 0; iter < newton_iter; iter++) {
-        // Save Zold = Z (both to SMEM and global for backward)
+        // Save Zold = Z (we'll need it for the final 0.25 * Z * (...) multiply)
         for (int idx = tid; idx < mm; idx += nthreads) Zold[idx] = Z[idx];
-        if (ns_iterates_out != nullptr) {
-            float* iter_out = ns_iterates_out + bh * newton_iter * mm + iter * mm;
-            for (int idx = tid; idx < mm; idx += nthreads) iter_out[idx] = Z[idx];
-        }
         __syncthreads();
 
-        // T1 = K2 @ Zold
+        // T1 = K2 @ Zold = M
         for (int idx = tid; idx < mm; idx += nthreads) {
             int row = idx / m, col = idx % m;
             float acc = 0.0f;
@@ -142,14 +163,14 @@ __global__ void kernel2_inv_kernel(
         }
         __syncthreads();
 
-        // T2 = 7I - T1
+        // T2 = 7I - M
         for (int idx = tid; idx < mm; idx += nthreads) {
             int row = idx / m, col = idx % m;
             T2[idx] = ((row == col) ? 7.0f : 0.0f) - T1[idx];
         }
         __syncthreads();
 
-        // Z = T1 @ T2   (= KZ * (7I - KZ))
+        // Z = M @ T2 = M*(7I - M)
         for (int idx = tid; idx < mm; idx += nthreads) {
             int row = idx / m, col = idx % m;
             float acc = 0.0f;
@@ -158,14 +179,14 @@ __global__ void kernel2_inv_kernel(
         }
         __syncthreads();
 
-        // T2 = 15I - Z
+        // T2 = 15I - Z = 15I - M*(7I - M)
         for (int idx = tid; idx < mm; idx += nthreads) {
             int row = idx / m, col = idx % m;
             T2[idx] = ((row == col) ? 15.0f : 0.0f) - Z[idx];
         }
         __syncthreads();
 
-        // Z = T1 @ T2   (= KZ * (15I - KZ*(7I-KZ)))
+        // Z = M @ T2 = M*(15I - M*(7I - M))
         for (int idx = tid; idx < mm; idx += nthreads) {
             int row = idx / m, col = idx % m;
             float acc = 0.0f;
@@ -174,14 +195,14 @@ __global__ void kernel2_inv_kernel(
         }
         __syncthreads();
 
-        // T2 = 13I - Z
+        // T2 = 13I - Z = 13I - M*(15I - M*(7I - M))
         for (int idx = tid; idx < mm; idx += nthreads) {
             int row = idx / m, col = idx % m;
             T2[idx] = ((row == col) ? 13.0f : 0.0f) - Z[idx];
         }
         __syncthreads();
 
-        // Z = 0.25 * Zold @ T2
+        // Z = 0.25 * Zold @ T2 = (1/4) * Z_old * (13I - M*(15I - M*(7I - M)))
         for (int idx = tid; idx < mm; idx += nthreads) {
             int row = idx / m, col = idx % m;
             float acc = 0.0f;
@@ -189,23 +210,28 @@ __global__ void kernel2_inv_kernel(
             Z[idx] = 0.25f * acc;
         }
         __syncthreads();
+
+        // Save Z_{iter+1} to GMEM (index iter+1)
+        if (ns_iterates_out != nullptr) {
+            float* iter_out = ns_iterates_out + bh * (newton_iter + 1) * mm + (iter + 1) * mm;
+            for (int idx = tid; idx < mm; idx += nthreads) iter_out[idx] = Z[idx];
+            __syncthreads();
+        }
     }
 
-    // Step 5: Write output
+    // Step 5: Write final K2_inv (= Z_N) for kernel3
     float* out = kernel2_inv_out + bh * mm;
     for (int idx = tid; idx < mm; idx += nthreads) {
         out[idx] = Z[idx];
     }
 }
 
-// -- launch wrapper --
-
-
 template <typename scalar_t>
 void launch_kernel2_inv(
     const scalar_t* q_tilde, const scalar_t* k_tilde,
     float* kernel2_inv, float* softmax_lse,
-    float* ns_iterates,  // (BH, newton_iter, m, m) or nullptr
+    float* ns_iterates,        // (BH, newton_iter+1, m, m) — REQUIRED for backward
+    float* k2_softmax,         // (BH, m, m) — the softmax K2 (REQUIRED for backward)
     int BH, int D, int m, int newton_iter,
     cudaStream_t stream
 ) {
@@ -227,7 +253,8 @@ void launch_kernel2_inv(
     }
 
     kernel2_inv_kernel<scalar_t><<<grid, block, smem_bytes, stream>>>(
-        q_tilde, k_tilde, kernel2_inv, softmax_lse, ns_iterates, D, m, newton_iter);
+        q_tilde, k_tilde, kernel2_inv, softmax_lse, ns_iterates, k2_softmax,
+        D, m, newton_iter);
     FN_CUDA_KERNEL_CHECK();
 }
 

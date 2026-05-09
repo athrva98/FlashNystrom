@@ -126,27 +126,36 @@ class TestCUDABackward:
         ).item()
         assert cos_sim > 0.99, f"dV cosine sim {cos_sim:.4f} too low"
 
-    def test_backward_d128(self):
-        """Test backward with D=128 (larger head dim, needs SMEM opt-in)."""
+    def test_backward_d128_cosine(self):
+        """D=128 gradients should match reference (cosine > 0.9)."""
         try:
             from flash_nystrom.flash_nystrom import FlashNystromFunction
         except ImportError:
             pytest.skip("CUDA extension not compiled")
 
-        torch.manual_seed(42)
-        B, H, N, D, m = 1, 2, 128, 128, 64
+        torch.manual_seed(0)
+        B, H, N, D, m = 1, 2, 256, 128, 64
         q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        out = FlashNystromFunction.apply(q, k, v, None, m, 6, 0)
-        out.sum().backward()
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
 
-        for name, p in [("q", q), ("k", k), ("v", v)]:
-            assert p.grad is not None, f"{name}.grad is None"
-            assert not torch.isnan(p.grad).any(), f"{name}.grad has NaN"
-            assert not torch.isinf(p.grad).any(), f"{name}.grad has Inf"
-            assert p.grad.abs().max() > 0, f"{name}.grad is all zeros"
+        q2 = q.detach().float().cpu().requires_grad_(True)
+        k2 = k.detach().float().cpu().requires_grad_(True)
+        v2 = v.detach().float().cpu().requires_grad_(True)
+        nystrom_attention_reference_simple(q2, k2, v2, m).sum().backward()
+
+        def cos(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.float().flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
+
+        dq_cos = cos(q.grad.cpu(), q2.grad)
+        dk_cos = cos(k.grad.cpu(), k2.grad)
+        dv_cos = cos(v.grad.cpu(), v2.grad)
+        assert dq_cos > 0.90, f"D=128 dQ cosine {dq_cos:.4f} too low"
+        assert dk_cos > 0.90, f"D=128 dK cosine {dk_cos:.4f} too low"
+        assert dv_cos > 0.99, f"D=128 dV cosine {dv_cos:.4f} too low"
 
     def test_backward_bf16(self):
         """BF16 backward should produce finite gradients."""
@@ -259,6 +268,298 @@ class TestCUDABackward:
         assert dq_cos > 0.90, f"dQ cosine {dq_cos:.4f} too low"
         assert dk_cos > 0.90, f"dK cosine {dk_cos:.4f} too low"
         assert dv_cos > 0.99, f"dV cosine {dv_cos:.4f} too low"
+
+    # -- BF16 cosine similarity --
+
+    def test_backward_bf16_cosine_d64(self):
+        """BF16 gradients at D=64 should match reference with cosine > 0.9."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(0)
+        B, H, N, D, m = 1, 2, 256, 64, 32
+        q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
+
+        q2 = q.detach().float().cpu().requires_grad_(True)
+        k2 = k.detach().float().cpu().requires_grad_(True)
+        v2 = v.detach().float().cpu().requires_grad_(True)
+        nystrom_attention_reference_simple(q2, k2, v2, m).sum().backward()
+
+        def cos(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.float().flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
+
+        assert cos(q.grad.cpu(), q2.grad) > 0.85, "BF16 dQ cosine too low"
+        assert cos(k.grad.cpu(), k2.grad) > 0.85, "BF16 dK cosine too low"
+        assert cos(v.grad.cpu(), v2.grad) > 0.99, "BF16 dV cosine too low"
+
+    def test_backward_bf16_d128(self):
+        """BF16 at D=128 should produce correct gradients."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(0)
+        B, H, N, D, m = 1, 2, 256, 128, 64
+        q = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
+
+        q2 = q.detach().float().cpu().requires_grad_(True)
+        k2 = k.detach().float().cpu().requires_grad_(True)
+        v2 = v.detach().float().cpu().requires_grad_(True)
+        nystrom_attention_reference_simple(q2, k2, v2, m).sum().backward()
+
+        def cos(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.float().flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
+
+        assert cos(q.grad.cpu(), q2.grad) > 0.85, "BF16 D=128 dQ cosine too low"
+        assert cos(k.grad.cpu(), k2.grad) > 0.85, "BF16 D=128 dK cosine too low"
+        assert cos(v.grad.cpu(), v2.grad) > 0.99, "BF16 D=128 dV cosine too low"
+
+    # -- FP32 scalar path at D=128 --
+
+    def test_backward_fp32_d128_raises(self):
+        """FP32+D=128 backward should raise a clear error, not crash."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(42)
+        B, H, N, D, m = 1, 2, 128, 128, 64
+        q = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda", requires_grad=True)
+
+        with pytest.raises(RuntimeError, match="FP32.*D=128 is not supported"):
+            FlashNystromFunction.apply(q, k, v, None, m, 6, 0)
+
+    # -- partial tile edge cases --
+
+    def test_backward_n65_partial_tile(self):
+        """N=65: 1 full tile + 1-row partial. Tests partial tile in backward."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(42)
+        B, H, N, D, m = 1, 2, 65, 64, 32
+        q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
+
+        q2 = q.detach().float().cpu().requires_grad_(True)
+        k2 = k.detach().float().cpu().requires_grad_(True)
+        v2 = v.detach().float().cpu().requires_grad_(True)
+        nystrom_attention_reference_simple(q2, k2, v2, m).sum().backward()
+
+        def cos(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.float().flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
+
+        assert cos(v.grad.cpu(), v2.grad) > 0.99, f"N=65 dV cosine too low"
+
+    def test_backward_n63_under_tile(self):
+        """N=63: single partial tile, one row short."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(42)
+        B, H, N, D, m = 1, 2, 63, 64, 32
+        q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
+        for name, p in [("q", q), ("k", k), ("v", v)]:
+            assert not torch.isnan(p.grad).any(), f"{name}.grad has NaN at N=63"
+            assert p.grad.abs().max() > 0, f"{name}.grad is all zeros at N=63"
+
+    def test_backward_d128_partial_tile(self):
+        """D=128, N=100: partial tile with D=128 SMEM path."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(42)
+        B, H, N, D, m = 1, 2, 100, 128, 64
+        q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
+
+        q2 = q.detach().float().cpu().requires_grad_(True)
+        k2 = k.detach().float().cpu().requires_grad_(True)
+        v2 = v.detach().float().cpu().requires_grad_(True)
+        nystrom_attention_reference_simple(q2, k2, v2, m).sum().backward()
+
+        def cos(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.float().flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
+
+        assert cos(v.grad.cpu(), v2.grad) > 0.99, "D=128 N=100 dV cosine too low"
+
+    # -- large N stress (atomicAdd accumulation across many tiles) --
+
+    def test_backward_large_n_cosine(self):
+        """N=4096: many tiles accumulate dKt/dstep2 via atomicAdd."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(0)
+        B, H, N, D, m = 1, 2, 4096, 64, 32
+        q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
+
+        q2 = q.detach().float().cpu().requires_grad_(True)
+        k2 = k.detach().float().cpu().requires_grad_(True)
+        v2 = v.detach().float().cpu().requires_grad_(True)
+        nystrom_attention_reference_simple(q2, k2, v2, m).sum().backward()
+
+        def cos(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.float().flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
+
+        dq_cos = cos(q.grad.cpu(), q2.grad)
+        dk_cos = cos(k.grad.cpu(), k2.grad)
+        dv_cos = cos(v.grad.cpu(), v2.grad)
+        assert dq_cos > 0.85, f"N=4096 dQ cosine {dq_cos:.4f} too low"
+        assert dk_cos > 0.85, f"N=4096 dK cosine {dk_cos:.4f} too low"
+        assert dv_cos > 0.99, f"N=4096 dV cosine {dv_cos:.4f} too low"
+
+    # -- N%m != 0 with cosine check --
+
+    def test_backward_non_divisible_n_cosine(self):
+        """N=300, m=32: not divisible, check cosine not just NaN."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(42)
+        B, H, N, D, m = 1, 2, 300, 64, 32
+        q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
+
+        q2 = q.detach().float().cpu().requires_grad_(True)
+        k2 = k.detach().float().cpu().requires_grad_(True)
+        v2 = v.detach().float().cpu().requires_grad_(True)
+        nystrom_attention_reference_simple(q2, k2, v2, m).sum().backward()
+
+        def cos(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.float().flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
+
+        assert cos(v.grad.cpu(), v2.grad) > 0.99, "N=300 dV cosine too low"
+
+    # -- m < kBlockN --
+
+    def test_backward_m16_d128(self):
+        """m=16, D=128: small landmark count with zero-padded SMEM."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(42)
+        B, H, N, D, m = 1, 2, 256, 128, 16
+        q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
+        for name, p in [("q", q), ("k", k), ("v", v)]:
+            assert not torch.isnan(p.grad).any(), f"{name}.grad NaN at m=16 D=128"
+            assert p.grad.abs().max() > 0, f"{name}.grad zeros at m=16 D=128"
+
+    # -- determinism --
+
+    def test_backward_determinism(self):
+        """Two identical backward passes should produce identical gradients."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(42)
+        B, H, N, D, m = 1, 2, 256, 64, 32
+
+        def run():
+            q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+            k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+            v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+            # use same data both runs
+            return q, k, v
+
+        q1, k1, v1 = run()
+        q2 = q1.detach().clone().requires_grad_(True)
+        k2 = k1.detach().clone().requires_grad_(True)
+        v2 = v1.detach().clone().requires_grad_(True)
+
+        FlashNystromFunction.apply(q1, k1, v1, None, m, 6, 0).sum().backward()
+        FlashNystromFunction.apply(q2, k2, v2, None, m, 6, 0).sum().backward()
+
+        # dV should be bit-exact (no atomicAdd in V path)
+        assert torch.equal(v1.grad, v2.grad), \
+            f"dV not deterministic, max diff: {(v1.grad-v2.grad).abs().max().item()}"
+
+    # -- multi-batch with cosine --
+
+    def test_backward_batch_cosine(self):
+        """Multi-batch backward with cosine similarity check."""
+        try:
+            from flash_nystrom.flash_nystrom import FlashNystromFunction
+        except ImportError:
+            pytest.skip("CUDA extension not compiled")
+
+        torch.manual_seed(42)
+        B, H, N, D, m = 4, 4, 128, 64, 32
+        q = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
+
+        FlashNystromFunction.apply(q, k, v, None, m, 6, 0).sum().backward()
+
+        q2 = q.detach().float().cpu().requires_grad_(True)
+        k2 = k.detach().float().cpu().requires_grad_(True)
+        v2 = v.detach().float().cpu().requires_grad_(True)
+        nystrom_attention_reference_simple(q2, k2, v2, m).sum().backward()
+
+        def cos(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.float().flatten().unsqueeze(0), b.flatten().unsqueeze(0)).item()
+
+        assert cos(q.grad.cpu(), q2.grad) > 0.90, "Batch dQ cosine too low"
+        assert cos(k.grad.cpu(), k2.grad) > 0.90, "Batch dK cosine too low"
+        assert cos(v.grad.cpu(), v2.grad) > 0.99, "Batch dV cosine too low"
+
+    # -- end-to-end --
 
     def test_training_converges(self):
         """End-to-end: model can overfit to a fixed target."""

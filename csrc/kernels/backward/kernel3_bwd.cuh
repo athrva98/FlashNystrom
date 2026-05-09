@@ -4,14 +4,24 @@
  ******************************************************************************/
 #pragma once
 #include "utils.h"
+#include "nystrom_utils.h"
+#include "kernels/kernel3_output_fused.cuh"
+
+#include <cute/tensor.hpp>
+#include <cute/atom/mma_atom.hpp>
+#include <cute/atom/copy_atom.hpp>
+#include <cutlass/numeric_types.h>
 
 namespace flash_nystrom {
 
-// kernel3 backward — tiled over K/V like the forward
-// dK2_inv computation was moved to a seperate kernel for numerical stability
+using namespace cute;
+
+// kernel3 backward — tiled over K/V like the forward.
+// dK2_inv computation was moved to a separate kernel for numerical stability.
 //
-// Given dstep2, produces dV, dK_s, dQ_tilde, dK2_inv.
-// One CTA per batch-head. Tiles over K/V columns.
+// FP32 path: scalar kernel, one CTA per batch-head, tiles over K/V serially.
+// FP16/BF16 path: tensor core kernel (kernel3_bwd_tc), one CTA per (batch-head, tile),
+//   full parallelism across tiles. Uses TiledMma (4,1,1) and TiledMmaDKV (2,2,1).
 
 constexpr int kK3BwdBc = 64;
 constexpr int kK3BwdThreads = 256;
@@ -23,6 +33,7 @@ __global__ void kernel3_bwd_kernel(
     const scalar_t* __restrict__ v,
     const float*    __restrict__ k2_inv,
     const float*    __restrict__ lse3,
+    const float*    __restrict__ D3_in,
     const float*    __restrict__ dstep2,
     scalar_t* __restrict__ dV,
     scalar_t* __restrict__ dK_s,
@@ -41,7 +52,6 @@ __global__ void kernel3_bwd_kernel(
     scalar_t* sVtile = sKtile + Bc * D;
     float*    sdO3   = reinterpret_cast<float*>(sVtile + Bc * D);
     float*    sP     = sdO3 + m * D;
-    float*    scratch = sP + m * Bc;
 
     // Load Q_tilde
     const scalar_t* qt_base = q_tilde + bh * m * D;
@@ -58,10 +68,8 @@ __global__ void kernel3_bwd_kernel(
     }
     __syncthreads();
 
-    // Zero dK2_inv accumulator
-    float* dk2i = dK2_inv + bh * m * m;
-    for (int idx = tid; idx < m * m; idx += nthreads) dk2i[idx] = 0.0f;
-    __syncthreads();
+    // dK2_inv is computed by a separate FP32 kernel (compute_dk2inv.cuh).
+    // No zeroing needed here — the separate kernel overwrites it entirely.
 
     const float* lse3_bh = lse3 + bh * m;
     int num_tiles = (N + Bc - 1) / Bc;
@@ -107,21 +115,16 @@ __global__ void kernel3_bwd_kernel(
             dV_tile[idx] = from_float<scalar_t>(existing + sum);
         }
 
-        // Softmax backward: dS3 = P3 * (dP3 - D3)
-        // dP3[i,j] = sum_d dO3[i,d] * V[j,d]
-        // D3[i] = sum_j dP3[i,j] * P3[i,j]
-        // dS3[i,j] = P3[i,j] * (dP3[i,j] - D3[i])
-        // Process row-by-row. Each row is independent.
+        // Softmax backward: dS3[i,j] = P3[i,j] * (dP3[i,j] - D3[i])
+        //   dP3[i,j] = sum_d dO3[i,d] * V[j,d]
+        //   D3[i]    = sum_n_GLOBAL P3[i,n] * dP3[i,n]   (precomputed)
+        //
+        // D3 is the GLOBAL rowsum across all N positions and is precomputed
+        // by launch_precompute_d3 — must NOT be recomputed per-tile (the
+        // per-tile sum is incorrect whenever N > Bc).
+        const float* D3_bh = D3_in + bh * m;
         for (int i = tid; i < m; i += nthreads) {
-            // Compute D3[i] = sum_j P3[i,j] * dP3[i,j]
-            float D3_i = 0.0f;
-            for (int j = 0; j < tl; j++) {
-                float dP_ij = 0.0f;
-                for (int d = 0; d < D; d++)
-                    dP_ij += sdO3[i * D + d] * to_float(sVtile[j * D + d]);
-                D3_i += sP[i * Bc + j] * dP_ij;
-            }
-            // Now compute dS3[i,j] = P3[i,j] * (dP3[i,j] - D3[i])
+            float D3_i = D3_bh[i];
             for (int j = 0; j < tl; j++) {
                 float dP_ij = 0.0f;
                 for (int d = 0; d < D; d++)
@@ -158,31 +161,365 @@ __global__ void kernel3_bwd_kernel(
     }
 }
 
+// -- tensor core kernel (fp16/bf16), multi-CTA --
+//
+// ALL 5 GEMMs use tensor cores. One CTA per (batch-head, tile).
+//
+// 4-buffer SMEM: sQt + sdO3 + sKV + sPdS = 56KB at D=128
+//
+// TiledMma (4,1,1):    GEMM1 (S=Qt@K^T), GEMM_dP (dP=dO3@V^T), GEMM_dQt (dQt+=dS@K^T)
+// TiledMmaDKV (2,2,1): GEMM_dK (dK=dS^T@Qt), GEMM_dV (dV=P^T@dO3)
+//
+// sKV lifecycle: K → V (for dP, dV) → K (reload for dQt, dK)
+// sPdS lifecycle: P (for dV) → dS (for dQt, dK)
+
+template <typename Traits>
+__global__ void __launch_bounds__(Traits::kNThreads)
+kernel3_bwd_tc(
+    const typename Traits::Element* __restrict__ q_tilde_ptr,  // (BH, m, D)
+    const typename Traits::Element* __restrict__ k_s_ptr,      // (BH, N, D)
+    const typename Traits::Element* __restrict__ v_ptr,        // (BH, N, D)
+    const float*                    __restrict__ lse3_ptr,     // (BH, m)
+    const float*                    __restrict__ D3_ptr,       // (BH, m) precomputed global rowsum
+    const typename Traits::Element* __restrict__ dO3_ptr,      // (BH, m, D) precomputed FP16
+    typename Traits::Element*       __restrict__ dV_ptr,       // (BH, N, D) output
+    typename Traits::Element*       __restrict__ dK_s_ptr,     // (BH, N, D) output
+    float*                          __restrict__ dQ_tilde_ptr, // (BH, m, D) FP32 accumulator
+    int N, int D, int m
+) {
+    using Element = typename Traits::Element;
+    constexpr int kBlockM  = Traits::kBlockM;   // 64 (m dimension)
+    constexpr int kBlockN  = Traits::kBlockN;   // 64 (Bc tile size)
+    constexpr int kHeadDim = Traits::kHeadDim;
+
+    // Transposed view reuse requires SmemLayoutQ == SmemLayoutKV
+    static_assert(kBlockM == kBlockN, "kernel3_bwd_tc requires kBlockM == kBlockN");
+
+    const int tile_idx = blockIdx.x;
+    const int bh = blockIdx.y;
+    const int tidx = threadIdx.x;
+
+    const int tile_start = tile_idx * kBlockN;
+    if (tile_start >= N) return;
+    const int tile_len = min(kBlockN, N - tile_start);
+    const bool full_tile = (tile_len == kBlockN);
+
+    // 4-buffer SMEM layout
+    extern __shared__ char smem_[];
+    Element* sQt_ptr  = reinterpret_cast<Element*>(smem_);
+    Element* sdO3_ptr_s = sQt_ptr  + Traits::kSmemQElems;
+    Element* sKV_ptr  = sdO3_ptr_s + Traits::kSmemKVElems;
+    Element* sPdS_ptr = sKV_ptr  + Traits::kSmemKVElems;
+
+    // Normal views
+    auto sQt   = make_tensor(make_smem_ptr(sQt_ptr),    typename Traits::SmemLayoutQ{});
+    auto sdO3  = make_tensor(make_smem_ptr(sdO3_ptr_s), typename Traits::SmemLayoutKV{});
+    auto sKV   = make_tensor(make_smem_ptr(sKV_ptr),    typename Traits::SmemLayoutKV{});
+    auto sPdS  = make_tensor(make_smem_ptr(sPdS_ptr),   typename Traits::SmemLayoutPdS{});
+
+    // Transposed views for TC GEMM B-operands and A-operands
+    auto sKVt    = make_tensor(sKV.data(),        typename Traits::SmemLayoutKVtransposed{});
+    auto sKVtNS  = make_tensor(sKV.data().get(),  typename Traits::SmemLayoutKVtransposedNoSwizzle{});
+    auto sQtt    = make_tensor(sQt.data(),        typename Traits::SmemLayoutKVtransposed{});
+    auto sQttNS  = make_tensor(sQt.data().get(),  typename Traits::SmemLayoutKVtransposedNoSwizzle{});
+    auto sdO3t   = make_tensor(sdO3.data(),       typename Traits::SmemLayoutKVtransposed{});
+    auto sdO3tNS = make_tensor(sdO3.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
+    auto sPdSt   = make_tensor(sPdS.data(),       typename Traits::SmemLayoutPdStransposed{});
+    auto sPdStNS = make_tensor(make_smem_ptr(sPdS_ptr), typename Traits::SmemLayoutPdStransposedNoSwizzle{});
+
+    // Zero-init all buffers (handles partial tiles and m < kBlockM)
+    constexpr int total_elems = Traits::kSmemBwdElems;
+    for (int i = tidx; i < total_elems; i += Traits::kNThreads)
+        reinterpret_cast<Element*>(smem_)[i] = Element(0);
+    __syncthreads();
+
+    // Load persistent buffers: Q_tilde and dO3
+    typename Traits::GmemTiledCopy gmem_copy;
+    auto gmem_thr = gmem_copy.get_thread_slice(tidx);
+
+    if (m == kBlockM) {
+        auto gQt  = make_tensor(make_gmem_ptr(q_tilde_ptr + bh*m*D),
+                                Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+        auto gdO3 = make_tensor(make_gmem_ptr(dO3_ptr + bh*m*D),
+                                Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gQt),  gmem_thr.partition_D(sQt));
+        cute::copy(gmem_copy, gmem_thr.partition_S(gdO3), gmem_thr.partition_D(sdO3));
+    } else {
+        auto* qt = q_tilde_ptr + bh*m*D;
+        auto* d3 = dO3_ptr + bh*m*D;
+        for (int i = tidx; i < m*kHeadDim; i += Traits::kNThreads) {
+            int r = i / kHeadDim, c = i % kHeadDim;
+            if (c < D) { sQt(r,c) = qt[r*D+c]; sdO3(r,c) = d3[r*D+c]; }
+        }
+    }
+
+    // Load K_tile into sKV
+    if (full_tile) {
+        auto gK = make_tensor(make_gmem_ptr(k_s_ptr + bh*N*D + tile_start*D),
+                              Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gK), gmem_thr.partition_D(sKV));
+    } else {
+        auto* k_base = k_s_ptr + bh*N*D + tile_start*D;
+        for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
+            int r = i / kHeadDim, c = i % kHeadDim;
+            if (c < D) sKV(r,c) = k_base[r*D+c];
+        }
+    }
+    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
+
+    // ======== TiledMma setup (GEMM1, GEMM_dP, GEMM_dQt) ========
+    typename Traits::TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(tidx);
+
+    auto smem_copy_A  = make_tiled_copy_A(typename Traits::SmemCopyAtom{}, tiled_mma);
+    auto thr_copy_A   = smem_copy_A.get_thread_slice(tidx);
+    auto smem_copy_B  = make_tiled_copy_B(typename Traits::SmemCopyAtom{}, tiled_mma);
+    auto thr_copy_B   = smem_copy_B.get_thread_slice(tidx);
+    auto smem_copy_Bt = make_tiled_copy_B(typename Traits::SmemCopyAtomTransposed{}, tiled_mma);
+    auto thr_copy_Bt  = smem_copy_Bt.get_thread_slice(tidx);
+
+    // Identity tensor for (kBlockM, kBlockN) accumulators — score masking
+    auto cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    auto tScS = thr_mma.partition_C(cS);
+    auto tScS_rc = make_tensor(tScS.data(), convert_layout_acc_rowcol(tScS.layout()));
+
+    // Identity tensor for (kBlockM, kHeadDim) accumulators — dQt atomicAdd
+    auto cDQt = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
+    auto tDQtc = thr_mma.partition_C(cDQt);
+
+    // ======== TiledMmaDKV setup (GEMM_dK, GEMM_dV) ========
+    typename Traits::TiledMmaDKV tiled_mma_dkv;
+    auto thr_mma_dkv = tiled_mma_dkv.get_thread_slice(tidx);
+
+    auto smem_copy_PdSt  = make_tiled_copy_A(typename Traits::SmemCopyAtomTransposed{}, tiled_mma_dkv);
+    auto thr_copy_PdSt   = smem_copy_PdSt.get_thread_slice(tidx);
+    auto smem_copy_QtT   = make_tiled_copy_B(typename Traits::SmemCopyAtomTransposed{}, tiled_mma_dkv);
+    auto thr_copy_QtT    = smem_copy_QtT.get_thread_slice(tidx);
+
+    // Identity tensor for (kBlockN, kHeadDim) accumulators — dK/dV output
+    auto cDKV = make_identity_tensor(Shape<Int<kBlockN>, Int<kHeadDim>>{});
+    auto tDKVc = thr_mma_dkv.partition_C(cDKV);
+
+    // ======== Phase 1: GEMM1 — S = Qt @ K^T (sKV has K_tile) ========
+    auto acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+    clear(acc_s);
+    gemm_smem(acc_s, thr_mma.partition_fragment_A(sQt), thr_mma.partition_fragment_B(sKV),
+              thr_copy_A.partition_S(sQt), thr_copy_B.partition_S(sKV),
+              tiled_mma, smem_copy_A, smem_copy_B, thr_copy_A, thr_copy_B);
+
+    // ======== Phase 2: P = exp(S - LSE3) ========
+    auto scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
+    constexpr int nrow = decltype(size<0>(scores))::value;
+
+    const float* lse = lse3_ptr + bh * m;
+    #pragma unroll
+    for (int mi = 0; mi < nrow; mi++) {
+        int pr = get<0>(tScS_rc(mi, 0));
+        float lse_val = (pr < m) ? lse[pr] : 0.0f;
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(scores); ni++) {
+            int pc = get<1>(tScS_rc(mi, ni));
+            scores(mi, ni) = (pc < tile_len && pr < m) ? expf(scores(mi, ni) - lse_val) : 0.0f;
+        }
+    }
+    // acc_s = P in registers
+
+    // ======== Phase 3: Swap sKV from K_tile to V_tile ========
+    // Need V for GEMM_dP (dP = dO3 @ V^T, NOT K^T!)
+    __syncthreads();  // GEMM1 done reading K from sKV
+    if (full_tile) {
+        auto gV = make_tensor(make_gmem_ptr(v_ptr + bh*N*D + tile_start*D),
+                              Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gV), gmem_thr.partition_D(sKV));
+    } else {
+        for (int i = tidx; i < Traits::kSmemKVElems; i += Traits::kNThreads)
+            sKV_ptr[i] = Element(0);
+        __syncthreads();
+        auto* v_base = v_ptr + bh*N*D + tile_start*D;
+        for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
+            int r = i / kHeadDim, c = i % kHeadDim;
+            if (c < D) sKV(r,c) = v_base[r*D+c];
+        }
+    }
+    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
+
+    // ======== Phase 4: GEMM_dP — dP = dO3 @ V^T (sKV now has V_tile) ========
+    auto acc_dp = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+    clear(acc_dp);
+    gemm_smem(acc_dp, thr_mma.partition_fragment_A(sdO3), thr_mma.partition_fragment_B(sKV),
+              thr_copy_A.partition_S(sdO3), thr_copy_B.partition_S(sKV),
+              tiled_mma, smem_copy_A, smem_copy_B, thr_copy_A, thr_copy_B);
+
+    // ======== Phase 5: Softmax backward — dS = P * (dP - D3) ========
+    // D3[i] is the GLOBAL rowsum sum_n A3[i, n] * dP3[i, n], precomputed by
+    // launch_precompute_d3. The previous in-tile rowsum was wrong for N > Bc.
+    auto P_rc  = make_tensor(acc_s.data(),  convert_layout_acc_rowcol(acc_s.layout()));
+    auto dP_rc = make_tensor(acc_dp.data(), convert_layout_acc_rowcol(acc_dp.layout()));
+
+    Tensor D3 = make_tensor<float>(Shape<Int<nrow>>{});
+    const float* D3_bh = D3_ptr + bh * m;
+    #pragma unroll
+    for (int mi = 0; mi < nrow; mi++) {
+        int pr = get<0>(tScS_rc(mi, 0));
+        D3(mi) = (pr < m) ? D3_bh[pr] : 0.0f;
+    }
+
+    #pragma unroll
+    for (int mi = 0; mi < nrow; mi++) {
+        #pragma unroll
+        for (int ni = 0; ni < size<1>(dP_rc); ni++)
+            dP_rc(mi, ni) = P_rc(mi, ni) * (dP_rc(mi, ni) - D3(mi));
+    }
+    // acc_dp = dS in registers, acc_s = P still in registers
+
+    // ======== Phase 6: Write P to sPdS (needed for GEMM_dV) ========
+    {
+        auto rP = convert_type<Element>(acc_s);
+        auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
+        auto tc = sc.get_thread_slice(tidx);
+        cute::copy(sc, tc.retile_S(rP), tc.partition_D(sPdS));
+    }
+    __syncthreads();
+
+    // ======== Phase 7: GEMM_dV — dV += P^T @ dO3 (accumulate to existing) ========
+    // Must accumulate (not overwrite): dconv_bwd writes its dV contribution
+    // before this kernel runs, and we must not clobber it.
+    {
+        auto acc_dv = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});
+        clear(acc_dv);
+        gemm_smem(acc_dv,
+                  thr_mma_dkv.partition_fragment_A(sPdStNS),
+                  thr_mma_dkv.partition_fragment_B(sdO3tNS),
+                  thr_copy_PdSt.partition_S(sPdSt),
+                  thr_copy_QtT.partition_S(sdO3t),
+                  tiled_mma_dkv, smem_copy_PdSt, smem_copy_QtT,
+                  thr_copy_PdSt, thr_copy_QtT);
+
+        Element* dv_tile = dV_ptr + bh * N * D + tile_start * D;
+        #pragma unroll
+        for (int fi = 0; fi < size(acc_dv); fi++) {
+            int row = get<0>(tDKVc(fi));
+            int col = get<1>(tDKVc(fi));
+            if (row < tile_len && col < D) {
+                float existing = to_float(dv_tile[row * D + col]);
+                dv_tile[row * D + col] = from_float<Element>(existing + acc_dv(fi));
+            }
+        }
+    }
+
+    // ======== Phase 8: Write dS to sPdS (overwrite P) ========
+    {
+        auto rdS = convert_type<Element>(acc_dp);
+        auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
+        auto tc = sc.get_thread_slice(tidx);
+        cute::copy(sc, tc.retile_S(rdS), tc.partition_D(sPdS));
+    }
+
+    // ======== Phase 9: Reload K_tile into sKV (overwrite V) ========
+    __syncthreads();  // GEMM_dV done reading sPdS(P), dS write to sPdS complete
+    if (full_tile) {
+        auto gK = make_tensor(make_gmem_ptr(k_s_ptr + bh*N*D + tile_start*D),
+                              Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gK), gmem_thr.partition_D(sKV));
+    } else {
+        auto* k_base = k_s_ptr + bh*N*D + tile_start*D;
+        for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
+            int r = i / kHeadDim, c = i % kHeadDim;
+            if (c < D) sKV(r,c) = k_base[r*D+c];
+        }
+    }
+    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
+
+    // ======== Phase 10: GEMM_dQt — dQt += dS @ K^T (atomicAdd) ========
+    {
+        auto acc_dqt = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+        clear(acc_dqt);
+        gemm_smem(acc_dqt, thr_mma.partition_fragment_A(sPdS), thr_mma.partition_fragment_B(sKVtNS),
+                  thr_copy_A.partition_S(sPdS), thr_copy_Bt.partition_S(sKVt),
+                  tiled_mma, smem_copy_A, smem_copy_Bt, thr_copy_A, thr_copy_Bt);
+
+        float* dqt = dQ_tilde_ptr + bh * m * D;
+        #pragma unroll
+        for (int fi = 0; fi < size(acc_dqt); fi++) {
+            int row = get<0>(tDQtc(fi));
+            int col = get<1>(tDQtc(fi));
+            if (row < m && col < D)
+                atomicAdd(&dqt[row * D + col], acc_dqt(fi));
+        }
+    }
+
+    // ======== Phase 11: GEMM_dK — dK = dS^T @ Qt (direct write) ========
+    {
+        auto acc_dk = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});
+        clear(acc_dk);
+        gemm_smem(acc_dk,
+                  thr_mma_dkv.partition_fragment_A(sPdStNS),
+                  thr_mma_dkv.partition_fragment_B(sQttNS),
+                  thr_copy_PdSt.partition_S(sPdSt),
+                  thr_copy_QtT.partition_S(sQtt),
+                  tiled_mma_dkv, smem_copy_PdSt, smem_copy_QtT,
+                  thr_copy_PdSt, thr_copy_QtT);
+
+        Element* dk_tile = dK_s_ptr + bh * N * D + tile_start * D;
+        #pragma unroll
+        for (int fi = 0; fi < size(acc_dk); fi++) {
+            int row = get<0>(tDKVc(fi));
+            int col = get<1>(tDKVc(fi));
+            if (row < tile_len && col < D)
+                dk_tile[row * D + col] = from_float<Element>(acc_dk(fi));
+        }
+    }
+}
+
+
 template <typename scalar_t>
 void launch_kernel3_bwd(
     const scalar_t* q_tilde, const scalar_t* k_s, const scalar_t* v,
-    const float* k2_inv, const float* lse3, const float* dstep2,
+    const float* k2_inv, const float* lse3,
+    const float* D3,                    // (BH, m) global precomputed rowsum
+    const float* dstep2,
     scalar_t* dV, scalar_t* dK_s, float* dQ_tilde, float* dK2_inv,
+    const scalar_t* dO3,                // precomputed dO3 in scalar_t (always supplied)
     int BH, int N, int D, int m, cudaStream_t stream
 ) {
-    constexpr int Bc = kK3BwdBc;
-    dim3 grid(BH);
-    dim3 block(kK3BwdThreads);
-
-    size_t smem = m * D * sizeof(scalar_t)        // sQt
-               + Bc * D * sizeof(scalar_t) * 2    // sKtile + sVtile
-               + m * D * sizeof(float)            // sdO3
-               + m * Bc * sizeof(float)           // sP
-               + 8 * sizeof(float);               // scratch
-
-    if (smem > 48 * 1024) {
-        FN_CHECK(smem <= get_max_smem_per_block(), "kernel3_bwd: insufficient smem");
-        FN_CUDA_CHECK(cudaFuncSetAttribute(kernel3_bwd_kernel<scalar_t>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+    if constexpr (std::is_same_v<scalar_t, float>) {
+        // FP32: scalar fallback (single CTA per batch-head)
+        constexpr int Bc = kK3BwdBc;
+        dim3 grid(BH);
+        dim3 block(kK3BwdThreads);
+        size_t smem = m * D * sizeof(scalar_t)        // sQt
+                   + Bc * D * sizeof(scalar_t) * 2    // sKtile + sVtile
+                   + m * D * sizeof(float)            // sdO3
+                   + m * Bc * sizeof(float);          // sP
+        if (smem > 48 * 1024) {
+            FN_CHECK(smem <= get_max_smem_per_block(), "kernel3_bwd: insufficient smem");
+            FN_CUDA_CHECK(cudaFuncSetAttribute(kernel3_bwd_kernel<float>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+        }
+        kernel3_bwd_kernel<float><<<grid, block, smem, stream>>>(
+            q_tilde, k_s, v, k2_inv, lse3, D3, dstep2, dV, dK_s, dQ_tilde, dK2_inv, N, D, m);
+    } else {
+        // FP16/BF16: tensor core, multi-CTA
+        FN_CHECK(D == 64 || D == 128, "kernel3_bwd: D must be 64 or 128");
+        FN_CHECK(dO3 != nullptr, "kernel3_bwd TC requires precomputed dO3");
+        auto launch = [&](auto HeadDimTag) {
+            constexpr int kHeadDim = decltype(HeadDimTag)::value;
+            using Traits = K3Traits<kHeadDim, scalar_t>;
+            constexpr int Bc = Traits::kBlockN;
+            int num_tiles = (N + Bc - 1) / Bc;
+            dim3 grid(num_tiles, BH);
+            dim3 block(Traits::kNThreads);
+            size_t smem = Traits::kSmemBwdBytes;
+            if (smem > 48 * 1024) {
+                FN_CHECK(smem <= get_max_smem_per_block(), "kernel3_bwd_tc: insufficient smem");
+                FN_CUDA_CHECK(cudaFuncSetAttribute(kernel3_bwd_tc<Traits>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+            }
+            kernel3_bwd_tc<Traits><<<grid, block, smem, stream>>>(
+                q_tilde, k_s, v, lse3, D3, dO3, dV, dK_s, dQ_tilde, N, D, m);
+        };
+        if (D == 64) launch(Int<64>{}); else launch(Int<128>{});
     }
-
-    kernel3_bwd_kernel<scalar_t><<<grid, block, smem, stream>>>(
-        q_tilde, k_s, v, k2_inv, lse3, dstep2, dV, dK_s, dQ_tilde, dK2_inv, N, D, m);
     FN_CUDA_KERNEL_CHECK();
 }
 
