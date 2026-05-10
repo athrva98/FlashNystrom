@@ -165,13 +165,19 @@ __global__ void kernel3_bwd_kernel(
 //
 // ALL 5 GEMMs use tensor cores. One CTA per (batch-head, tile).
 //
-// 4-buffer SMEM: sQt + sdO3 + sKV + sPdS = 56KB at D=128
+// 3-buffer SMEM: sQB + sKV + sPdS = 40KB at D=128
+//
+// sQB is time-multiplexed between Qt (Phase 1, Phase 11) and dO3 (Phase 4, 7).
+// Folding the two 16KB buffers into one (and paying one extra Qt reload from
+// GMEM after Phase 7) drops SMEM from 56KB to 40KB and lets two CTAs share an
+// SM. The Qt and dO3 lifetimes never overlap so the reuse is exact.
 //
 // TiledMma (4,1,1):    GEMM1 (S=Qt@K^T), GEMM_dP (dP=dO3@V^T), GEMM_dQt (dQt+=dS@K^T)
 // TiledMmaDKV (2,2,1): GEMM_dK (dK=dS^T@Qt), GEMM_dV (dV=P^T@dO3)
 //
-// sKV lifecycle: K → V (for dP, dV) → K (reload for dQt, dK)
-// sPdS lifecycle: P (for dV) → dS (for dQt, dK)
+// sQB lifecycle: Qt (Phase 1) -> dO3 (Phase 4, 7) -> Qt (Phase 11)
+// sKV lifecycle: K (Phase 1) -> V (Phase 4, 7) -> K (Phase 10)
+// sPdS lifecycle: P (Phase 7) -> dS (Phase 10, 11)
 
 template <typename Traits>
 __global__ void __launch_bounds__(Traits::kNThreads)
@@ -204,18 +210,20 @@ kernel3_bwd_tc(
     const int tile_len = min(kBlockN, N - tile_start);
     const bool full_tile = (tile_len == kBlockN);
 
-    // 4-buffer SMEM layout
+    // 3-buffer SMEM layout. sQB holds Qt or dO3 depending on phase; the two
+    // views below share storage. SmemLayoutQ == SmemLayoutKV under
+    // kBlockM == kBlockN, so partition_fragment and copy atoms compose
+    // identically against either view.
     extern __shared__ char smem_[];
-    Element* sQt_ptr  = reinterpret_cast<Element*>(smem_);
-    Element* sdO3_ptr_s = sQt_ptr  + Traits::kSmemQElems;
-    Element* sKV_ptr  = sdO3_ptr_s + Traits::kSmemKVElems;
+    Element* sQB_ptr  = reinterpret_cast<Element*>(smem_);
+    Element* sKV_ptr  = sQB_ptr  + Traits::kSmemQElems;
     Element* sPdS_ptr = sKV_ptr  + Traits::kSmemKVElems;
 
-    // Normal views
-    auto sQt   = make_tensor(make_smem_ptr(sQt_ptr),    typename Traits::SmemLayoutQ{});
-    auto sdO3  = make_tensor(make_smem_ptr(sdO3_ptr_s), typename Traits::SmemLayoutKV{});
-    auto sKV   = make_tensor(make_smem_ptr(sKV_ptr),    typename Traits::SmemLayoutKV{});
-    auto sPdS  = make_tensor(make_smem_ptr(sPdS_ptr),   typename Traits::SmemLayoutPdS{});
+    // Normal views (sQt and sdO3 alias the same SMEM region)
+    auto sQt   = make_tensor(make_smem_ptr(sQB_ptr),  typename Traits::SmemLayoutQ{});
+    auto sdO3  = make_tensor(make_smem_ptr(sQB_ptr),  typename Traits::SmemLayoutKV{});
+    auto sKV   = make_tensor(make_smem_ptr(sKV_ptr),  typename Traits::SmemLayoutKV{});
+    auto sPdS  = make_tensor(make_smem_ptr(sPdS_ptr), typename Traits::SmemLayoutPdS{});
 
     // Transposed views for TC GEMM B-operands and A-operands
     auto sKVt    = make_tensor(sKV.data(),        typename Traits::SmemLayoutKVtransposed{});
@@ -233,23 +241,20 @@ kernel3_bwd_tc(
         reinterpret_cast<Element*>(smem_)[i] = Element(0);
     __syncthreads();
 
-    // Load persistent buffers: Q_tilde and dO3
+    // Load Q_tilde into sQB. dO3 is loaded later (before Phase 4), reusing
+    // the same buffer. Qt will be reloaded a second time before Phase 11.
     typename Traits::GmemTiledCopy gmem_copy;
     auto gmem_thr = gmem_copy.get_thread_slice(tidx);
 
     if (m == kBlockM) {
         auto gQt  = make_tensor(make_gmem_ptr(q_tilde_ptr + bh*m*D),
                                 Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-        auto gdO3 = make_tensor(make_gmem_ptr(dO3_ptr + bh*m*D),
-                                Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
         cute::copy(gmem_copy, gmem_thr.partition_S(gQt),  gmem_thr.partition_D(sQt));
-        cute::copy(gmem_copy, gmem_thr.partition_S(gdO3), gmem_thr.partition_D(sdO3));
     } else {
         auto* qt = q_tilde_ptr + bh*m*D;
-        auto* d3 = dO3_ptr + bh*m*D;
         for (int i = tidx; i < m*kHeadDim; i += Traits::kNThreads) {
             int r = i / kHeadDim, c = i % kHeadDim;
-            if (c < D) { sQt(r,c) = qt[r*D+c]; sdO3(r,c) = d3[r*D+c]; }
+            if (c < D) sQt(r,c) = qt[r*D+c];
         }
     }
 
@@ -324,21 +329,35 @@ kernel3_bwd_tc(
     }
     // acc_s = P in registers
 
-    // ======== Phase 3: Swap sKV from K_tile to V_tile ========
-    // Need V for GEMM_dP (dP = dO3 @ V^T, NOT K^T!)
-    __syncthreads();  // GEMM1 done reading K from sKV
+    // ======== Phase 3: Swap sKV (K -> V) and sQB (Qt -> dO3) ========
+    // Phase 4 needs V (for dP = dO3 @ V^T) and dO3 (as A operand of GEMM_dP).
+    // sQt is dead after Phase 1 (acc_s now holds S); sKV(K) is dead after
+    // GEMM1's inner-K loop completes. Overwriting both is safe past this sync.
+    __syncthreads();  // GEMM1 done reading sQt and sKV(K)
+    // Partial-tile tails stay zero from the kernel-start init: K-load only
+    // touched rows [0, tile_len) and Qt-load only touched rows [0, m), so we
+    // can skip re-zeroing here.
     if (full_tile) {
         auto gV = make_tensor(make_gmem_ptr(v_ptr + bh*N*D + tile_start*D),
                               Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
         cute::copy(gmem_copy, gmem_thr.partition_S(gV), gmem_thr.partition_D(sKV));
     } else {
-        for (int i = tidx; i < Traits::kSmemKVElems; i += Traits::kNThreads)
-            sKV_ptr[i] = Element(0);
-        __syncthreads();
         auto* v_base = v_ptr + bh*N*D + tile_start*D;
         for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
             int r = i / kHeadDim, c = i % kHeadDim;
             if (c < D) sKV(r,c) = v_base[r*D+c];
+        }
+    }
+    // Load dO3 into sQB (overwrites Qt).
+    if (m == kBlockM) {
+        auto gdO3 = make_tensor(make_gmem_ptr(dO3_ptr + bh*m*D),
+                                Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gdO3), gmem_thr.partition_D(sdO3));
+    } else {
+        auto* d3 = dO3_ptr + bh*m*D;
+        for (int i = tidx; i < m*kHeadDim; i += Traits::kNThreads) {
+            int r = i / kHeadDim, c = i % kHeadDim;
+            if (c < D) sdO3(r,c) = d3[r*D+c];
         }
     }
     cp_async_fence(); cp_async_wait<0>(); __syncthreads();
@@ -415,17 +434,36 @@ kernel3_bwd_tc(
         cute::copy(sc, tc.retile_S(rdS), tc.partition_D(sPdS));
     }
 
-    // ======== Phase 9: Reload K_tile into sKV (overwrite V) ========
-    __syncthreads();  // GEMM_dV done reading sPdS(P), dS write to sPdS complete
+    // ======== Phase 9: Reload K into sKV (overwrite V) and Qt into sQB (overwrite dO3) ========
+    // After Phase 7 finishes reading sdO3 and sPdS(P), and after Phase 8 writes
+    // dS to sPdS, both V (in sKV) and dO3 (in sQB) are dead. We reload K and
+    // Qt in parallel for Phases 10 and 11. The sync above is the one that
+    // protects dO3's last read.
+    __syncthreads();  // GEMM_dV done reading sdO3 and sPdS(P); dS write to sPdS complete
+    // Partial tails stay zero (V-load touched only first tile_len rows of sKV;
+    // dO3-load touched only first m rows of sQB), so no re-zero needed.
+    // full_tile gates the K reload (sKV size), m == kBlockM gates the Qt
+    // reload (sQB size) — they are independent so check them separately.
     if (full_tile) {
-        auto gK = make_tensor(make_gmem_ptr(k_s_ptr + bh*N*D + tile_start*D),
-                              Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-        cute::copy(gmem_copy, gmem_thr.partition_S(gK), gmem_thr.partition_D(sKV));
+        auto gK  = make_tensor(make_gmem_ptr(k_s_ptr + bh*N*D + tile_start*D),
+                               Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gK),  gmem_thr.partition_D(sKV));
     } else {
         auto* k_base = k_s_ptr + bh*N*D + tile_start*D;
         for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
             int r = i / kHeadDim, c = i % kHeadDim;
             if (c < D) sKV(r,c) = k_base[r*D+c];
+        }
+    }
+    if (m == kBlockM) {
+        auto gQt = make_tensor(make_gmem_ptr(q_tilde_ptr + bh*m*D),
+                               Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+        cute::copy(gmem_copy, gmem_thr.partition_S(gQt), gmem_thr.partition_D(sQt));
+    } else {
+        auto* qt_base = q_tilde_ptr + bh*m*D;
+        for (int i = tidx; i < m*kHeadDim; i += Traits::kNThreads) {
+            int r = i / kHeadDim, c = i % kHeadDim;
+            if (c < D) sQt(r,c) = qt_base[r*D+c];
         }
     }
     cp_async_fence(); cp_async_wait<0>(); __syncthreads();

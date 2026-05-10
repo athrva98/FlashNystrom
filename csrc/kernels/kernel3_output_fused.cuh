@@ -116,9 +116,12 @@ struct K3Traits {
     // Forward: sQt (persistent) + sKV (single, reloaded per tile)
     static constexpr int kSmemBytes = (kSmemQElems + kSmemKVElems) * sizeof(Element);
 
-    // Backward: sQt + sdO3 + sKV + sPdS (4 buffers)
-    // sdO3 uses SmemLayoutKV (same shape as sQt since kBlockM == kBlockN)
-    static constexpr int kSmemBwdElems = kSmemQElems + kSmemKVElems * 2 + kSmemPdSElems;
+    // Backward: sQB (shared Qt/dO3, time-multiplexed) + sKV + sPdS (3 buffers).
+    // sQt and sdO3 never coexist in time, so we fold them into one buffer and
+    // reload Qt from GMEM after Phase 7. Saves 16KB. SmemLayoutQ and
+    // SmemLayoutKV are identical when kBlockM == kBlockN, so views over the
+    // shared buffer compose correctly.
+    static constexpr int kSmemBwdElems = kSmemQElems + kSmemKVElems + kSmemPdSElems;
     static constexpr int kSmemBwdBytes = kSmemBwdElems * sizeof(Element);
 };
 
