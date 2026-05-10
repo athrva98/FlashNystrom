@@ -16,6 +16,10 @@ nvcc_flags = [
     "--expt-extended-lambda",
     "-lineinfo",
     "-std=c++17",
+    # Resource visibility. Print registers, stack, spill, and shared-memory
+    # usage per kernel at compile time. Required for any informed occupancy
+    # tuning. Can be disabled by setting FLASH_NYSTROM_QUIET=1.
+    *([] if os.environ.get("FLASH_NYSTROM_QUIET") else ["-Xptxas=-v", "--resource-usage"]),
 ]
 
 # Detect GPU architecture from nvidia-smi

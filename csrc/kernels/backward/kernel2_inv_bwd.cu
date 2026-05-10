@@ -429,7 +429,9 @@ void launch_kernel2_inv_bwd(
     }
 }
 
-// Explicit template instantiations.
+// Explicit template instantiations. Required so other TUs (e.g. the
+// occupancy probe in flash_nystrom.cu) can take the kernel function
+// pointer without seeing the kernel definition.
 template void launch_kernel2_inv_bwd<float>(
     const float*, const float*, const float*, const float*, const float*,
     const float*, const float*, float*, float*, float*, float*,
@@ -442,6 +444,22 @@ template void launch_kernel2_inv_bwd<cutlass::bfloat16_t>(
     const cutlass::bfloat16_t*, const cutlass::bfloat16_t*, const float*, const float*, const float*,
     const float*, const float*, float*, float*, float*, float*,
     int, int, int, int, cudaStream_t);
+
+template __global__ void ns_bwd_final_kernel<float>(
+    const float* __restrict__, const float* __restrict__,
+    const float* __restrict__, const float* __restrict__,
+    float* __restrict__, float* __restrict__, float* __restrict__,
+    int, int);
+template __global__ void ns_bwd_final_kernel<cutlass::half_t>(
+    const cutlass::half_t* __restrict__, const cutlass::half_t* __restrict__,
+    const float* __restrict__, const float* __restrict__,
+    float* __restrict__, float* __restrict__, float* __restrict__,
+    int, int);
+template __global__ void ns_bwd_final_kernel<cutlass::bfloat16_t>(
+    const cutlass::bfloat16_t* __restrict__, const cutlass::bfloat16_t* __restrict__,
+    const float* __restrict__, const float* __restrict__,
+    float* __restrict__, float* __restrict__, float* __restrict__,
+    int, int);
 
 // =========================================================================
 // Test-only launchers (debug pybind hooks).

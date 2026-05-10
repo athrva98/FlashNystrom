@@ -11,6 +11,30 @@
 
 namespace flash_nystrom {
 
+// Forward declarations of the kernel functions. Needed by host code that
+// wants to take their addresses (e.g. for occupancy queries). Definitions
+// and explicit template instantiations live in kernel2_inv_bwd.cu. The
+// __restrict__ qualifiers must match the definition exactly so that the
+// declared function type is identical and the linker resolves the symbol.
+__global__ void ns_bwd_step_kernel(
+    const float* __restrict__ K2_in,
+    const float* __restrict__ Z_j_in,
+    int Z_j_bh_stride,
+    float* __restrict__ dZ_inout,
+    float* __restrict__ dK2_acc,
+    int m);
+
+template <typename scalar_t>
+__global__ void ns_bwd_final_kernel(
+    const scalar_t* __restrict__ q_tilde,
+    const scalar_t* __restrict__ k_tilde,
+    const float* __restrict__ K2_in,
+    const float* __restrict__ dZ0_in,
+    float* __restrict__ dK2_acc,
+    float* __restrict__ dQ_tilde,
+    float* __restrict__ dK_tilde,
+    int D, int m);
+
 // -- Production launch wrapper used by run_nystrom_bwd_impl --
 //
 // Unrolls all NS backward iterations and runs the final softmax-bwd step.

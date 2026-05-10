@@ -14,6 +14,7 @@
 #include "flash_nystrom.h"
 #include "kernels/backward/kernel2_inv_bwd.cuh"  // for debug hooks
 #include "kernels/backward/compute_dk2inv.cuh"   // for debug hooks
+#include "occupancy_probe.h"                      // for occupancy reporting
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -496,4 +497,39 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Returns (dQ_tilde, dK_tilde) FP32.",
           py::arg("q_tilde"), py::arg("k_tilde"), py::arg("K2_softmax"),
           py::arg("ns_iterates"), py::arg("dK2_inv_in"), py::arg("newton_iter"));
+
+    // ----- Occupancy probe -----
+    py::class_<flash_nystrom::OccupancyRow>(m, "OccupancyRow")
+        .def_readonly("kernel_name",        &flash_nystrom::OccupancyRow::kernel_name)
+        .def_readonly("threads_per_block",  &flash_nystrom::OccupancyRow::threads_per_block)
+        .def_readonly("dynamic_smem_bytes", &flash_nystrom::OccupancyRow::dynamic_smem_bytes)
+        .def_readonly("regs_per_thread",    &flash_nystrom::OccupancyRow::regs_per_thread)
+        .def_readonly("static_smem_bytes",  &flash_nystrom::OccupancyRow::static_smem_bytes)
+        .def_readonly("max_blocks_per_sm",  &flash_nystrom::OccupancyRow::max_blocks_per_sm)
+        .def_readonly("max_warps_per_sm",   &flash_nystrom::OccupancyRow::max_warps_per_sm)
+        .def_readonly("regs_per_block",     &flash_nystrom::OccupancyRow::regs_per_block)
+        .def_readonly("total_smem_per_block", &flash_nystrom::OccupancyRow::total_smem_per_block)
+        .def_readonly("blocks_by_threads",  &flash_nystrom::OccupancyRow::blocks_by_threads)
+        .def_readonly("blocks_by_regs",     &flash_nystrom::OccupancyRow::blocks_by_regs)
+        .def_readonly("blocks_by_smem",     &flash_nystrom::OccupancyRow::blocks_by_smem)
+        .def_readonly("blocks_by_hardware", &flash_nystrom::OccupancyRow::blocks_by_hardware)
+        .def_readonly("binding_constraint", &flash_nystrom::OccupancyRow::binding_constraint);
+
+    m.def("probe_occupancy",
+          &flash_nystrom::probe_all,
+          "Run cudaOccupancyMaxActiveBlocksPerMultiprocessor on every kernel "
+          "this build ships, at the given (m, D, newton_iter) launch config.",
+          py::arg("m") = 64, py::arg("D") = 128, py::arg("newton_iter") = 6,
+          py::arg("dtype") = "half");
+
+    py::class_<flash_nystrom::SmLimits>(m, "SmLimits")
+        .def_readonly("max_threads_per_sm",     &flash_nystrom::SmLimits::max_threads_per_sm)
+        .def_readonly("max_blocks_per_sm",      &flash_nystrom::SmLimits::max_blocks_per_sm)
+        .def_readonly("max_regs_per_sm",        &flash_nystrom::SmLimits::max_regs_per_sm)
+        .def_readonly("max_smem_per_sm_bytes",  &flash_nystrom::SmLimits::max_smem_per_sm_bytes)
+        .def_readonly("reg_alloc_unit",         &flash_nystrom::SmLimits::reg_alloc_unit)
+        .def_readonly("warp_alloc_unit",        &flash_nystrom::SmLimits::warp_alloc_unit);
+
+    m.def("query_sm_limits", &flash_nystrom::query_sm_limits,
+          "Return the per-SM hardware limits for the current device.");
 }
