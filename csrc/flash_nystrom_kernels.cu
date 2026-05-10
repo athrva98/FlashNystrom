@@ -164,7 +164,7 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
     launch_compute_dk2inv<elem_type>(q_tilde, k_s, v, dO3,
         p.lse3_ptr, p.dstep2_ptr,
         p.dK2_inv_ptr, p.D3_ptr,
-        BH, N, D, m, p.stream);
+        BH, N, D, m, p.fast_dk2inv, p.stream);
 
     launch_kernel3_bwd<elem_type>(q_tilde, k_s, v, p.k2_inv_ptr, p.lse3_ptr,
         p.D3_ptr, p.dstep2_ptr, dV, dK, p.dQ_tilde_ptr, p.dK2_inv_ptr,

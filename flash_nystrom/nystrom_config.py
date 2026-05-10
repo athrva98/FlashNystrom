@@ -28,6 +28,19 @@ class NystromConfig:
     use_conv_residual: bool = True
     """Whether to add depthwise conv1d residual."""
 
+    fast_dk2inv: bool = False
+    """Opt-in tensor-core path for `compute_dk2inv` in the backward pass.
+
+    Default False uses the FP32 scalar kernel — bit-for-bit consistent with
+    the autograd reference (modulo FP32 noise). Set True to use the
+    FP16/BF16 tensor-core kernel, which is dramatically faster at large N
+    (~6x bwd speedup at N=4096+) but converts the softmax output P from
+    FP32 to FP16/BF16 before the second GEMM, trimming P to a 10-bit
+    mantissa. Single-seed CIFAR-10 runs show this within FP16 stochastic
+    variance; it can cost a fraction of a percentage point on tight
+    accuracy comparisons. Recommended only for FP16/BF16 inputs at large N
+    where backward latency matters."""
+
     def __post_init__(self):
         assert self.num_landmarks > 0, "num_landmarks must be positive"
         assert self.newton_iter > 0, "newton_iter must be positive"

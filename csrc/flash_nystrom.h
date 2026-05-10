@@ -59,6 +59,10 @@ struct NystromBwdParams {
     int batch_size, num_heads, seq_len, head_dim, num_landmarks;
     int newton_iter, conv_kernel_size;
     bool is_bf16;
+    // Opt-in tensor-core path for compute_dk2inv. Default false → FP32 scalar.
+    // True only for FP16/BF16 input dtype; trades a small precision drop for
+    // a large bwd latency win at large N. See compute_dk2inv.cuh.
+    bool fast_dk2inv;
 
     // Forward saved tensors (const, read-only)
     const void* __restrict__ q_s_ptr;        // (B,H,N,D) scaled Q

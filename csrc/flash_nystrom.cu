@@ -154,7 +154,8 @@ std::vector<torch::Tensor> nystrom_bwd(
     torch::Tensor ns_iterates, torch::Tensor k2_softmax,
     torch::Tensor v, torch::Tensor output,
     int64_t num_landmarks, int64_t newton_iter, int64_t conv_kernel_size,
-    c10::optional<torch::Tensor> conv_weight
+    c10::optional<torch::Tensor> conv_weight,
+    bool fast_dk2inv
 ) {
     const auto dtype = dO.scalar_type();
     const int64_t B = dO.size(0), H = dO.size(1), N = dO.size(2), D = dO.size(3);
@@ -207,6 +208,7 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.newton_iter = static_cast<int>(newton_iter);
     params.conv_kernel_size = static_cast<int>(conv_kernel_size);
     params.is_bf16 = (dtype == at::ScalarType::BFloat16);
+    params.fast_dk2inv = fast_dk2inv;
 
     params.q_s_ptr = q_s.data_ptr();
     params.k_s_ptr = k_s.data_ptr();
@@ -435,6 +437,8 @@ std::vector<torch::Tensor> debug_compute_dk2inv(
     auto dK2_inv = torch::empty({BH, m, m}, opts_f32);
     auto D3      = torch::empty({BH, m},    opts_f32);
 
+    // Debug hook always exercises the scalar path (FP32 input dtype + the
+    // TC kernel only runs for FP16/BF16 anyway).
     flash_nystrom::launch_compute_dk2inv<float>(
         q_tilde.data_ptr<float>(),
         k_s.data_ptr<float>(),
@@ -444,7 +448,7 @@ std::vector<torch::Tensor> debug_compute_dk2inv(
         dstep2.data_ptr<float>(),
         dK2_inv.data_ptr<float>(),
         D3.data_ptr<float>(),
-        BH, N, D, m, stream);
+        BH, N, D, m, /*fast_dk2inv=*/false, stream);
 
     return {dK2_inv, D3};
 }
@@ -460,7 +464,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("conv_kernel_size") = 0,
           py::arg("conv_weight") = c10::nullopt);
     m.def("backward", &flash_nystrom::nystrom_bwd,
-          "FlashNystrom backward (CUDA)");
+          "FlashNystrom backward (CUDA). Pass fast_dk2inv=True to opt into "
+          "the tensor-core compute_dk2inv kernel (faster but converts P from "
+          "FP32 to FP16/BF16 before GEMM2; default false = FP32 scalar).",
+          py::arg("dO"),
+          py::arg("q_s"), py::arg("k_s"),
+          py::arg("q_tilde"), py::arg("k_tilde"),
+          py::arg("kernel2_inv"), py::arg("step2"),
+          py::arg("softmax1_lse"), py::arg("softmax2_lse"), py::arg("softmax3_lse"),
+          py::arg("ns_iterates"), py::arg("k2_softmax"),
+          py::arg("v"), py::arg("output"),
+          py::arg("num_landmarks"), py::arg("newton_iter"), py::arg("conv_kernel_size"),
+          py::arg("conv_weight"),
+          py::arg("fast_dk2inv") = false);
     m.def("debug_ns_bwd_step", &flash_nystrom::debug_ns_bwd_step,
           "Debug: single NS backward iteration (returns dZ_j, dK2_contrib).",
           py::arg("K2"), py::arg("Z_j"), py::arg("dZ_in"));

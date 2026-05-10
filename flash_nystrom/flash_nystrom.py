@@ -58,7 +58,8 @@ def _depthwise_conv_residual(v, weight):
 class FlashNystromFunction(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, q, k, v, conv_weight, num_landmarks, newton_iter, conv_kernel_size
+        ctx, q, k, v, conv_weight, num_landmarks, newton_iter, conv_kernel_size,
+        fast_dk2inv,
     ):
         assert _C is not None, "CUDA extension not available"
 
@@ -79,6 +80,7 @@ class FlashNystromFunction(torch.autograd.Function):
         ctx.newton_iter = newton_iter
         ctx.conv_kernel_size = conv_kernel_size
         ctx.has_conv = conv_weight is not None
+        ctx.fast_dk2inv = fast_dk2inv
 
         return output
 
@@ -112,15 +114,17 @@ class FlashNystromFunction(torch.autograd.Function):
             ctx.newton_iter,
             ctx.conv_kernel_size,
             conv_weight,
+            ctx.fast_dk2inv,
         )
         dQ, dK, dV = results[0], results[1], results[2]
         dconv = results[3] if ctx.has_conv and results[3] is not None else None
 
-        return dQ, dK, dV, dconv, None, None, None
+        return dQ, dK, dV, dconv, None, None, None, None
 
 
 def flash_nystrom_attention(
-    q, k, v, num_landmarks=64, newton_iter=6, conv_weight=None, conv_kernel_size=0
+    q, k, v, num_landmarks=64, newton_iter=6, conv_weight=None, conv_kernel_size=0,
+    fast_dk2inv=False,
 ):
     """main entry point — uses CUDA kernels if available, falls back to pytorch.
 
@@ -129,12 +133,18 @@ def flash_nystrom_attention(
     backward automatically. The custom CUDA conv kernels (`dconv_residual.cuh`
     and `dconv_residual_bwd.cuh`) are no longer used by this path — they remain
     in the codebase only for the reference implementation's compatibility.
+
+    `fast_dk2inv` opts into the tensor-core path for `compute_dk2inv` in the
+    backward (FP16/BF16 only). Faster at large N but converts the softmax
+    output P from FP32 to FP16/BF16 before GEMM2, trimming P to a 10-bit
+    mantissa — small accuracy cost. Default False = FP32 scalar (matches the
+    autograd reference to FP32 noise).
     """
     if HAS_CUDA and q.is_cuda:
         # Pure attention via the fused kernels — pass conv_weight=None so the
         # custom CUDA conv kernels never run.
         out = FlashNystromFunction.apply(
-            q, k, v, None, num_landmarks, newton_iter, 0
+            q, k, v, None, num_landmarks, newton_iter, 0, fast_dk2inv,
         )
         # Add depthwise-conv residual via cuDNN if requested.
         if conv_weight is not None and conv_kernel_size > 0:
@@ -184,5 +194,6 @@ class FlashNystromAttention(nn.Module):
             newton_iter=self.config.newton_iter,
             conv_weight=self.conv_weight,
             conv_kernel_size=ks,
+            fast_dk2inv=self.config.fast_dk2inv,
         )
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, N, self.dim))

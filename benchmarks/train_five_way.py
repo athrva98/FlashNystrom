@@ -161,7 +161,7 @@ class FullFNAttention(_NystromBase):
     """Full FlashNystrom (CUDA fwd + CUDA bwd)."""
     def forward(self, x):
         q, k, v, B, N = self._qkv(x)
-        out = FlashNystromFunction.apply(q, k, v, None, self.m, self.niter, 0)
+        out = FlashNystromFunction.apply(q, k, v, None, self.m, self.niter, 0, False)
         return self._project_out(out, B, N)
 
 

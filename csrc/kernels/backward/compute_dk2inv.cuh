@@ -378,36 +378,68 @@ compute_dk2inv_tc(
 // Launch wrapper. Dispatches TC for FP16/BF16, scalar for FP32.
 // -----------------------------------------------------------------------------
 
+// Helper: run the FP32 scalar kernel. Always available, used as the default
+// path. Inputs are cast to FP32 in SMEM, all matmuls run in FP32.
 template <typename scalar_t>
-void launch_compute_dk2inv(
+static void launch_compute_dk2inv_scalar(
     const scalar_t* q_tilde, const scalar_t* k_s, const scalar_t* v,
     const scalar_t* dO3,
     const float* lse3, const float* dstep2,
     float* dK2_inv, float* D3,
     int BH, int N, int D, int m, cudaStream_t stream
 ) {
+    constexpr int TILE_N = 32;
+    dim3 grid(BH);
+    dim3 block(256);
+    size_t smem = (m * D + m * D + TILE_N * D + m * TILE_N + m) * sizeof(float);
+    if (smem > 48 * 1024) {
+        FN_CHECK(smem <= get_max_smem_per_block(),
+                 "compute_dk2inv: insufficient smem");
+        FN_CUDA_CHECK(cudaFuncSetAttribute(compute_dk2inv_kernel<scalar_t>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+    }
+    compute_dk2inv_kernel<scalar_t><<<grid, block, smem, stream>>>(
+        q_tilde, k_s, v, dO3, lse3, dstep2, dK2_inv, D3, N, D, m);
+    FN_CUDA_KERNEL_CHECK();
+}
+
+// dispatch: TC for FP16/BF16 when fast_dk2inv is set, otherwise scalar FP32.
+//
+// fast_dk2inv = true   → tensor-core path. Faster (~6x at large N) but P
+//                        (softmax output) is converted FP32 → Element before
+//                        GEMM2, trimming P to a 10-bit mantissa. May cost
+//                        sub-1 pt accuracy relative to scalar at single-seed
+//                        evaluation.
+// fast_dk2inv = false  → FP32 scalar fallback. Bit-for-bit consistent with
+//                        the autograd reference (modulo FP32 noise). Default.
+//
+// FP32 input dtype always uses scalar (TC atom requires 16-bit operands).
+template <typename scalar_t>
+void launch_compute_dk2inv(
+    const scalar_t* q_tilde, const scalar_t* k_s, const scalar_t* v,
+    const scalar_t* dO3,
+    const float* lse3, const float* dstep2,
+    float* dK2_inv, float* D3,
+    int BH, int N, int D, int m, bool fast_dk2inv, cudaStream_t stream
+) {
     if constexpr (std::is_same_v<scalar_t, float>) {
-        constexpr int TILE_N = 32;
-        dim3 grid(BH);
-        dim3 block(256);
-        size_t smem = (m * D + m * D + TILE_N * D + m * TILE_N + m) * sizeof(float);
-        if (smem > 48 * 1024) {
-            FN_CHECK(smem <= get_max_smem_per_block(),
-                     "compute_dk2inv: insufficient smem");
-            FN_CUDA_CHECK(cudaFuncSetAttribute(compute_dk2inv_kernel<scalar_t>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-        }
-        compute_dk2inv_kernel<scalar_t><<<grid, block, smem, stream>>>(
-            q_tilde, k_s, v, dO3, lse3, dstep2, dK2_inv, D3, N, D, m);
-        FN_CUDA_KERNEL_CHECK();
+        // FP32: scalar only (no 16-bit operand TC atom).
+        launch_compute_dk2inv_scalar<scalar_t>(
+            q_tilde, k_s, v, dO3, lse3, dstep2, dK2_inv, D3,
+            BH, N, D, m, stream);
+    } else if (!fast_dk2inv) {
+        // Default high-precision path for FP16/BF16 too.
+        launch_compute_dk2inv_scalar<scalar_t>(
+            q_tilde, k_s, v, dO3, lse3, dstep2, dK2_inv, D3,
+            BH, N, D, m, stream);
     } else {
+        // Opt-in TC path: FP16/BF16 only.
         FN_CHECK(D == 64 || D == 128, "compute_dk2inv_tc: D must be 64 or 128");
         auto launch = [&](auto HeadDimTag) {
             constexpr int kHeadDim = decltype(HeadDimTag)::value;
             using Traits = K3Traits<kHeadDim, scalar_t>;
             dim3 grid(BH);
             dim3 block(Traits::kNThreads);
-            // sQ + sKV in Element + sB in FP32 (kBlockM * kHeadDim)
             size_t smem_elem  = (Traits::kSmemQElems + Traits::kSmemKVElems)
                                 * sizeof(scalar_t);
             size_t smem_fp32  = static_cast<size_t>(Traits::kBlockM) *
