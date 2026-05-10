@@ -21,10 +21,8 @@ Makefile
 *.ncu-rep
 data/
 third_party/cutlass/
-docs/*.aux
-docs/*.log
-docs/*.out
-docs/*.toc
+# Technical reference is kept locally, not in the public repo
+docs/
 .claude/
 *.pyd
 *.so
