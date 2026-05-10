@@ -327,7 +327,11 @@ kernel3_bwd_tc(
             scores(mi, ni) = (pc < tile_len && pr < m) ? expf(scores(mi, ni) - lse_val) : 0.0f;
         }
     }
-    // acc_s = P in registers
+    // Eager FP32 -> FP16 conversion of P. Frees the 32 FP32 acc_s registers
+    // before GEMM_dP and softmax_bwd, dropping live-register pressure across
+    // the GEMM_dV peak. softmax_bwd upconverts per element below.
+    Tensor rP = convert_type<Element>(acc_s);
+    auto rP_rc = make_tensor(rP.data(), convert_layout_acc_rowcol(acc_s.layout()));
 
     // ======== Phase 3: Swap sKV (K -> V) and sQB (Qt -> dO3) ========
     // Phase 4 needs V (for dP = dO3 @ V^T) and dO3 (as A operand of GEMM_dP).
@@ -371,8 +375,8 @@ kernel3_bwd_tc(
 
     // ======== Phase 5: Softmax backward — dS = P * (dP - D3) ========
     // D3[i] is the GLOBAL rowsum sum_n A3[i, n] * dP3[i, n], precomputed by
-    // launch_precompute_d3. The previous in-tile rowsum was wrong for N > Bc.
-    auto P_rc  = make_tensor(acc_s.data(),  convert_layout_acc_rowcol(acc_s.layout()));
+    // launch_precompute_d3. P is read from rP_rc (FP16) and upconverted per
+    // element; the FP32 acc_s storage was freed by the eager conversion above.
     auto dP_rc = make_tensor(acc_dp.data(), convert_layout_acc_rowcol(acc_dp.layout()));
 
     Tensor D3 = make_tensor<float>(Shape<Int<nrow>>{});
@@ -386,14 +390,17 @@ kernel3_bwd_tc(
     #pragma unroll
     for (int mi = 0; mi < nrow; mi++) {
         #pragma unroll
-        for (int ni = 0; ni < size<1>(dP_rc); ni++)
-            dP_rc(mi, ni) = P_rc(mi, ni) * (dP_rc(mi, ni) - D3(mi));
+        for (int ni = 0; ni < size<1>(dP_rc); ni++) {
+            float p_val = static_cast<float>(rP_rc(mi, ni));
+            dP_rc(mi, ni) = p_val * (dP_rc(mi, ni) - D3(mi));
+        }
     }
-    // acc_dp = dS in registers, acc_s = P still in registers
+    // Eager FP16 conversion of dS, mirror of acc_s above. Frees 32 FP32 regs
+    // before GEMM_dV (which allocates a 64-FP32-reg acc_dv).
+    Tensor rdS = convert_type<Element>(acc_dp);
 
-    // ======== Phase 6: Write P to sPdS (needed for GEMM_dV) ========
+    // ======== Phase 6: Write P (rP, already FP16) to sPdS ========
     {
-        auto rP = convert_type<Element>(acc_s);
         auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
         auto tc = sc.get_thread_slice(tidx);
         cute::copy(sc, tc.retile_S(rP), tc.partition_D(sPdS));
@@ -426,9 +433,8 @@ kernel3_bwd_tc(
         }
     }
 
-    // ======== Phase 8: Write dS to sPdS (overwrite P) ========
+    // ======== Phase 8: Write dS (rdS, already FP16 from eager convert) to sPdS ========
     {
-        auto rdS = convert_type<Element>(acc_dp);
         auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
         auto tc = sc.get_thread_slice(tidx);
         cute::copy(sc, tc.retile_S(rdS), tc.partition_D(sPdS));

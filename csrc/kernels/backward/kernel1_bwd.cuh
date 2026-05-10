@@ -204,7 +204,14 @@ kernel1_bwd_tc(
             scores(mi, ni) = (pc < m && pr < tile_rows) ? expf(scores(mi, ni) - lse_val) : 0.0f;
         }
     }
-    // acc_s = P in registers
+    // Eagerly convert acc_s (P, FP32) to FP16 so the 32 high FP32 regs can
+    // die before GEMM2 (which needs B-fragment registers) and softmax_bwd
+    // (which reads P alongside acc_dp). The FP32->FP16 round here is the
+    // same precision boundary we cross at the sPdS write anyway, just
+    // performed sooner. SASS check on RTX 5060 Laptop showed P occupying
+    // R140-R171; this refactor frees those 32 high registers.
+    Tensor rP = convert_type<Element>(acc_s);
+    auto rP_rc = make_tensor(rP.data(), convert_layout_acc_rowcol(acc_s.layout()));
 
     // ======== Swap slot: Q → dO ========
     __syncthreads();
@@ -224,7 +231,9 @@ kernel1_bwd_tc(
               thr_copy_A.partition_S(sSlot), thr_copy_B.partition_S(sS2),
               tiled_mma, smem_copy_A, smem_copy_B, thr_copy_A, thr_copy_B);
 
-    // Softmax backward: dS = P * (dP - D1)
+    // Softmax backward: dS = P * (dP - D1). P comes from rP (FP16) and is
+    // upconverted per element; the FP32 acc_s registers were freed after
+    // the eager convert_type above.
     auto dP_rc = make_tensor(acc_dp.data(), convert_layout_acc_rowcol(acc_dp.layout()));
     const float* d1 = D1_ptr + bh*N + row_start;
     #pragma unroll
@@ -232,15 +241,19 @@ kernel1_bwd_tc(
         int pr = get<0>(tScS_rc(mi, 0));
         float d1v = (pr < tile_rows) ? d1[pr] : 0.0f;
         #pragma unroll
-        for (int ni = 0; ni < size<1>(dP_rc); ni++)
-            dP_rc(mi, ni) = scores(mi, ni) * (dP_rc(mi, ni) - d1v);
+        for (int ni = 0; ni < size<1>(dP_rc); ni++) {
+            float p_val = static_cast<float>(rP_rc(mi, ni));
+            dP_rc(mi, ni) = p_val * (dP_rc(mi, ni) - d1v);
+        }
     }
-    // acc_dp = dS in registers
+    // acc_dp = dS in registers. Eagerly convert to FP16 so the 32 FP32 regs
+    // can die before GEMM5 (which allocates a 64-FP32-reg acc_ds2). rdS
+    // (16 FP16 regs) is what survives across GEMM5 to the sPdS write below.
+    Tensor rdS = convert_type<Element>(acc_dp);
     // sS2 is FREE (step2 no longer needed after GEMM2)
 
-    // ======== Write P to sS2 for GEMM5 (SmemLayoutPdS on sS2_ptr) ========
+    // ======== Write P (rP, already FP16) to sS2 for GEMM5 ========
     {
-        auto rP = convert_type<Element>(acc_s);
         auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
         auto tc = sc.get_thread_slice(tidx);
         cute::copy(sc, tc.retile_S(rP), tc.partition_D(sPdS));
@@ -275,9 +288,8 @@ kernel1_bwd_tc(
     // ======== Write dS to sS2 + reload Q into slot (parallel: different SMEM regions) ========
     __syncthreads();  // GEMM5 done reading sS2 (P) and slot (dO)
 
-    // Write dS over P in sS2 (register → SMEM, synchronous)
+    // Write dS (rdS, already FP16 from the eager convert above) over P in sS2
     {
-        auto rdS = convert_type<Element>(acc_dp);
         auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
         auto tc = sc.get_thread_slice(tidx);
         cute::copy(sc, tc.retile_S(rdS), tc.partition_D(sPdS));
