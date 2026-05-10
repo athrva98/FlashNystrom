@@ -96,6 +96,34 @@ Setting `fast_dk2inv=True` switches it to a tensor-core path that converts the s
 
 The flag does nothing on FP32 input dtype. The tensor-core kernels require 16-bit operands.
 
+## PyTorch compatibility
+
+`FlashNystromAttention` is a regular `nn.Module` and `flash_nystrom_attention` is a regular function. Standard PyTorch idioms work without changes.
+
+| Workflow                                  | Status |
+|-------------------------------------------|--------|
+| Eager forward + backward                  | works |
+| FP16 / BF16 / FP32 input dtypes           | works |
+| `torch.amp.autocast("cuda", dtype=...)`   | works |
+| `nn.Module` composition, `state_dict`     | works |
+| DDP / FSDP gradient sync                  | works (gradients flow through standard autograd; no custom collective is needed) |
+| `torch.compile`                           | runs, with a graph break at the FlashNystrom forward call. The kernel itself executes normally, but Dynamo cannot fuse across the boundary. See ROADMAP for the planned `torch.library.custom_op` registration that will eliminate the graph break. |
+| `torch.jit.script`                        | not supported. Custom autograd Functions are not scriptable. |
+| `torch.export`                            | not currently supported (depends on the `custom_op` registration above). |
+
+Typical training loop with autocast (matches the CIFAR-10 example):
+
+```python
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+for x, y in loader:
+    with torch.amp.autocast("cuda", dtype=torch.float16):
+        logits = model(x.cuda())
+        loss = F.cross_entropy(logits, y.cuda())
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+```
+
 ## Configuration
 
 `NystromConfig` fields:
