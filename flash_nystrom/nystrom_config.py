@@ -28,18 +28,22 @@ class NystromConfig:
     use_conv_residual: bool = True
     """Whether to add depthwise conv1d residual."""
 
-    fast_dk2inv: bool = False
-    """Opt-in tensor-core path for `compute_dk2inv` in the backward pass.
+    fast_dk2inv: bool = True
+    """Tensor-core path for `compute_dk2inv` in the backward pass.
 
-    Default False uses the FP32 scalar kernel — bit-for-bit consistent with
-    the autograd reference (modulo FP32 noise). Set True to use the
-    FP16/BF16 tensor-core kernel, which is dramatically faster at large N
-    (~6x bwd speedup at N=4096+) but converts the softmax output P from
-    FP32 to FP16/BF16 before the second GEMM, trimming P to a 10-bit
-    mantissa. Single-seed CIFAR-10 runs show this within FP16 stochastic
-    variance; it can cost a fraction of a percentage point on tight
-    accuracy comparisons. Recommended only for FP16/BF16 inputs at large N
-    where backward latency matters."""
+    Default True uses the FP16/BF16 tensor-core kernel. Set False to use
+    the FP32 scalar fallback (bit-for-bit consistent with the autograd
+    reference modulo FP32 noise).
+
+    The TC path is 4-6x faster on the full backward at N=4096+ (since
+    `compute_dk2inv` accounts for ~75-85% of bwd time when the scalar
+    kernel is used). The tradeoff is one FP32->FP16/BF16 conversion of
+    the softmax output P right before the second GEMM, trimming P to a
+    10-bit mantissa. Single-seed CIFAR-10 runs show this loss within
+    FP16 stochastic variance; it can cost a fraction of a percentage
+    point on tight accuracy comparisons. FP32 inputs always use the
+    scalar fallback regardless of this flag (the TC atom requires
+    16-bit operands)."""
 
     def __post_init__(self):
         assert self.num_landmarks > 0, "num_landmarks must be positive"

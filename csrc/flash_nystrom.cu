@@ -465,9 +465,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("conv_kernel_size") = 0,
           py::arg("conv_weight") = c10::nullopt);
     m.def("backward", &flash_nystrom::nystrom_bwd,
-          "FlashNystrom backward (CUDA). Pass fast_dk2inv=True to opt into "
-          "the tensor-core compute_dk2inv kernel (faster but converts P from "
-          "FP32 to FP16/BF16 before GEMM2; default false = FP32 scalar).",
+          "FlashNystrom backward (CUDA). Default fast_dk2inv=True uses the "
+          "tensor-core compute_dk2inv kernel (4-6x faster bwd). Set False to "
+          "use the FP32 scalar fallback (matches the autograd reference; "
+          "slower).",
           py::arg("dO"),
           py::arg("q_s"), py::arg("k_s"),
           py::arg("q_tilde"), py::arg("k_tilde"),
@@ -477,7 +478,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("v"), py::arg("output"),
           py::arg("num_landmarks"), py::arg("newton_iter"), py::arg("conv_kernel_size"),
           py::arg("conv_weight"),
-          py::arg("fast_dk2inv") = false);
+          py::arg("fast_dk2inv") = true);
     m.def("debug_ns_bwd_step", &flash_nystrom::debug_ns_bwd_step,
           "Debug: single NS backward iteration (returns dZ_j, dK2_contrib).",
           py::arg("K2"), py::arg("Z_j"), py::arg("dZ_in"));

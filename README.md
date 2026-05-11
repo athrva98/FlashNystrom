@@ -74,27 +74,27 @@ out = flash_nystrom_attention(q, k, v, num_landmarks=64, newton_iter=6)
 
 Forward and backward latency in milliseconds on an RTX 5060 Laptop, FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6. Median of 50 runs after 10 warmup iterations.
 
-| N    | FN fwd | FN bwd (default) | FN bwd (`fast_dk2inv=True`) | SDPA fwd | SDPA bwd |
-|-----:|-------:|-----------------:|-----------------------------:|---------:|---------:|
-|  128 |   0.15 |             0.74 |                         0.84 |     0.04 |     0.49 |
-|  256 |   0.15 |             0.81 |                         0.58 |     0.03 |     0.25 |
-|  512 |   0.16 |             1.05 |                         0.60 |     0.04 |     0.19 |
-| 1024 |   0.18 |             1.57 |                         0.64 |     0.10 |     0.31 |
-| 2048 |   0.21 |             2.52 |                         0.66 |     0.29 |     0.95 |
-| 4096 |   0.29 |             4.49 |                         0.77 |     1.06 |     3.50 |
-| 8192 |   0.43 |             8.80 |                         1.08 |     4.12 |    13.89 |
+| N    | FN fwd | FN bwd | SDPA fwd | SDPA bwd |
+|-----:|-------:|-------:|---------:|---------:|
+|  128 |   0.15 |   0.84 |     0.04 |     0.49 |
+|  256 |   0.15 |   0.58 |     0.03 |     0.25 |
+|  512 |   0.16 |   0.60 |     0.04 |     0.19 |
+| 1024 |   0.18 |   0.64 |     0.10 |     0.31 |
+| 2048 |   0.21 |   0.66 |     0.29 |     0.95 |
+| 4096 |   0.29 |   0.77 |     1.06 |     3.50 |
+| 8192 |   0.43 |   1.08 |     4.12 |    13.89 |
 
-The forward pass is faster than SDPA at every N. The backward crosses over near N=4096 in the default configuration and near N=2048 in the `fast_dk2inv=True` configuration. At N=8192 the total fwd+bwd is roughly 12x faster than SDPA in the fast mode.
+The forward pass is faster than SDPA at every N. The backward crosses over near N=2048. At N=8192 the total fwd+bwd is roughly 12x faster than SDPA.
 
 Reproduce with `python benchmarks/bench_fwd_bwd.py`.
 
 ## The fast_dk2inv flag
 
-`compute_dk2inv` is the kernel that produces the gradient of the loss with respect to the pseudoinverse iterate Z_N. By default it runs in FP32 scalar so that its output is bit-for-bit consistent with PyTorch autograd modulo FP32 reduction order.
+`compute_dk2inv` is the kernel that produces the gradient of the loss with respect to the pseudoinverse iterate Z_N. By default (`fast_dk2inv=True`) it runs through a tensor-core path that is 4-6x faster than the FP32 scalar fallback on the full backward (it dominates bwd time when the scalar path is used). The TC path converts the softmax output P from FP32 to FP16/BF16 before the second GEMM, trimming P to a 10-bit mantissa. On 20-epoch CIFAR-10 ViT this falls within FP16 single-seed variance and accuracy is preserved within the noise floor. The accumulator stays in FP32 so the loss-of-precision is bounded to one quantization step per P element.
 
-Setting `fast_dk2inv=True` switches it to a tensor-core path that converts the softmax output P from FP32 to FP16/BF16 before the second GEMM. The 10-bit mantissa truncation costs a small amount of precision in P. On 20-epoch CIFAR-10 ViT this falls within FP16 single-seed variance and accuracy is preserved within the noise floor. Set this flag when latency matters more than the last fraction of a percentage point of training accuracy.
+Set `fast_dk2inv=False` to use the FP32 scalar fallback. The fallback is bit-for-bit consistent with PyTorch autograd modulo FP32 reduction order. Use this when accuracy comparisons need the last fraction of a percentage point.
 
-The flag does nothing on FP32 input dtype. The tensor-core kernels require 16-bit operands.
+The flag does nothing on FP32 input dtype. The tensor-core kernels require 16-bit operands, so FP32 inputs always go through the scalar fallback.
 
 ## PyTorch compatibility
 
@@ -134,7 +134,7 @@ for x, y in loader:
 | `newton_iter`      |       6 | NS iterations for the pseudoinverse. Backward correctness is independent of convergence. |
 | `conv_kernel_size` |       3 | Depthwise conv1d residual on V. Set to 0 to disable. |
 | `use_conv_residual`|    True | Master switch for the conv residual. |
-| `fast_dk2inv`      |   False | Opt-in tensor-core path for `compute_dk2inv`. FP16/BF16 only. |
+| `fast_dk2inv`      |    True | Tensor-core path for `compute_dk2inv` in the backward (4-6x faster). FP16/BF16 only; FP32 always uses the scalar fallback. Set False to opt into bit-for-bit-with-autograd FP32 scalar. |
 
 ## Limitations
 

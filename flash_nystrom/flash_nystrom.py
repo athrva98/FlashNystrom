@@ -124,7 +124,7 @@ class FlashNystromFunction(torch.autograd.Function):
 
 def flash_nystrom_attention(
     q, k, v, num_landmarks=64, newton_iter=6, conv_weight=None, conv_kernel_size=0,
-    fast_dk2inv=False,
+    fast_dk2inv=True,
 ):
     """main entry point — uses CUDA kernels if available, falls back to pytorch.
 
@@ -134,11 +134,12 @@ def flash_nystrom_attention(
     and `dconv_residual_bwd.cuh`) are no longer used by this path — they remain
     in the codebase only for the reference implementation's compatibility.
 
-    `fast_dk2inv` opts into the tensor-core path for `compute_dk2inv` in the
-    backward (FP16/BF16 only). Faster at large N but converts the softmax
+    `fast_dk2inv` controls the `compute_dk2inv` path in the backward (FP16/BF16
+    only). Default True uses the tensor-core kernel (4-6x faster on the full
+    bwd). Set False to use the FP32 scalar fallback, which is bit-for-bit
+    consistent with the autograd reference. The TC path converts the softmax
     output P from FP32 to FP16/BF16 before GEMM2, trimming P to a 10-bit
-    mantissa — small accuracy cost. Default False = FP32 scalar (matches the
-    autograd reference to FP32 noise).
+    mantissa — small accuracy cost, typically below FP16 training noise.
     """
     if HAS_CUDA and q.is_cuda:
         # Pure attention via the fused kernels — pass conv_weight=None so the
