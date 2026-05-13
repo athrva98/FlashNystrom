@@ -180,6 +180,7 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
         p.ns_iterates_ptr, p.k2_softmax_ptr,
         p.dQ_tilde_ptr, p.dK_tilde_ptr,
         p.ns_dZ_workspace_ptr, p.ns_dK2_workspace_ptr,
+        p.ns_step_scratch_ptr,
         BH, D, m, p.newton_iter, p.stream);
 
     launch_landmark_bwd<elem_type>(p.dQ_tilde_ptr, p.dK_tilde_ptr, dQ, dK,

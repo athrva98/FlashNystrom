@@ -54,6 +54,12 @@ ext_modules = [
             os.path.join(this_dir, "csrc"),
             cutlass_include,
         ],
+        # cuBLAS is used for the m-bounded dense GEMMs (Newton-Schulz step,
+        # Newton-Schulz final, landmark projection). Pure dense matmuls with
+        # no softmax fusion, so we let NVIDIA's tuned kernels do the work.
+        # Tensor-core flash kernels (kernel1_fused_tc, kernel3_fused_tc and
+        # their backwards) keep streaming custom kernels.
+        libraries=["cublas"],
         extra_compile_args={
             "cxx": ["/O2", "/std:c++17"] if os.name == "nt" else ["-O3", "-std=c++17"],
             "nvcc": nvcc_flags,

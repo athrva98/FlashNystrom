@@ -6,10 +6,13 @@
 // The header (kernel2_inv_bwd.cuh) only declares; everything in this TU.
 
 #include "kernels/backward/kernel2_inv_bwd.cuh"
+#include "cublas_helpers.cuh"
 #include "utils.h"
 
 #include <cfloat>
 #include <cutlass/numeric_types.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cublas_v2.h>
 
 namespace flash_nystrom {
 
@@ -378,6 +381,7 @@ void launch_kernel2_inv_bwd(
     float* dQ_tilde, float* dK_tilde,
     float* dZ_workspace,
     float* dK2_workspace,
+    float* ns_step_scratch,
     int BH, int D, int m, int newton_iter, cudaStream_t stream
 ) {
     (void)k2_inv;
@@ -391,8 +395,36 @@ void launch_kernel2_inv_bwd(
     // dK2_workspace = 0
     FN_CUDA_CHECK(cudaMemsetAsync(dK2_workspace, 0, BH * mm * sizeof(float), stream));
 
-    // Per-iteration kernel
-    {
+    // ---- Per-iteration NS backward step ----------------------------------
+    //
+    // Two paths:
+    //   1. cuBLAS-based: 11 Sgemm-strided-batched + 4 small elementwise
+    //      kernels per step. Wins at m >= 48 where the per-GEMM compute
+    //      amortizes cuBLAS's 5 us launch overhead.
+    //   2. Legacy monolithic ns_bwd_step_kernel: single SMEM-bound CTA
+    //      doing all 11 matmuls in one kernel. Wins at small m where the
+    //      cuBLAS launch overhead would dominate.
+    //
+    // The crossover sits around m=48 on RTX 5060 Laptop. CUDA-graph capture
+    // around the cuBLAS path would close the launch-overhead gap and let it
+    // win everywhere; left as a follow-up.
+    //
+    // cuBLAS scratch layout (11 slots, each BH * m * m floats):
+    //   [0] M       = K2 @ Z_j
+    //   [1] M2      = M @ M
+    //   [2] V       = 15 I - 7 M + M^2
+    //   [3] T       = 13 I - M @ V
+    //   [4] dT      = 1/4 * Z_j^T @ dZ_{j+1}
+    //   [5] dV      = -M^T @ dT
+    //   [6] dM_T    = -dT @ V^T
+    //   [7] dV_MT   = dV @ M^T
+    //   [8] dU      = -M^T @ dV
+    //   [9] dM      = dM_T + (-7 dV + dV_MT) - dU
+    //   [10] dZ_outer = 1/4 * dZ_{j+1} @ T^T
+    const bool use_cublas_path = (m >= 48) && (ns_step_scratch != nullptr);
+
+    if (!use_cublas_path) {
+        // Legacy SMEM-bound kernel path.
         size_t smem = 6 * mm * sizeof(float);
         dim3 grid(BH);
         dim3 block(256);
@@ -403,12 +435,110 @@ void launch_kernel2_inv_bwd(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
         }
         for (int j = newton_iter - 1; j >= 0; j--) {
-            const float* Z_j_base = ns_iterates + j * mm;  // Z_j of bh=0
+            const float* Z_j_base = ns_iterates + j * mm;
             ns_bwd_step_kernel<<<grid, block, smem, stream>>>(
                 K2_softmax, Z_j_base, Z_bh_stride,
                 dZ_workspace, dK2_workspace, m);
             FN_CUDA_KERNEL_CHECK();
         }
+    } else {
+
+        float* ws_M       = ns_step_scratch + 0 * BH * mm;
+        float* ws_M2      = ns_step_scratch + 1 * BH * mm;
+        float* ws_V       = ns_step_scratch + 2 * BH * mm;
+        float* ws_T       = ns_step_scratch + 3 * BH * mm;
+        float* ws_dT      = ns_step_scratch + 4 * BH * mm;
+        float* ws_dV      = ns_step_scratch + 5 * BH * mm;
+        float* ws_dM_T    = ns_step_scratch + 6 * BH * mm;
+        float* ws_dV_MT   = ns_step_scratch + 7 * BH * mm;
+        float* ws_dU      = ns_step_scratch + 8 * BH * mm;
+        float* ws_dM      = ns_step_scratch + 9 * BH * mm;
+        float* ws_dZ_out  = ns_step_scratch + 10 * BH * mm;
+
+        cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+        cublasSetStream(handle, stream);
+
+        for (int j = newton_iter - 1; j >= 0; j--) {
+            const float* Z_j = ns_iterates + j * mm;  // Z_j of bh=0; stride = Z_bh_stride
+
+            // M = K2 @ Z_j
+            rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
+                1.0f, K2_softmax, mm, Z_j, Z_bh_stride,
+                0.0f, ws_M, mm, BH);
+
+            // M2 = M @ M
+            rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
+                1.0f, ws_M, mm, ws_M, mm,
+                0.0f, ws_M2, mm, BH);
+
+            // V = 15 I - 7 M + M^2
+            launch_affine_with_identity(ws_V, ws_M, ws_M2,
+                /*c0=*/15.0f, /*c1=*/-7.0f, /*c2=*/1.0f, BH, m, stream);
+
+            // T_tmp = M @ V, then T = 13 I - T_tmp (in place)
+            rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
+                1.0f, ws_M, mm, ws_V, mm,
+                0.0f, ws_T, mm, BH);
+            launch_affine_with_identity(ws_T, ws_T, /*B=*/nullptr,
+                /*c0=*/13.0f, /*c1=*/-1.0f, /*c2=*/0.0f, BH, m, stream);
+
+            // dZ_outer = 1/4 * dZ_{j+1} @ T^T
+            rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
+                0.25f, dZ_workspace, mm, ws_T, mm,
+                0.0f, ws_dZ_out, mm, BH);
+
+            // dT = 1/4 * Z_j^T @ dZ_{j+1}
+            rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+                0.25f, Z_j, Z_bh_stride, dZ_workspace, mm,
+                0.0f, ws_dT, mm, BH);
+
+            // dM_T = -dT @ V^T
+            rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
+                -1.0f, ws_dT, mm, ws_V, mm,
+                0.0f, ws_dM_T, mm, BH);
+
+            // dV = -M^T @ dT
+            rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+                -1.0f, ws_M, mm, ws_dT, mm,
+                0.0f, ws_dV, mm, BH);
+
+            // dV_MT = dV @ M^T (for dM_V = -7 dV + dV_MT)
+            rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
+                1.0f, ws_dV, mm, ws_M, mm,
+                0.0f, ws_dV_MT, mm, BH);
+
+            // dU = -M^T @ dV
+            rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+                -1.0f, ws_M, mm, ws_dV, mm,
+                0.0f, ws_dU, mm, BH);
+
+            // dM = dM_T + (-7 dV) + dV_MT + (-1 dU)
+            //   Start: dM = dM_T (c0=0, c1=1, c2=0 with A=dM_T, B=nullptr)
+            //   Then add -7 dV
+            //   Then add dV_MT
+            //   Then add -1 dU
+            launch_affine_with_identity(ws_dM, ws_dM_T, /*B=*/nullptr,
+                /*c0=*/0.0f, /*c1=*/1.0f, /*c2=*/0.0f, BH, m, stream);
+            launch_add_scaled_inplace(ws_dM, ws_dV,    -7.0f, BH, m, stream);
+            launch_add_scaled_inplace(ws_dM, ws_dV_MT,  1.0f, BH, m, stream);
+            launch_add_scaled_inplace(ws_dM, ws_dU,    -1.0f, BH, m, stream);
+
+            // dK2_acc += dM @ Z_j^T  (cuBLAS gemm with beta=1 accumulates)
+            rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
+                1.0f, ws_dM, mm, Z_j, Z_bh_stride,
+                1.0f, dK2_workspace, mm, BH);
+
+            // dZ_workspace = K2^T @ dM    (replaces old dZ_{j+1} with dZ_inner)
+            //   note: dZ_workspace's value at entry (dZ_{j+1}) is no longer needed
+            //   past this point in the iteration; we overwrite it.
+            rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+                1.0f, K2_softmax, mm, ws_dM, mm,
+                0.0f, dZ_workspace, mm, BH);
+
+            // dZ_workspace += dZ_outer   (dZ_j = dZ_outer + dZ_inner)
+            launch_add_scaled_inplace(dZ_workspace, ws_dZ_out, 1.0f, BH, m, stream);
+        }
+        FN_CUDA_KERNEL_CHECK();
     }
 
     // Final-step kernel
@@ -434,15 +564,15 @@ void launch_kernel2_inv_bwd(
 // pointer without seeing the kernel definition.
 template void launch_kernel2_inv_bwd<float>(
     const float*, const float*, const float*, const float*, const float*,
-    const float*, const float*, float*, float*, float*, float*,
+    const float*, const float*, float*, float*, float*, float*, float*,
     int, int, int, int, cudaStream_t);
 template void launch_kernel2_inv_bwd<cutlass::half_t>(
     const cutlass::half_t*, const cutlass::half_t*, const float*, const float*, const float*,
-    const float*, const float*, float*, float*, float*, float*,
+    const float*, const float*, float*, float*, float*, float*, float*,
     int, int, int, int, cudaStream_t);
 template void launch_kernel2_inv_bwd<cutlass::bfloat16_t>(
     const cutlass::bfloat16_t*, const cutlass::bfloat16_t*, const float*, const float*, const float*,
-    const float*, const float*, float*, float*, float*, float*,
+    const float*, const float*, float*, float*, float*, float*, float*,
     int, int, int, int, cudaStream_t);
 
 template __global__ void ns_bwd_final_kernel<float>(

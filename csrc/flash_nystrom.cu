@@ -195,6 +195,10 @@ std::vector<torch::Tensor> nystrom_bwd(
     // Workspaces for the unrolled NS backward.
     auto ns_dZ_ws  = torch::empty({B, H, m, m}, opts_f32);
     auto ns_dK2_ws = torch::empty({B, H, m, m}, opts_f32);
+    // Scratch for the cuBLAS-based NS step: 11 FP32 buffers each shape
+    // (B, H, m, m), concatenated into one allocation for cache locality.
+    // Used by launch_kernel2_inv_bwd when cuBLAS path is enabled.
+    auto ns_step_scratch = torch::empty({11, B, H, m, m}, opts_f32);
 
     // dO3 intermediate (always allocated — used by precompute_d3 and the TC
     // kernel3_bwd). Allocated in input dtype: FP16/BF16 for the TC path,
@@ -250,6 +254,7 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.dO3_ptr = dO3.data_ptr();
     params.ns_dZ_workspace_ptr  = ns_dZ_ws.data_ptr<float>();
     params.ns_dK2_workspace_ptr = ns_dK2_ws.data_ptr<float>();
+    params.ns_step_scratch_ptr  = ns_step_scratch.data_ptr<float>();
     params.stream = stream;
 
     if (dtype == at::ScalarType::Float) {
@@ -392,6 +397,9 @@ std::vector<torch::Tensor> debug_kernel2_inv_bwd_full(
     auto dK_tilde = torch::zeros({BH, m, D}, opts_f32);
     auto dZ_ws    = torch::empty({BH, m, m}, opts_f32);
     auto dK2_ws   = torch::empty({BH, m, m}, opts_f32);
+    // Per-iter NS step scratch for the cuBLAS path. Single allocation
+    // partitioned into 11 (BH, m, m) buffers inside launch_kernel2_inv_bwd.
+    auto ns_step_scratch = torch::empty({11, BH, m, m}, opts_f32);
 
     flash_nystrom::launch_kernel2_inv_bwd<float>(
         q_tilde.data_ptr<float>(), k_tilde.data_ptr<float>(),
@@ -401,6 +409,7 @@ std::vector<torch::Tensor> debug_kernel2_inv_bwd_full(
         K2_softmax.data_ptr<float>(),
         dQ_tilde.data_ptr<float>(), dK_tilde.data_ptr<float>(),
         dZ_ws.data_ptr<float>(), dK2_ws.data_ptr<float>(),
+        ns_step_scratch.data_ptr<float>(),
         BH, D, m, static_cast<int>(newton_iter), stream);
 
     return {dQ_tilde, dK_tilde};

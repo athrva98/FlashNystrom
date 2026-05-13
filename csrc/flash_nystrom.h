@@ -111,6 +111,11 @@ struct NystromBwdParams {
     // Workspace for unrolled NS backward.
     float* __restrict__ ns_dZ_workspace_ptr;   // (B,H,m,m) FP32 — rolling dZ_j
     float* __restrict__ ns_dK2_workspace_ptr;  // (B,H,m,m) FP32 — accumulated dK2 from NS
+    // Scratch for the cuBLAS-based ns_bwd_step (M, M2, V, T, dT, dV, dM_T,
+    // dV_MT, dU, dM, dZ_outer interleaved). Size 11 * BH * m * m FP32 = 176 KB
+    // at the common (BH=8, m=64) config. If null the launcher falls back to
+    // the legacy monolithic ns_bwd_step_kernel.
+    float* __restrict__ ns_step_scratch_ptr;   // 11 * (B,H,m,m) FP32 or nullptr
 
     cudaStream_t stream;
 

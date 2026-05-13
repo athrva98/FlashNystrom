@@ -61,6 +61,9 @@ void launch_kernel2_inv_bwd(
     float* dQ_tilde, float* dK_tilde,
     float* dZ_workspace,
     float* dK2_workspace,
+    // 11 * BH * m * m FP32 scratch for the cuBLAS-based per-iter NS step
+    // (M, M2, V, T, dT, dV, dM_T, dV_MT, dU, dM, dZ_outer interleaved).
+    float* ns_step_scratch,
     int BH, int D, int m, int newton_iter, cudaStream_t stream);
 
 // -- Test-only standalone launchers (used by debug pybind hooks) --
