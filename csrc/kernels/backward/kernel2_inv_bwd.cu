@@ -12,6 +12,12 @@
 #include <cfloat>
 #include <cutlass/numeric_types.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAEvent.h>
+#include <ATen/ops/empty.h>
+#include <ATen/Tensor.h>
+#include <c10/core/ScalarType.h>
+#include <c10/core/TensorOptions.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cublas_v2.h>
 
 namespace flash_nystrom {
@@ -370,6 +376,207 @@ __global__ void ns_bwd_final_kernel(
 // Production launch wrapper (called from run_nystrom_bwd_impl).
 // =========================================================================
 
+// -- per-thread NS bwd graph cache ----------------------------------------
+//
+// The NS backward fires ~80 small cuBLAS Sgemm calls + a handful of small
+// elementwise kernels + one ns_bwd_final per backward. Each launch is
+// ~5 us of host-side overhead; the GPU compute per call is microseconds.
+// Without graphs, host-side launch dominates: the per-iter NS cost was
+// ~480 us legacy, ~160 us cuBLAS-without-graphs at m=64 BH=8.
+//
+// The graph capture records all the launches once per (m, BH, niter, D)
+// shape and replays them with one cudaGraphLaunch on subsequent calls. The
+// pointers must stay stable across replays, so we hold persistent workspace
+// tensors here and memcpy the caller's inputs in / outputs out around the
+// graph launch. Memcpys are ~50 us total (a few MB on a 400 GB/s bus); the
+// graph launch is single-digit microseconds.
+
+template <typename T>
+struct ElemScalarType;
+template <> struct ElemScalarType<float>              { static constexpr c10::ScalarType value = at::kFloat;    };
+template <> struct ElemScalarType<cutlass::half_t>    { static constexpr c10::ScalarType value = at::kHalf;     };
+template <> struct ElemScalarType<cutlass::bfloat16_t>{ static constexpr c10::ScalarType value = at::kBFloat16; };
+
+template <typename scalar_t>
+struct NsBwdGraphState {
+    int m = -1, BH = -1, niter = -1, D = -1;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    // Persistent workspaces with stable addresses across calls.
+    at::Tensor K2_buf;       // (BH, m, m) FP32           — copied in
+    at::Tensor ns_iter_buf;  // (BH, niter+1, m, m) FP32 — copied in
+    at::Tensor q_tilde_buf;  // (BH, m, D) elem_type     — copied in
+    at::Tensor k_tilde_buf;  // (BH, m, D) elem_type     — copied in
+    at::Tensor dZ_buf;       // (BH, m, m) FP32          — rolling state
+    at::Tensor dK2_buf;      // (BH, m, m) FP32          — accumulator (zeroed each call)
+    at::Tensor dQ_tilde_buf; // (BH, m, D) FP32          — accumulator (copied in/out)
+    at::Tensor dK_tilde_buf; // (BH, m, D) FP32          — accumulator (copied in/out)
+    at::Tensor scratch_buf;  // (11, BH, m, m) FP32       — NS step intermediates
+
+    bool matches(int m_, int BH_, int n_, int D_) const {
+        return m == m_ && BH == BH_ && niter == n_ && D == D_;
+    }
+
+    void invalidate_graph() {
+        if (exec)  { cudaGraphExecDestroy(exec); exec  = nullptr; }
+        if (graph) { cudaGraphDestroy(graph);    graph = nullptr; }
+    }
+
+    void allocate(int m_, int BH_, int n_, int D_) {
+        m = m_; BH = BH_; niter = n_; D = D_;
+        invalidate_graph();
+        auto opts_f32  = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA);
+        auto opts_elem = at::TensorOptions()
+            .dtype(ElemScalarType<scalar_t>::value).device(at::kCUDA);
+        K2_buf       = at::empty({BH, m, m},          opts_f32);
+        ns_iter_buf  = at::empty({BH, n_ + 1, m, m},  opts_f32);
+        q_tilde_buf  = at::empty({BH, m, D},          opts_elem);
+        k_tilde_buf  = at::empty({BH, m, D},          opts_elem);
+        dZ_buf       = at::empty({BH, m, m},          opts_f32);
+        dK2_buf      = at::empty({BH, m, m},          opts_f32);
+        dQ_tilde_buf = at::empty({BH, m, D},          opts_f32);
+        dK_tilde_buf = at::empty({BH, m, D},          opts_f32);
+        scratch_buf  = at::empty({11, BH, m, m},      opts_f32);
+    }
+
+    ~NsBwdGraphState() {
+        // Best-effort cleanup on thread exit. CUDA context may already be
+        // gone at process exit; ignore errors silently.
+        if (exec)  cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+    }
+};
+
+template <typename scalar_t>
+static NsBwdGraphState<scalar_t>& get_ns_bwd_graph_state() {
+    static thread_local NsBwdGraphState<scalar_t> s;
+    return s;
+}
+
+// Record the entire NS backward (per-iter cuBLAS step loop + final softmax
+// bwd) onto whatever stream is active. Called inside stream capture to build
+// the graph; pointers are the persistent workspace pointers in `s`.
+template <typename scalar_t>
+static void record_ns_bwd_on_workspace(
+    NsBwdGraphState<scalar_t>& s, cudaStream_t stream
+) {
+    const int m = s.m, BH = s.BH, niter = s.niter, D = s.D;
+    const int mm = m * m;
+    const int Z_bh_stride = (niter + 1) * mm;
+
+    // Inside a function template, member templates on dependent objects
+    // need the explicit `template` disambiguator. Each .template data_ptr<T>()
+    // here is just .data_ptr<T>() with the disambiguation.
+    float*    K2       = s.K2_buf.template data_ptr<float>();
+    float*    ns_iter  = s.ns_iter_buf.template data_ptr<float>();
+    float*    dZ       = s.dZ_buf.template data_ptr<float>();
+    float*    dK2      = s.dK2_buf.template data_ptr<float>();
+    float*    scratch  = s.scratch_buf.template data_ptr<float>();
+    // ATen's data_ptr<T>() has no specialization for cutlass scalar types;
+    // go through the void-pointer form and reinterpret.
+    scalar_t* q_tilde  = reinterpret_cast<scalar_t*>(s.q_tilde_buf.data_ptr());
+    scalar_t* k_tilde  = reinterpret_cast<scalar_t*>(s.k_tilde_buf.data_ptr());
+    float*    dQ_tilde = s.dQ_tilde_buf.template data_ptr<float>();
+    float*    dK_tilde = s.dK_tilde_buf.template data_ptr<float>();
+
+    float* ws_M       = scratch + 0  * BH * mm;
+    float* ws_M2      = scratch + 1  * BH * mm;
+    float* ws_V       = scratch + 2  * BH * mm;
+    float* ws_T       = scratch + 3  * BH * mm;
+    float* ws_dT      = scratch + 4  * BH * mm;
+    float* ws_dV      = scratch + 5  * BH * mm;
+    float* ws_dM_T    = scratch + 6  * BH * mm;
+    float* ws_dV_MT   = scratch + 7  * BH * mm;
+    float* ws_dU      = scratch + 8  * BH * mm;
+    float* ws_dM      = scratch + 9  * BH * mm;
+    float* ws_dZ_out  = scratch + 10 * BH * mm;
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(handle, stream);
+
+    for (int j = niter - 1; j >= 0; j--) {
+        const float* Z_j = ns_iter + j * mm;
+
+        rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
+            1.0f, K2, mm, Z_j, Z_bh_stride,
+            0.0f, ws_M, mm, BH);
+
+        rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
+            1.0f, ws_M, mm, ws_M, mm,
+            0.0f, ws_M2, mm, BH);
+
+        launch_affine_with_identity(ws_V, ws_M, ws_M2,
+            15.0f, -7.0f, 1.0f, BH, m, stream);
+
+        rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
+            1.0f, ws_M, mm, ws_V, mm,
+            0.0f, ws_T, mm, BH);
+        launch_affine_with_identity(ws_T, ws_T, nullptr,
+            13.0f, -1.0f, 0.0f, BH, m, stream);
+
+        rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
+            0.25f, dZ, mm, ws_T, mm,
+            0.0f, ws_dZ_out, mm, BH);
+
+        rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+            0.25f, Z_j, Z_bh_stride, dZ, mm,
+            0.0f, ws_dT, mm, BH);
+
+        rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
+            -1.0f, ws_dT, mm, ws_V, mm,
+            0.0f, ws_dM_T, mm, BH);
+
+        rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+            -1.0f, ws_M, mm, ws_dT, mm,
+            0.0f, ws_dV, mm, BH);
+
+        rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
+            1.0f, ws_dV, mm, ws_M, mm,
+            0.0f, ws_dV_MT, mm, BH);
+
+        rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+            -1.0f, ws_M, mm, ws_dV, mm,
+            0.0f, ws_dU, mm, BH);
+
+        launch_affine_with_identity(ws_dM, ws_dM_T, nullptr,
+            0.0f, 1.0f, 0.0f, BH, m, stream);
+        launch_add_scaled_inplace(ws_dM, ws_dV,    -7.0f, BH, m, stream);
+        launch_add_scaled_inplace(ws_dM, ws_dV_MT,  1.0f, BH, m, stream);
+        launch_add_scaled_inplace(ws_dM, ws_dU,    -1.0f, BH, m, stream);
+
+        rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
+            1.0f, ws_dM, mm, Z_j, Z_bh_stride,
+            1.0f, dK2, mm, BH);
+
+        rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+            1.0f, K2, mm, ws_dM, mm,
+            0.0f, dZ, mm, BH);
+
+        launch_add_scaled_inplace(dZ, ws_dZ_out, 1.0f, BH, m, stream);
+    }
+
+    // Final NS bwd step. cudaFuncSetAttribute is host-only and not
+    // captured; it sets a function attribute that persists across replays.
+    {
+        size_t smem = (3 * mm + 8) * sizeof(float);
+        dim3 grid(BH);
+        dim3 block(256);
+        if (smem > 48 * 1024) {
+            FN_CHECK(smem <= get_max_smem_per_block(),
+                     "ns_bwd_final: insufficient SMEM");
+            FN_CUDA_CHECK(cudaFuncSetAttribute(ns_bwd_final_kernel<scalar_t>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+        }
+        ns_bwd_final_kernel<scalar_t><<<grid, block, smem, stream>>>(
+            q_tilde, k_tilde, K2, dZ, dK2,
+            dQ_tilde, dK_tilde, D, m);
+    }
+}
+
+// =========================================================================
+// Production launch wrapper (called from run_nystrom_bwd_impl).
+// =========================================================================
+
 template <typename scalar_t>
 void launch_kernel2_inv_bwd(
     const scalar_t* q_tilde, const scalar_t* k_tilde,
@@ -386,177 +593,73 @@ void launch_kernel2_inv_bwd(
 ) {
     (void)k2_inv;
     (void)lse2;
+    (void)dZ_workspace;     // graph state owns its own dZ buffer
+    (void)dK2_workspace;    // graph state owns its own dK2 buffer
+    (void)ns_step_scratch;  // graph state owns its own NS step scratch
+
     const int mm = m * m;
-    const int Z_bh_stride = (newton_iter + 1) * mm;
+    const int mD = m * D;
 
-    // dZ_workspace = dK2_inv_in (gradient w.r.t. Z_N)
-    FN_CUDA_CHECK(cudaMemcpyAsync(dZ_workspace, dK2_inv_in, BH * mm * sizeof(float),
-                                  cudaMemcpyDeviceToDevice, stream));
-    // dK2_workspace = 0
-    FN_CUDA_CHECK(cudaMemsetAsync(dK2_workspace, 0, BH * mm * sizeof(float), stream));
-
-    // ---- Per-iteration NS backward step ----------------------------------
-    //
-    // Two paths:
-    //   1. cuBLAS-based: 11 Sgemm-strided-batched + 4 small elementwise
-    //      kernels per step. Wins at m >= 48 where the per-GEMM compute
-    //      amortizes cuBLAS's 5 us launch overhead.
-    //   2. Legacy monolithic ns_bwd_step_kernel: single SMEM-bound CTA
-    //      doing all 11 matmuls in one kernel. Wins at small m where the
-    //      cuBLAS launch overhead would dominate.
-    //
-    // The crossover sits around m=48 on RTX 5060 Laptop. CUDA-graph capture
-    // around the cuBLAS path would close the launch-overhead gap and let it
-    // win everywhere; left as a follow-up.
-    //
-    // cuBLAS scratch layout (11 slots, each BH * m * m floats):
-    //   [0] M       = K2 @ Z_j
-    //   [1] M2      = M @ M
-    //   [2] V       = 15 I - 7 M + M^2
-    //   [3] T       = 13 I - M @ V
-    //   [4] dT      = 1/4 * Z_j^T @ dZ_{j+1}
-    //   [5] dV      = -M^T @ dT
-    //   [6] dM_T    = -dT @ V^T
-    //   [7] dV_MT   = dV @ M^T
-    //   [8] dU      = -M^T @ dV
-    //   [9] dM      = dM_T + (-7 dV + dV_MT) - dU
-    //   [10] dZ_outer = 1/4 * dZ_{j+1} @ T^T
-    const bool use_cublas_path = (m >= 48) && (ns_step_scratch != nullptr);
-
-    if (!use_cublas_path) {
-        // Legacy SMEM-bound kernel path.
-        size_t smem = 6 * mm * sizeof(float);
-        dim3 grid(BH);
-        dim3 block(256);
-        if (smem > 48 * 1024) {
-            FN_CHECK(smem <= get_max_smem_per_block(),
-                     "ns_bwd_step: insufficient SMEM");
-            FN_CUDA_CHECK(cudaFuncSetAttribute(ns_bwd_step_kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-        }
-        for (int j = newton_iter - 1; j >= 0; j--) {
-            const float* Z_j_base = ns_iterates + j * mm;
-            ns_bwd_step_kernel<<<grid, block, smem, stream>>>(
-                K2_softmax, Z_j_base, Z_bh_stride,
-                dZ_workspace, dK2_workspace, m);
-            FN_CUDA_KERNEL_CHECK();
-        }
-    } else {
-
-        float* ws_M       = ns_step_scratch + 0 * BH * mm;
-        float* ws_M2      = ns_step_scratch + 1 * BH * mm;
-        float* ws_V       = ns_step_scratch + 2 * BH * mm;
-        float* ws_T       = ns_step_scratch + 3 * BH * mm;
-        float* ws_dT      = ns_step_scratch + 4 * BH * mm;
-        float* ws_dV      = ns_step_scratch + 5 * BH * mm;
-        float* ws_dM_T    = ns_step_scratch + 6 * BH * mm;
-        float* ws_dV_MT   = ns_step_scratch + 7 * BH * mm;
-        float* ws_dU      = ns_step_scratch + 8 * BH * mm;
-        float* ws_dM      = ns_step_scratch + 9 * BH * mm;
-        float* ws_dZ_out  = ns_step_scratch + 10 * BH * mm;
-
-        cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
-        cublasSetStream(handle, stream);
-
-        for (int j = newton_iter - 1; j >= 0; j--) {
-            const float* Z_j = ns_iterates + j * mm;  // Z_j of bh=0; stride = Z_bh_stride
-
-            // M = K2 @ Z_j
-            rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
-                1.0f, K2_softmax, mm, Z_j, Z_bh_stride,
-                0.0f, ws_M, mm, BH);
-
-            // M2 = M @ M
-            rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
-                1.0f, ws_M, mm, ws_M, mm,
-                0.0f, ws_M2, mm, BH);
-
-            // V = 15 I - 7 M + M^2
-            launch_affine_with_identity(ws_V, ws_M, ws_M2,
-                /*c0=*/15.0f, /*c1=*/-7.0f, /*c2=*/1.0f, BH, m, stream);
-
-            // T_tmp = M @ V, then T = 13 I - T_tmp (in place)
-            rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
-                1.0f, ws_M, mm, ws_V, mm,
-                0.0f, ws_T, mm, BH);
-            launch_affine_with_identity(ws_T, ws_T, /*B=*/nullptr,
-                /*c0=*/13.0f, /*c1=*/-1.0f, /*c2=*/0.0f, BH, m, stream);
-
-            // dZ_outer = 1/4 * dZ_{j+1} @ T^T
-            rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
-                0.25f, dZ_workspace, mm, ws_T, mm,
-                0.0f, ws_dZ_out, mm, BH);
-
-            // dT = 1/4 * Z_j^T @ dZ_{j+1}
-            rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
-                0.25f, Z_j, Z_bh_stride, dZ_workspace, mm,
-                0.0f, ws_dT, mm, BH);
-
-            // dM_T = -dT @ V^T
-            rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
-                -1.0f, ws_dT, mm, ws_V, mm,
-                0.0f, ws_dM_T, mm, BH);
-
-            // dV = -M^T @ dT
-            rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
-                -1.0f, ws_M, mm, ws_dT, mm,
-                0.0f, ws_dV, mm, BH);
-
-            // dV_MT = dV @ M^T (for dM_V = -7 dV + dV_MT)
-            rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
-                1.0f, ws_dV, mm, ws_M, mm,
-                0.0f, ws_dV_MT, mm, BH);
-
-            // dU = -M^T @ dV
-            rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
-                -1.0f, ws_M, mm, ws_dV, mm,
-                0.0f, ws_dU, mm, BH);
-
-            // dM = dM_T + (-7 dV) + dV_MT + (-1 dU)
-            //   Start: dM = dM_T (c0=0, c1=1, c2=0 with A=dM_T, B=nullptr)
-            //   Then add -7 dV
-            //   Then add dV_MT
-            //   Then add -1 dU
-            launch_affine_with_identity(ws_dM, ws_dM_T, /*B=*/nullptr,
-                /*c0=*/0.0f, /*c1=*/1.0f, /*c2=*/0.0f, BH, m, stream);
-            launch_add_scaled_inplace(ws_dM, ws_dV,    -7.0f, BH, m, stream);
-            launch_add_scaled_inplace(ws_dM, ws_dV_MT,  1.0f, BH, m, stream);
-            launch_add_scaled_inplace(ws_dM, ws_dU,    -1.0f, BH, m, stream);
-
-            // dK2_acc += dM @ Z_j^T  (cuBLAS gemm with beta=1 accumulates)
-            rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
-                1.0f, ws_dM, mm, Z_j, Z_bh_stride,
-                1.0f, dK2_workspace, mm, BH);
-
-            // dZ_workspace = K2^T @ dM    (replaces old dZ_{j+1} with dZ_inner)
-            //   note: dZ_workspace's value at entry (dZ_{j+1}) is no longer needed
-            //   past this point in the iteration; we overwrite it.
-            rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
-                1.0f, K2_softmax, mm, ws_dM, mm,
-                0.0f, dZ_workspace, mm, BH);
-
-            // dZ_workspace += dZ_outer   (dZ_j = dZ_outer + dZ_inner)
-            launch_add_scaled_inplace(dZ_workspace, ws_dZ_out, 1.0f, BH, m, stream);
-        }
-        FN_CUDA_KERNEL_CHECK();
+    auto& s = get_ns_bwd_graph_state<scalar_t>();
+    if (!s.matches(m, BH, newton_iter, D)) {
+        s.allocate(m, BH, newton_iter, D);
     }
 
-    // Final-step kernel
-    {
-        size_t smem = (3 * mm + 8) * sizeof(float);
-        dim3 grid(BH);
-        dim3 block(256);
-        if (smem > 48 * 1024) {
-            FN_CHECK(smem <= get_max_smem_per_block(),
-                     "ns_bwd_final: insufficient SMEM");
-            FN_CUDA_CHECK(cudaFuncSetAttribute(ns_bwd_final_kernel<scalar_t>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-        }
-        ns_bwd_final_kernel<scalar_t><<<grid, block, smem, stream>>>(
-            q_tilde, k_tilde, K2_softmax, dZ_workspace, dK2_workspace,
-            dQ_tilde, dK_tilde, D, m);
-        FN_CUDA_KERNEL_CHECK();
+    // Memcpy inputs from caller pointers to persistent workspaces.
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.K2_buf.template data_ptr<float>(),
+        K2_softmax, BH * mm * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.ns_iter_buf.template data_ptr<float>(),
+        ns_iterates, BH * (newton_iter + 1) * mm * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.dZ_buf.template data_ptr<float>(),
+        dK2_inv_in, BH * mm * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.q_tilde_buf.data_ptr(),
+        q_tilde, BH * mD * sizeof(scalar_t),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.k_tilde_buf.data_ptr(),
+        k_tilde, BH * mD * sizeof(scalar_t),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.dQ_tilde_buf.template data_ptr<float>(),
+        dQ_tilde, BH * mD * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.dK_tilde_buf.template data_ptr<float>(),
+        dK_tilde, BH * mD * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemsetAsync(s.dK2_buf.template data_ptr<float>(),
+        0, BH * mm * sizeof(float), stream));
+
+    // Capture graph on first call for this shape, replay on subsequent calls.
+    // PyTorch's current stream is often the legacy default (stream 0), which
+    // is not capturable. We do the capture on a side stream from the pool
+    // (no kernels actually run during capture; the graph just records the
+    // launch sequence) and then replay on the caller's stream, which both
+    // executes the work and preserves the caller's stream ordering.
+    if (s.exec == nullptr) {
+        // Pre-warm the cuBLAS handle outside capture. PyTorch creates the
+        // handle lazily on first access; cublasCreate is not allowed during
+        // stream capture, so we trigger creation here.
+        (void)at::cuda::getCurrentCUDABlasHandle();
+
+        auto side = c10::cuda::getStreamFromPool(/*isHighPriority=*/false);
+        cudaStream_t side_stream = side.stream();
+        FN_CUDA_CHECK(cudaStreamBeginCapture(side_stream,
+            cudaStreamCaptureModeThreadLocal));
+        record_ns_bwd_on_workspace<scalar_t>(s, side_stream);
+        FN_CUDA_CHECK(cudaStreamEndCapture(side_stream, &s.graph));
+        FN_CUDA_CHECK(cudaGraphInstantiate(&s.exec, s.graph, nullptr, nullptr, 0));
     }
+    FN_CUDA_CHECK(cudaGraphLaunch(s.exec, stream));
+
+    // Memcpy outputs from workspaces to caller pointers.
+    FN_CUDA_CHECK(cudaMemcpyAsync(dQ_tilde,
+        s.dQ_tilde_buf.template data_ptr<float>(), BH * mD * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemcpyAsync(dK_tilde,
+        s.dK_tilde_buf.template data_ptr<float>(), BH * mD * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_KERNEL_CHECK();
 }
 
 // Explicit template instantiations. Required so other TUs (e.g. the
