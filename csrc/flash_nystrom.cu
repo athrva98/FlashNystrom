@@ -107,6 +107,10 @@ std::vector<torch::Tensor> nystrom_fwd(
     // Saved-for-backward tensors (always allocated; the unrolled NS backward needs them).
     auto ns_iterates  = torch::empty({B, H, static_cast<int64_t>(newton_iter + 1), m, m}, opts_f32);
     auto k2_softmax   = torch::empty({B, H, m, m}, opts_f32);
+    // B = softmax(Q_tilde @ K^T) @ V. Saved so the backward's compute_dk2inv
+    // does not need to N-walk to recompute it. m*D per batch-head, so total
+    // size B*H*m*D bytes in dtype (typically a few hundred KB).
+    auto b_saved      = torch::empty({B, H, m, D}, opts);
     NystromParams params = {};
     params.batch_size = static_cast<int>(B);
     params.num_heads = static_cast<int>(H);
@@ -125,6 +129,7 @@ std::vector<torch::Tensor> nystrom_fwd(
     params.k_tilde_ptr = k_tilde.data_ptr();
     params.kernel2_inv_ptr = kernel2_inv.data_ptr<float>();
     params.step2_ptr = step2.data_ptr();
+    params.b_ptr = b_saved.data_ptr();
     params.softmax1_lse_ptr = softmax1_lse.data_ptr<float>();
     params.softmax2_lse_ptr = softmax2_lse.data_ptr<float>();
     params.softmax3_lse_ptr = softmax3_lse.data_ptr<float>();
@@ -140,7 +145,8 @@ std::vector<torch::Tensor> nystrom_fwd(
     }
 
     return {output, q_s, k_s, q_tilde, k_tilde, kernel2_inv, step2,
-            softmax1_lse, softmax2_lse, softmax3_lse, ns_iterates, k2_softmax};
+            softmax1_lse, softmax2_lse, softmax3_lse, ns_iterates, k2_softmax,
+            b_saved};
 }
 
 // -- backward --
@@ -153,6 +159,7 @@ std::vector<torch::Tensor> nystrom_bwd(
     torch::Tensor kernel2_inv, torch::Tensor step2,
     torch::Tensor softmax1_lse, torch::Tensor softmax2_lse, torch::Tensor softmax3_lse,
     torch::Tensor ns_iterates, torch::Tensor k2_softmax,
+    torch::Tensor b_saved,
     torch::Tensor v, torch::Tensor output,
     int64_t num_landmarks, int64_t newton_iter, int64_t conv_kernel_size,
     c10::optional<torch::Tensor> conv_weight,
@@ -218,6 +225,7 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.k_tilde_ptr = k_tilde.data_ptr();
     params.k2_inv_ptr = kernel2_inv.data_ptr<float>();
     params.step2_ptr = step2.data_ptr();
+    params.b_ptr = b_saved.data_ptr();
     params.o_ptr = output.data_ptr();
     params.lse1_ptr = softmax1_lse.data_ptr<float>();
     params.lse2_ptr = softmax2_lse.data_ptr<float>();
@@ -444,6 +452,7 @@ std::vector<torch::Tensor> debug_compute_dk2inv(
         q_tilde.data_ptr<float>(),
         k_s.data_ptr<float>(),
         v.data_ptr<float>(),
+        /*b=*/nullptr,                 // debug hook always re-walks N (legacy path)
         dO3.data_ptr<float>(),
         lse3.data_ptr<float>(),
         dstep2.data_ptr<float>(),
@@ -465,16 +474,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("conv_kernel_size") = 0,
           py::arg("conv_weight") = c10::nullopt);
     m.def("backward", &flash_nystrom::nystrom_bwd,
-          "FlashNystrom backward (CUDA). Default fast_dk2inv=True uses the "
-          "tensor-core compute_dk2inv kernel (4-6x faster bwd). Set False to "
-          "use the FP32 scalar fallback (matches the autograd reference; "
-          "slower).",
+          "FlashNystrom backward (CUDA). Pass b_saved = softmax(Q_tilde @ K^T) "
+          "@ V from the forward to skip the N-walk in compute_dk2inv. "
+          "fast_dk2inv only matters when b_saved is empty.",
           py::arg("dO"),
           py::arg("q_s"), py::arg("k_s"),
           py::arg("q_tilde"), py::arg("k_tilde"),
           py::arg("kernel2_inv"), py::arg("step2"),
           py::arg("softmax1_lse"), py::arg("softmax2_lse"), py::arg("softmax3_lse"),
           py::arg("ns_iterates"), py::arg("k2_softmax"),
+          py::arg("b_saved"),
           py::arg("v"), py::arg("output"),
           py::arg("num_landmarks"), py::arg("newton_iter"), py::arg("conv_kernel_size"),
           py::arg("conv_weight"),

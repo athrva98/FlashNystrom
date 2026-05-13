@@ -136,6 +136,7 @@ kernel3_fused_tc(
     const typename Traits::Element* __restrict__ v_ptr,        // (B*H, N, D)
     const float*                    __restrict__ kernel2_inv_ptr, // (B*H, m, m)
     typename Traits::Element*       __restrict__ step2_ptr,    // (B*H, m, D)
+    typename Traits::Element*       __restrict__ b_ptr,        // (B*H, m, D) or nullptr; B = softmax(Qt@K^T)@V
     float*                          __restrict__ lse_ptr,      // (B*H, m)
     int N, int D, int m
 ) {
@@ -413,6 +414,19 @@ kernel3_fused_tc(
     cute::copy(smem_copy_O, taccOrO, taccOsQ);
     __syncthreads();
 
+    // Side output: write B = O_acc to GMEM if requested. This is the same
+    // intermediate the backward's compute_dk2inv would otherwise N-walk to
+    // recompute; saving it once here turns that bwd kernel into a pair of
+    // small m-bounded matmuls. sQ holds B at this point (kBlockM x kHeadDim
+    // in the swizzled SMEM layout); rows >= m and cols >= D are zero.
+    if (b_ptr != nullptr) {
+        Element* b_out = b_ptr + bh * m * D;
+        for (int idx = tidx; idx < m * D; idx += Traits::kNThreads) {
+            int row = idx / D, d = idx % D;
+            b_out[idx] = sQ(row, d);
+        }
+    }
+
     // Scalar K2_inv @ O_acc -> step2
     // sQ now holds O_acc as (kBlockM, kHeadDim) in SMEM
     // K2_inv is (m, m) in GMEM (FP32)
@@ -435,7 +449,9 @@ kernel3_fused_tc(
 template <typename scalar_t>
 void launch_kernel3_output_fused(
     const scalar_t* q_tilde, const scalar_t* k, const scalar_t* v,
-    const float* kernel2_inv, scalar_t* step2, float* softmax3_lse,
+    const float* kernel2_inv, scalar_t* step2,
+    scalar_t* b_out,                         // (BH, m, D) saved B, or nullptr
+    float* softmax3_lse,
     int BH, int N, int D, int m,
     cudaStream_t stream
 ) {
@@ -459,7 +475,7 @@ void launch_kernel3_output_fused(
         }
 
         kernel3_fused_tc<Traits><<<grid, block, smem, stream>>>(
-            q_tilde, k, v, kernel2_inv, step2, softmax3_lse, N, D, m);
+            q_tilde, k, v, kernel2_inv, step2, b_out, softmax3_lse, N, D, m);
     };
 
     if (D == 64) { launch(Int<64>{}); }

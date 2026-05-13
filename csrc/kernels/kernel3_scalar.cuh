@@ -16,6 +16,7 @@ __global__ void kernel3_scalar_kernel(
     const scalar_t* __restrict__ v,
     const float*    __restrict__ kernel2_inv,
     scalar_t*       __restrict__ step2_out,
+    scalar_t*       __restrict__ b_out,       // (B*H, m, D) or nullptr
     float*          __restrict__ softmax3_lse_out,
     int N, int D, int m
 ) {
@@ -89,6 +90,14 @@ __global__ void kernel3_scalar_kernel(
     }
     __syncthreads();
 
+    // Side output: write B = O_acc to GMEM if requested (saved for the bwd
+    // compute_dk2inv so it does not need to N-walk to recompute B).
+    if (b_out != nullptr) {
+        scalar_t* b_bh = b_out + bh * m * D;
+        for (int idx = tid; idx < m * D; idx += nthreads)
+            b_bh[idx] = from_float<scalar_t>(O_acc[idx]);
+    }
+
     // K2_inv @ O_acc
     const float* k2inv = kernel2_inv + bh * m * m;
     scalar_t* step2 = step2_out + bh * m * D;
@@ -107,7 +116,9 @@ __global__ void kernel3_scalar_kernel(
 template <typename scalar_t>
 void launch_kernel3_scalar(
     const scalar_t* q_tilde, const scalar_t* k, const scalar_t* v,
-    const float* kernel2_inv, scalar_t* step2, float* softmax3_lse,
+    const float* kernel2_inv, scalar_t* step2,
+    scalar_t* b_out,                          // (BH, m, D) or nullptr
+    float* softmax3_lse,
     int BH, int N, int D, int m, cudaStream_t stream
 ) {
     constexpr int Bc = 64;
@@ -120,7 +131,7 @@ void launch_kernel3_scalar(
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
     }
     kernel3_scalar_kernel<scalar_t><<<grid, block, smem, stream>>>(
-        q_tilde, k, v, kernel2_inv, step2, softmax3_lse, N, D, m);
+        q_tilde, k, v, kernel2_inv, step2, b_out, softmax3_lse, N, D, m);
     FN_CUDA_KERNEL_CHECK();
 }
 

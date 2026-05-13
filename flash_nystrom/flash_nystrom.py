@@ -67,10 +67,12 @@ class FlashNystromFunction(torch.autograd.Function):
             q, k, v, num_landmarks, newton_iter, conv_kernel_size, conv_weight
         )
         # results: [output, q_s, k_s, q_tilde, k_tilde, k2inv, step2,
-        #           lse1, lse2, lse3, ns_iterates, k2_softmax]
+        #           lse1, lse2, lse3, ns_iterates, k2_softmax, b_saved]
+        # b_saved = softmax(Q_tilde @ K^T) @ V is reused in the backward so
+        # compute_dk2inv skips an O(m*N*D) recomputation pass.
         output = results[0]
 
-        saved = list(results[1:])  # q_s, k_s, qt, kt, k2inv, step2, lse1, lse2, lse3, ns_iter, k2sm
+        saved = list(results[1:])  # q_s, k_s, qt, kt, k2inv, step2, lse1, lse2, lse3, ns_iter, k2sm, b_saved
         saved.append(v)
         saved.append(output)
         if conv_weight is not None:
@@ -91,9 +93,10 @@ class FlashNystromFunction(torch.autograd.Function):
         lse1, lse2, lse3 = saved[6:9]
         ns_iterates = saved[9]
         k2_softmax = saved[10]
-        v = saved[11]
-        output = saved[12]
-        conv_weight = saved[13] if ctx.has_conv else None
+        b_saved = saved[11]
+        v = saved[12]
+        output = saved[13]
+        conv_weight = saved[14] if ctx.has_conv else None
 
         results = _C.backward(
             grad_output.contiguous(),
@@ -108,6 +111,7 @@ class FlashNystromFunction(torch.autograd.Function):
             lse3,
             ns_iterates,
             k2_softmax,
+            b_saved,
             v,
             output,
             ctx.num_landmarks,

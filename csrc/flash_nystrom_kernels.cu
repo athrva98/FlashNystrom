@@ -38,6 +38,7 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     auto* qt  = static_cast<elem_type*>(p.q_tilde_ptr);
     auto* kt  = static_cast<elem_type*>(p.k_tilde_ptr);
     auto* s2  = static_cast<elem_type*>(p.step2_ptr);
+    auto* b   = static_cast<elem_type*>(p.b_ptr);
     auto* q_m = static_cast<elem_type*>(p.q_ptr);
     auto* k_m = static_cast<elem_type*>(p.k_ptr);
 
@@ -53,7 +54,7 @@ static void run_nystrom_fwd_half(NystromParams &p) {
         p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream);
 
     launch_kernel3_output_fused<elem_type>(qt, k_m, v,
-        p.kernel2_inv_ptr, s2, p.softmax3_lse_ptr,
+        p.kernel2_inv_ptr, s2, b, p.softmax3_lse_ptr,
         p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
 
     // Tensor-core kernel1 (the main performance kernel)
@@ -78,6 +79,7 @@ static void run_nystrom_fwd_fp32_impl(NystromParams &p) {
     auto* qt  = static_cast<T*>(p.q_tilde_ptr);
     auto* kt  = static_cast<T*>(p.k_tilde_ptr);
     auto* s2  = static_cast<T*>(p.step2_ptr);
+    auto* b   = static_cast<T*>(p.b_ptr);
     auto* q_m = static_cast<T*>(p.q_ptr);
     auto* k_m = static_cast<T*>(p.k_ptr);
 
@@ -93,7 +95,7 @@ static void run_nystrom_fwd_fp32_impl(NystromParams &p) {
         p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream);
 
     launch_kernel3_scalar<T>(qt, k_m, v,
-        p.kernel2_inv_ptr, s2, p.softmax3_lse_ptr,
+        p.kernel2_inv_ptr, s2, b, p.softmax3_lse_ptr,
         p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
 
     launch_kernel1_scalar<T>(q_m, kt, s2,
@@ -157,11 +159,13 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
     launch_compute_dO3<elem_type>(p.k2_inv_ptr, p.dstep2_ptr, dO3,
         BH, D, m, p.stream);
 
-    // Single fused N-pass: B = softmax(Q_tilde @ K_s^T) @ V drives both
-    //   dK2_inv[i, j] = sum_d dstep2[i, d] * B[j, d]               (∂L/∂Z_N)
-    //   D3[i]         = sum_d B[i, d] * dO3[i, d]                 (kernel3 row corr.)
-    // Replaces the previous compute_dk2inv + precompute_d3 pair (two N-walks).
-    launch_compute_dk2inv<elem_type>(q_tilde, k_s, v, dO3,
+    // B = softmax(Q_tilde @ K_s^T) @ V is saved from the forward kernel3.
+    // When B is provided, compute_dk2inv collapses to two small m-bounded
+    // matmuls (no N-walk). The launch dispatches to compute_dk2inv_from_b.
+    // If B is null (FP32 input without a saved B, for example), the path
+    // falls back to the prior N-walking compute_dk2inv variants.
+    auto* b_saved = static_cast<const elem_type*>(p.b_ptr);
+    launch_compute_dk2inv<elem_type>(q_tilde, k_s, v, b_saved, dO3,
         p.lse3_ptr, p.dstep2_ptr,
         p.dK2_inv_ptr, p.D3_ptr,
         BH, N, D, m, p.fast_dk2inv, p.stream);

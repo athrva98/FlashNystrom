@@ -33,6 +33,10 @@ struct NystromParams {
     void* __restrict__ k_tilde_ptr;       // (B, H, m, D)
     float* __restrict__ kernel2_inv_ptr;  // (B, H, m, m) FP32
     void* __restrict__ step2_ptr;         // (B, H, m, D)
+    // B = softmax(Q_tilde @ K^T) @ V — saved from forward so the backward can
+    // skip the N-walk in compute_dk2inv. Same dtype as Q/K/V. Nullable: if
+    // null, the forward kernel does not emit B (used by FP32 scalar path).
+    void* __restrict__ b_ptr;             // (B, H, m, D) or nullptr
     float* __restrict__ softmax1_lse_ptr; // (B, H, N)
     float* __restrict__ softmax2_lse_ptr; // (B, H, m)
     float* __restrict__ softmax3_lse_ptr; // (B, H, m)
@@ -72,6 +76,10 @@ struct NystromBwdParams {
     const void* __restrict__ k_tilde_ptr;    // (B,H,m,D)
     const float* __restrict__ k2_inv_ptr;    // (B,H,m,m) FP32
     const void* __restrict__ step2_ptr;      // (B,H,m,D)
+    // B = softmax(Q_tilde @ K^T) @ V saved from the forward, same dtype as
+    // Q/K/V. compute_dk2inv reuses this instead of recomputing the N-walk.
+    // Nullable for the FP32 scalar path which falls back to N-walking.
+    const void* __restrict__ b_ptr;          // (B,H,m,D) or nullptr
     const void* __restrict__ o_ptr;          // (B,H,N,D) forward output
     const float* __restrict__ lse1_ptr;      // (B,H,N)
     const float* __restrict__ lse2_ptr;      // (B,H,m)

@@ -44,6 +44,71 @@ using namespace cute;
 // =============================================================================
 
 // -----------------------------------------------------------------------------
+// B-reuse path: B = softmax(Q_tilde @ K^T) @ V was saved during the forward
+// (see kernel3_output_fused.cuh / kernel3_scalar.cuh). The backward only
+// needs the two small trailing matmuls:
+//
+//   dK2_inv[i, j] = sum_d dstep2[i, d] * B[j, d]            (m x m output)
+//   D3[i]         = sum_d B[i, d] * dO3[i, d]              (m vector)
+//
+// Both run scalar in a single CTA per (batch, head). At m <= 64 and D in {64,
+// 128} the work is m*m*D + m*D = 0.5M ops per BH at the largest config; one
+// CTA at 256 threads finishes this in tens of microseconds. This kernel
+// replaces the prior N-walking compute_dk2inv path for the FP16/BF16 default
+// and saves O(m * N * D) compute per backward.
+// -----------------------------------------------------------------------------
+
+template <typename scalar_t>
+__global__ void compute_dk2inv_from_b_kernel(
+    const scalar_t* __restrict__ b,        // (BH, m, D) saved from fwd
+    const scalar_t* __restrict__ dO3,      // (BH, m, D)
+    const float*    __restrict__ dstep2,   // (BH, m, D)
+    float*          __restrict__ dK2_inv,  // (BH, m, m) output
+    float*          __restrict__ D3,       // (BH, m) output
+    int D, int m
+) {
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const scalar_t* b_bh   = b      + bh * m * D;
+    const scalar_t* dO3_bh = dO3    + bh * m * D;
+    const float*    ds2_bh = dstep2 + bh * m * D;
+    float* dki_bh = dK2_inv + bh * m * m;
+    float* d3_bh  = D3      + bh * m;
+
+    // dK2_inv[i, j] = sum_d dstep2[i, d] * B[j, d]
+    for (int idx = tid; idx < m * m; idx += nthreads) {
+        int i = idx / m, j = idx % m;
+        float acc = 0.0f;
+        for (int d = 0; d < D; d++)
+            acc += ds2_bh[i * D + d] * to_float(b_bh[j * D + d]);
+        dki_bh[idx] = acc;
+    }
+
+    // D3[i] = sum_d B[i, d] * dO3[i, d]
+    for (int i = tid; i < m; i += nthreads) {
+        float acc = 0.0f;
+        for (int d = 0; d < D; d++)
+            acc += to_float(b_bh[i * D + d]) * to_float(dO3_bh[i * D + d]);
+        d3_bh[i] = acc;
+    }
+}
+
+template <typename scalar_t>
+static void launch_compute_dk2inv_from_b(
+    const scalar_t* b, const scalar_t* dO3, const float* dstep2,
+    float* dK2_inv, float* D3,
+    int BH, int D, int m, cudaStream_t stream
+) {
+    dim3 grid(BH);
+    dim3 block(256);
+    compute_dk2inv_from_b_kernel<scalar_t><<<grid, block, 0, stream>>>(
+        b, dO3, dstep2, dK2_inv, D3, D, m);
+    FN_CUDA_KERNEL_CHECK();
+}
+
+// -----------------------------------------------------------------------------
 // FP32 scalar fallback. Same algorithm, scalar inner loops.
 // -----------------------------------------------------------------------------
 
@@ -403,37 +468,40 @@ static void launch_compute_dk2inv_scalar(
     FN_CUDA_KERNEL_CHECK();
 }
 
-// dispatch: TC for FP16/BF16 when fast_dk2inv is set, otherwise scalar FP32.
+// Dispatch:
+//   1. If `b` is non-null, use the B-reuse path. B was emitted by the forward
+//      kernel3 (FP16/BF16 or FP32 scalar). compute_dk2inv collapses to two
+//      tiny m-bounded matmuls and the N-walk is eliminated entirely. This is
+//      the default path on all dtypes when the forward saved B.
+//   2. Otherwise fall back to the prior N-walking path. The `fast_dk2inv`
+//      flag still toggles between TC and scalar for that fallback; kept for
+//      compatibility and for the FP32-input case where no saved B exists.
 //
-// fast_dk2inv = true   → tensor-core path. Faster (~6x at large N) but P
-//                        (softmax output) is converted FP32 → Element before
-//                        GEMM2, trimming P to a 10-bit mantissa. May cost
-//                        sub-1 pt accuracy relative to scalar at single-seed
-//                        evaluation.
-// fast_dk2inv = false  → FP32 scalar fallback. Bit-for-bit consistent with
-//                        the autograd reference (modulo FP32 noise). Default.
-//
-// FP32 input dtype always uses scalar (TC atom requires 16-bit operands).
+// FP32 input dtype falls into the scalar fallback for the N-walking variant
+// (TC atom requires 16-bit operands).
 template <typename scalar_t>
 void launch_compute_dk2inv(
     const scalar_t* q_tilde, const scalar_t* k_s, const scalar_t* v,
+    const scalar_t* b,                  // (BH, m, D) saved from forward, or nullptr
     const scalar_t* dO3,
     const float* lse3, const float* dstep2,
     float* dK2_inv, float* D3,
     int BH, int N, int D, int m, bool fast_dk2inv, cudaStream_t stream
 ) {
+    if (b != nullptr) {
+        launch_compute_dk2inv_from_b<scalar_t>(
+            b, dO3, dstep2, dK2_inv, D3, BH, D, m, stream);
+        return;
+    }
     if constexpr (std::is_same_v<scalar_t, float>) {
-        // FP32: scalar only (no 16-bit operand TC atom).
         launch_compute_dk2inv_scalar<scalar_t>(
             q_tilde, k_s, v, dO3, lse3, dstep2, dK2_inv, D3,
             BH, N, D, m, stream);
     } else if (!fast_dk2inv) {
-        // Default high-precision path for FP16/BF16 too.
         launch_compute_dk2inv_scalar<scalar_t>(
             q_tilde, k_s, v, dO3, lse3, dstep2, dK2_inv, D3,
             BH, N, D, m, stream);
     } else {
-        // Opt-in TC path: FP16/BF16 only.
         FN_CHECK(D == 64 || D == 128, "compute_dk2inv_tc: D must be 64 or 128");
         auto launch = [&](auto HeadDimTag) {
             constexpr int kHeadDim = decltype(HeadDimTag)::value;
