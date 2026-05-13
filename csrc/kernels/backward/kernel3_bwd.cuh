@@ -190,7 +190,12 @@ kernel3_bwd_tc(
     const typename Traits::Element* __restrict__ dO3_ptr,      // (BH, m, D) precomputed FP16
     typename Traits::Element*       __restrict__ dV_ptr,       // (BH, N, D) output
     typename Traits::Element*       __restrict__ dK_s_ptr,     // (BH, N, D) output
-    float*                          __restrict__ dQ_tilde_ptr, // (BH, m, D) FP32 accumulator
+    // Split-K target for dQ_tilde. Shape (num_splits, BH, m, D) FP32, zero
+    // initialized; each tile atomicAdds into slot (tile_idx % num_splits).
+    // When num_splits == 0 the kernel writes straight to dQ_tilde_split_ptr
+    // treated as the legacy (BH, m, D) buffer (single shared accumulator).
+    float*                          __restrict__ dQ_tilde_split_ptr,
+    int num_splits,
     int N, int D, int m
 ) {
     using Element = typename Traits::Element;
@@ -482,7 +487,17 @@ kernel3_bwd_tc(
                   thr_copy_A.partition_S(sPdS), thr_copy_Bt.partition_S(sKVt),
                   tiled_mma, smem_copy_A, smem_copy_Bt, thr_copy_A, thr_copy_Bt);
 
-        float* dqt = dQ_tilde_ptr + bh * m * D;
+        // Split-K: write into slot (tile_idx % num_splits) so adjacent tiles
+        // do not contend on the same FP32 cells in L2. With num_splits >=
+        // num_tiles each slot has exactly one contributor (zero atomicAdd
+        // contention); otherwise contention is num_tiles / num_splits, much
+        // less than the prior num_tiles per cell.
+        const int split_idx = (num_splits > 0) ? (tile_idx % num_splits) : 0;
+        const long long bh_slot_stride = static_cast<long long>(m) * D;
+        const long long split_slot_stride = static_cast<long long>(gridDim.y) * bh_slot_stride;
+        float* dqt = dQ_tilde_split_ptr
+                   + static_cast<long long>(split_idx) * split_slot_stride
+                   + static_cast<long long>(bh) * bh_slot_stride;
         #pragma unroll
         for (int fi = 0; fi < size(acc_dqt); fi++) {
             int row = get<0>(tDQtc(fi));
@@ -515,6 +530,47 @@ kernel3_bwd_tc(
     }
 }
 
+// Reduce dQ_tilde_split (num_splits, BH, m, D) along the split axis into
+// dQ_tilde (BH, m, D). One thread per (bh, row*D+col); each thread sums
+// num_splits scattered reads, one per split slot.
+//
+// Templated on a dummy parameter to give the global function weak linkage
+// so the header can be included from multiple translation units without
+// LNK2005 multiply-defined errors.
+template <int kBlock = 128>
+__global__ void reduce_dQ_tilde_split_kernel(
+    const float* __restrict__ dQ_tilde_split,
+    float* __restrict__ dQ_tilde,
+    int num_splits, int BH, int mD
+) {
+    int bh = blockIdx.y;
+    int idx = blockIdx.x * kBlock + threadIdx.x;
+    if (idx >= mD) return;
+    const long long bh_stride    = static_cast<long long>(mD);
+    const long long split_stride = static_cast<long long>(BH) * bh_stride;
+    float acc = 0.0f;
+    #pragma unroll 8
+    for (int s = 0; s < num_splits; s++) {
+        acc += dQ_tilde_split[
+            static_cast<long long>(s) * split_stride
+            + static_cast<long long>(bh) * bh_stride
+            + idx];
+    }
+    dQ_tilde[bh * bh_stride + idx] = acc;
+}
+
+inline void launch_reduce_dQ_tilde_split(
+    const float* dQ_tilde_split, float* dQ_tilde,
+    int num_splits, int BH, int m, int D, cudaStream_t stream
+) {
+    int mD = m * D;
+    constexpr int BLOCK = 128;
+    dim3 grid((mD + BLOCK - 1) / BLOCK, BH);
+    reduce_dQ_tilde_split_kernel<BLOCK><<<grid, BLOCK, 0, stream>>>(
+        dQ_tilde_split, dQ_tilde, num_splits, BH, mD);
+    FN_CUDA_KERNEL_CHECK();
+}
+
 
 template <typename scalar_t>
 void launch_kernel3_bwd(
@@ -524,6 +580,11 @@ void launch_kernel3_bwd(
     const float* dstep2,
     scalar_t* dV, scalar_t* dK_s, float* dQ_tilde, float* dK2_inv,
     const scalar_t* dO3,                // precomputed dO3 in scalar_t (always supplied)
+    // dQ_tilde split-K workspace: (num_splits, BH, m, D) FP32, zero-init by
+    // caller. The kernel writes each tile's dQ_tilde contribution to slot
+    // (tile_idx % num_splits), then the reduction below sums into dQ_tilde.
+    // If null or num_splits == 0, dQ_tilde is used directly (legacy).
+    float* dQ_tilde_split, int num_splits,
     int BH, int N, int D, int m, cudaStream_t stream
 ) {
     if constexpr (std::is_same_v<scalar_t, float>) {
@@ -546,6 +607,9 @@ void launch_kernel3_bwd(
         // FP16/BF16: tensor core, multi-CTA
         FN_CHECK(D == 64 || D == 128, "kernel3_bwd: D must be 64 or 128");
         FN_CHECK(dO3 != nullptr, "kernel3_bwd TC requires precomputed dO3");
+        const bool use_split_k = (dQ_tilde_split != nullptr && num_splits > 0);
+        float* dqt_target = use_split_k ? dQ_tilde_split : dQ_tilde;
+        int    eff_num_splits = use_split_k ? num_splits : 0;
         auto launch = [&](auto HeadDimTag) {
             constexpr int kHeadDim = decltype(HeadDimTag)::value;
             using Traits = K3Traits<kHeadDim, scalar_t>;
@@ -560,9 +624,16 @@ void launch_kernel3_bwd(
                     cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
             }
             kernel3_bwd_tc<Traits><<<grid, block, smem, stream>>>(
-                q_tilde, k_s, v, lse3, D3, dO3, dV, dK_s, dQ_tilde, N, D, m);
+                q_tilde, k_s, v, lse3, D3, dO3, dV, dK_s,
+                dqt_target, eff_num_splits, N, D, m);
         };
         if (D == 64) launch(Int<64>{}); else launch(Int<128>{});
+        FN_CUDA_KERNEL_CHECK();
+
+        if (use_split_k) {
+            launch_reduce_dQ_tilde_split(
+                dQ_tilde_split, dQ_tilde, num_splits, BH, m, D, stream);
+        }
     }
     FN_CUDA_KERNEL_CHECK();
 }

@@ -191,6 +191,12 @@ std::vector<torch::Tensor> nystrom_bwd(
     auto dK2_inv   = torch::zeros({B, H, m, m}, opts_f32);
     auto D1        = torch::empty({B, H, N}, opts_f32);
     auto D3        = torch::empty({B, H, m}, opts_f32);
+    // Split-K workspace for dQ_tilde (kernel3_bwd_tc). num_splits is capped
+    // at 64; at the worst-case N=16384 BH=8 m=64 D=128 this is 16 MB. We
+    // zero-init since the kernel atomicAdds into split slots (multiple
+    // tiles per slot when num_tiles > num_splits).
+    constexpr int kNumSplits = 64;
+    auto dQ_tilde_split = torch::zeros({kNumSplits, B, H, m, D}, opts_f32);
 
     // Workspaces for the unrolled NS backward.
     auto ns_dZ_ws  = torch::empty({B, H, m, m}, opts_f32);
@@ -249,6 +255,8 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.dQ_tilde_ptr = dQ_tilde.data_ptr<float>();
     params.dK_tilde_ptr = dK_tilde.data_ptr<float>();
     params.dK2_inv_ptr = dK2_inv.data_ptr<float>();
+    params.dQ_tilde_split_ptr = dQ_tilde_split.data_ptr<float>();
+    params.num_splits = kNumSplits;
     params.D1_ptr = D1.data_ptr<float>();
     params.D3_ptr = D3.data_ptr<float>();
     params.dO3_ptr = dO3.data_ptr();

@@ -104,6 +104,15 @@ struct NystromBwdParams {
     float* __restrict__ dK2_inv_ptr;         // (B,H,m,m) FP32
     float* __restrict__ D1_ptr;              // (B,H,N) FP32 precomputed dot(dO,O)
     float* __restrict__ D3_ptr;              // (B,H,m) FP32 precomputed sum_n A3[i,n]*dP3[i,n]
+    // Split-K workspace for the dQ_tilde accumulator in kernel3_bwd_tc.
+    // Shape (num_splits, B, H, m, D) FP32, zero-initialized. The bwd kernel
+    // writes each tile's dQ_tilde contribution to its own split slot
+    // (tile_idx % num_splits) instead of all tiles atomicAdding to the same
+    // m*D cells; a small reduction kernel then sums across the split axis
+    // into dQ_tilde_ptr. num_splits = 0 disables split-K (legacy atomicAdd
+    // straight to dQ_tilde_ptr).
+    float* __restrict__ dQ_tilde_split_ptr;  // (num_splits, B, H, m, D) FP32 or nullptr
+    int num_splits;
 
     // Intermediate for TC kernel3_bwd: dO3 = K2_inv^T @ dstep2, stored as elem_type
     void* __restrict__ dO3_ptr;              // (B,H,m,D) FP16/BF16, or nullptr for FP32

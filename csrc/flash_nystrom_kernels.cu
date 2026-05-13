@@ -173,6 +173,7 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
     launch_kernel3_bwd<elem_type>(q_tilde, k_s, v, p.k2_inv_ptr, p.lse3_ptr,
         p.D3_ptr, p.dstep2_ptr, dV, dK, p.dQ_tilde_ptr, p.dK2_inv_ptr,
         static_cast<const elem_type*>(dO3),
+        p.dQ_tilde_split_ptr, p.num_splits,
         BH, N, D, m, p.stream);
 
     launch_kernel2_inv_bwd<elem_type>(q_tilde, k_tilde, p.lse2_ptr,
