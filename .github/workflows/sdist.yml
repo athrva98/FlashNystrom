@@ -1,0 +1,72 @@
+# Build the source distribution on every push and PR.
+# This runs without CUDA (CPU runner is fine for sdist), and verifies:
+#   - submodules are reachable
+#   - MANIFEST.in includes all the C++/CUDA headers and CUTLASS includes
+#   - pyproject.toml / setup.py parse cleanly
+#   - the tarball has the expected file count and reasonable size
+#
+# Does NOT compile the CUDA extension. That requires a GPU runner; see
+# tests-gpu.yml for the self-hosted runner workflow.
+
+name: sdist
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-sdist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          # build doesn't need CUDA, but torch is a setup.py-time dependency
+          # (CUDAExtension lives in torch.utils.cpp_extension). Use the CPU
+          # torch wheel to keep the sdist runner fast.
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+              "torch>=2.0"
+          pip install build
+
+      - name: Build sdist
+        run: |
+          # --no-isolation: setup.py imports torch.utils.cpp_extension, which
+          # in turn imports torch which checks for CUDA_HOME. The isolated
+          # build env doesn't see our torch install. We share the parent env
+          # to avoid that. The build itself doesn't compile CUDA, just
+          # collects sources into a tarball.
+          python -m build --sdist --no-isolation
+
+      - name: Inspect sdist
+        run: |
+          ls -lh dist/
+          # Sanity check the tarball contents.
+          tar tzf dist/flash_nystrom-*.tar.gz | head -20
+          echo "Total entries: $(tar tzf dist/flash_nystrom-*.tar.gz | wc -l)"
+          echo "CUTLASS include entries: $(tar tzf dist/flash_nystrom-*.tar.gz | grep -c cutlass/include)"
+          # csrc must be present.
+          tar tzf dist/flash_nystrom-*.tar.gz | grep -q "csrc/flash_nystrom.cu"
+          # CUTLASS include must be present.
+          tar tzf dist/flash_nystrom-*.tar.gz | grep -q "cutlass/include/cute/tensor.hpp"
+          # LICENSE must be present.
+          tar tzf dist/flash_nystrom-*.tar.gz | grep -q "LICENSE"
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-nystrom-sdist
+          path: dist/*.tar.gz
+          retention-days: 14

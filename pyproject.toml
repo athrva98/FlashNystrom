@@ -5,18 +5,54 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "flash-nystrom"
 version = "0.1.0"
-description = "FlashAttention-style CUDA kernels for NystromFormer approximate attention"
+description = "FlashAttention-style CUDA kernels for Nystromformer approximate attention"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
+authors = [
+    {name = "Athrva Pandhare", email = "athrva98@gmail.com"},
+]
+keywords = [
+    "cuda",
+    "attention",
+    "nystromformer",
+    "pytorch",
+    "tensor-cores",
+    "flash-attention",
+    "transformer",
+    "linear-attention",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
 dependencies = [
     "torch>=2.0",
 ]
 
+[project.urls]
+Homepage   = "https://github.com/athrva98/FlashNystrom"
+Repository = "https://github.com/athrva98/FlashNystrom"
+Issues     = "https://github.com/athrva98/FlashNystrom/issues"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    "flash-attn>=2.0",
+]
+bench = [
+    "matplotlib",
 ]
 
 [tool.setuptools.packages.find]

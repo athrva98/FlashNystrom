@@ -20,7 +20,6 @@ Makefile
 *.nsys-rep
 *.ncu-rep
 data/
-third_party/cutlass/
 # Technical reference is kept locally, not in the public repo
 docs/
 .claude/
