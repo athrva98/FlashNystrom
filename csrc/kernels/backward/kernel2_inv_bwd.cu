@@ -373,6 +373,176 @@ __global__ void ns_bwd_final_kernel(
 }
 
 // =========================================================================
+// cuBLAS-friendly variant of ns_bwd_final: does everything except the two
+// trailing matmuls. Persists dK2 to GMEM and writes dS2 in scalar_t to a
+// GMEM workspace; the caller then runs cublasGemmEx for
+//   dQ_tilde += dS2 @ k_tilde
+//   dK_tilde += dS2^T @ q_tilde
+// with elem_type A and B and FP32 C, dispatching to TC for FP16/BF16.
+// =========================================================================
+
+template <typename scalar_t>
+__global__ void ns_bwd_final_pre_kernel(
+    const float*    __restrict__ K2_in,    // (BH, m, m)
+    const float*    __restrict__ dZ0_in,   // (BH, m, m)
+    float*          __restrict__ dK2_acc,  // (BH, m, m) FP32, updated in place
+    scalar_t*       __restrict__ dS2_out,  // (BH, m, m) elem_type, written
+    int m
+) {
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int mm = m * m;
+
+    extern __shared__ float smem[];
+    float* sK2     = smem;
+    float* sdK2    = smem + mm;
+    float* sdS2    = smem + 2 * mm;
+    float* scratch = smem + 3 * mm;
+
+    const float* K2_bh  = K2_in + bh * mm;
+    const float* dZ0_bh = dZ0_in + bh * mm;
+    float* dK2_bh = dK2_acc + bh * mm;
+
+    for (int idx = tid; idx < mm; idx += nthreads) sK2[idx]  = K2_bh[idx];
+    for (int idx = tid; idx < mm; idx += nthreads) sdK2[idx] = dK2_bh[idx];
+    __syncthreads();
+
+    // Column and row sums of K2.
+    float* col_sums = sdS2;
+    float* row_sums = sdS2 + m;
+    for (int j = tid; j < m; j += nthreads) {
+        float s = 0.0f;
+        for (int i = 0; i < m; i++) s += sK2[i * m + j];
+        col_sums[j] = s;
+    }
+    for (int i = tid; i < m; i += nthreads) {
+        float s = 0.0f;
+        for (int j = 0; j < m; j++) s += sK2[i * m + j];
+        row_sums[i] = s;
+    }
+    __syncthreads();
+
+    __shared__ float s_norm1;
+    __shared__ float s_norm_inf;
+    __shared__ int   s_jc1;
+    __shared__ int   s_ir_inf;
+    if (tid == 0) {
+        float maxv = -FLT_MAX; int maxi = 0;
+        for (int j = 0; j < m; j++) {
+            if (col_sums[j] > maxv) { maxv = col_sums[j]; maxi = j; }
+        }
+        s_norm1 = maxv;
+        s_jc1   = maxi;
+        maxv = -FLT_MAX; maxi = 0;
+        for (int i = 0; i < m; i++) {
+            if (row_sums[i] > maxv) { maxv = row_sums[i]; maxi = i; }
+        }
+        s_norm_inf = maxv;
+        s_ir_inf   = maxi;
+    }
+    __syncthreads();
+
+    const float norm1    = s_norm1;
+    const float norm_inf = s_norm_inf;
+    const int   jc1      = s_jc1;
+    const int   ir_inf   = s_ir_inf;
+    const float c_val    = fmaxf(norm1 * norm_inf, 1e-12f);
+    const float inv_c    = 1.0f / c_val;
+    const float inv_c2   = inv_c * inv_c;
+
+    // S = trace(dZ_0 @ K2)
+    float local_S = 0.0f;
+    for (int idx = tid; idx < mm; idx += nthreads) {
+        int a = idx / m, b = idx % m;
+        local_S += dZ0_bh[a * m + b] * sK2[b * m + a];
+    }
+    float S = block_reduce_sum(local_S, scratch);
+    __syncthreads();
+
+    // dK2 += dZ_0^T / c (direct)
+    for (int idx = tid; idx < mm; idx += nthreads) {
+        int r = idx / m, c = idx % m;
+        sdK2[idx] += dZ0_bh[c * m + r] * inv_c;
+    }
+
+    // dK2[*, jc1] += -S * norm_inf / c^2
+    {
+        float col_term = -S * norm_inf * inv_c2;
+        for (int r = tid; r < m; r += nthreads) {
+            sdK2[r * m + jc1] += col_term;
+        }
+    }
+
+    // dK2[ir_inf, *] += -S * norm_1 / c^2
+    {
+        float row_term = -S * norm1 * inv_c2;
+        for (int j = tid; j < m; j += nthreads) {
+            sdK2[ir_inf * m + j] += row_term;
+        }
+    }
+    __syncthreads();
+
+    // dS2 = K2 * (dK2 - rowsum(dK2 * K2))
+    for (int i = tid; i < m; i += nthreads) {
+        float D_i = 0.0f;
+        for (int j = 0; j < m; j++) D_i += sdK2[i * m + j] * sK2[i * m + j];
+        for (int j = 0; j < m; j++) {
+            sdS2[i * m + j] = sK2[i * m + j] * (sdK2[i * m + j] - D_i);
+        }
+    }
+    __syncthreads();
+
+    // Persist dK2 to GMEM and write dS2 (cast to scalar_t) to GMEM.
+    for (int idx = tid; idx < mm; idx += nthreads) dK2_bh[idx] = sdK2[idx];
+    scalar_t* dS2_bh = dS2_out + bh * mm;
+    for (int idx = tid; idx < mm; idx += nthreads) {
+        dS2_bh[idx] = from_float<scalar_t>(sdS2[idx]);
+    }
+}
+
+// Row-major batched GemmEx wrapper. Supports FP16/BF16/FP32 A, B with FP32
+// C. cuBLAS dispatches to tensor cores for FP16/BF16. Same row-major <-> col
+// -major transposition trick as rm_sgemm_strided_batched in cublas_helpers.cuh.
+template <typename scalar_t>
+inline void rm_gemm_ex_strided_batched(
+    cublasHandle_t handle,
+    char opA, char opB,
+    int M_rm, int N_rm, int K_rm,
+    float alpha,
+    const void* A, long long strideA,
+    const void* B, long long strideB,
+    float beta,
+    float* C, long long strideC,
+    int batch
+) {
+    cublasOperation_t cb_opA = (opB == 'T' || opB == 't') ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t cb_opB = (opA == 'T' || opA == 't') ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int lda_rm = (opA == 'N' || opA == 'n') ? K_rm : M_rm;
+    int ldb_rm = (opB == 'N' || opB == 'n') ? N_rm : K_rm;
+    int ldc_rm = N_rm;
+    cudaDataType_t ab_type;
+    if constexpr (std::is_same_v<scalar_t, float>)                 ab_type = CUDA_R_32F;
+    else if constexpr (std::is_same_v<scalar_t, cutlass::half_t>)  ab_type = CUDA_R_16F;
+    else                                                            ab_type = CUDA_R_16BF;
+    auto status = cublasGemmStridedBatchedEx(handle,
+        cb_opA, cb_opB,
+        N_rm, M_rm, K_rm,
+        &alpha,
+        B, ab_type, ldb_rm, strideB,
+        A, ab_type, lda_rm, strideA,
+        &beta,
+        C, CUDA_R_32F, ldc_rm, strideC,
+        batch,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("[cublas] GemmEx strided batched failed: %d\n", (int)status);
+        abort();
+    }
+}
+
+// =========================================================================
 // Production launch wrapper (called from run_nystrom_bwd_impl).
 // =========================================================================
 
@@ -412,6 +582,7 @@ struct NsBwdGraphState {
     at::Tensor dQ_tilde_buf; // (BH, m, D) FP32          — accumulator (copied in/out)
     at::Tensor dK_tilde_buf; // (BH, m, D) FP32          — accumulator (copied in/out)
     at::Tensor scratch_buf;  // (11, BH, m, m) FP32       — NS step intermediates
+    at::Tensor dS2_buf;      // (BH, m, m) elem_type      — ns_bwd_final pre-kernel output
 
     bool matches(int m_, int BH_, int n_, int D_) const {
         return m == m_ && BH == BH_ && niter == n_ && D == D_;
@@ -437,6 +608,7 @@ struct NsBwdGraphState {
         dQ_tilde_buf = at::empty({BH, m, D},          opts_f32);
         dK_tilde_buf = at::empty({BH, m, D},          opts_f32);
         scratch_buf  = at::empty({11, BH, m, m},      opts_f32);
+        dS2_buf      = at::empty({BH, m, m},          opts_elem);
     }
 
     ~NsBwdGraphState() {
@@ -555,21 +727,33 @@ static void record_ns_bwd_on_workspace(
         launch_add_scaled_inplace(dZ, ws_dZ_out, 1.0f, BH, m, stream);
     }
 
-    // Final NS bwd step. cudaFuncSetAttribute is host-only and not
-    // captured; it sets a function attribute that persists across replays.
+    // Final NS bwd: split into a pre-kernel (norms, dK2 init grad, dS2
+    // computation, persists dK2 to GMEM and writes dS2 in elem_type) plus
+    // two cuBLAS GemmEx calls for the trailing m x m x D matmuls. cuBLAS
+    // dispatches to tensor cores for FP16/BF16.
     {
+        scalar_t* dS2 = reinterpret_cast<scalar_t*>(s.dS2_buf.data_ptr());
         size_t smem = (3 * mm + 8) * sizeof(float);
         dim3 grid(BH);
         dim3 block(256);
         if (smem > 48 * 1024) {
             FN_CHECK(smem <= get_max_smem_per_block(),
-                     "ns_bwd_final: insufficient SMEM");
-            FN_CUDA_CHECK(cudaFuncSetAttribute(ns_bwd_final_kernel<scalar_t>,
+                     "ns_bwd_final_pre: insufficient SMEM");
+            FN_CUDA_CHECK(cudaFuncSetAttribute(ns_bwd_final_pre_kernel<scalar_t>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
         }
-        ns_bwd_final_kernel<scalar_t><<<grid, block, smem, stream>>>(
-            q_tilde, k_tilde, K2, dZ, dK2,
-            dQ_tilde, dK_tilde, D, m);
+        ns_bwd_final_pre_kernel<scalar_t><<<grid, block, smem, stream>>>(
+            K2, dZ, dK2, dS2, m);
+
+        // dQ_tilde += dS2 @ k_tilde   (alpha=1, beta=1; row-major)
+        rm_gemm_ex_strided_batched<scalar_t>(handle, 'N', 'N', m, D, m,
+            1.0f, dS2, mm, k_tilde, (long long)m * D,
+            1.0f, dQ_tilde, (long long)m * D, BH);
+
+        // dK_tilde += dS2^T @ q_tilde (alpha=1, beta=1; row-major)
+        rm_gemm_ex_strided_batched<scalar_t>(handle, 'T', 'N', m, D, m,
+            1.0f, dS2, mm, q_tilde, (long long)m * D,
+            1.0f, dK_tilde, (long long)m * D, BH);
     }
 }
 
