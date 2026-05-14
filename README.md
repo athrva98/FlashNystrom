@@ -76,15 +76,15 @@ Forward and backward latency in milliseconds on an RTX 5060 Laptop, FP16, B=1, H
 
 | N    | FN fwd | FN bwd | SDPA fwd | SDPA bwd |
 |-----:|-------:|-------:|---------:|---------:|
-|  128 |   0.15 |   0.84 |     0.04 |     0.49 |
-|  256 |   0.15 |   0.58 |     0.03 |     0.25 |
-|  512 |   0.16 |   0.60 |     0.04 |     0.19 |
-| 1024 |   0.18 |   0.64 |     0.10 |     0.31 |
-| 2048 |   0.21 |   0.66 |     0.29 |     0.95 |
-| 4096 |   0.29 |   0.77 |     1.06 |     3.50 |
-| 8192 |   0.43 |   1.08 |     4.12 |    13.89 |
+|  128 |   0.15 |   0.84 |     0.03 |     0.23 |
+|  256 |   0.15 |   0.51 |     0.03 |     0.24 |
+|  512 |   0.16 |   0.50 |     0.04 |     0.20 |
+| 1024 |   0.18 |   0.48 |     0.10 |     0.31 |
+| 2048 |   0.21 |   0.50 |     0.29 |     0.95 |
+| 4096 |   0.29 |   0.57 |     1.07 |     3.51 |
+| 8192 |   0.43 |   0.82 |     4.16 |    13.69 |
 
-The forward pass is faster than SDPA at every N. The backward crosses over near N=2048. At N=8192 the total fwd+bwd is roughly 12x faster than SDPA.
+The forward pass is faster than SDPA at every N. The backward crosses over near N=2048. At N=8192 the total fwd+bwd is roughly 14x faster than SDPA.
 
 Reproduce with `python benchmarks/bench_fwd_bwd.py`.
 
