@@ -72,7 +72,7 @@ out = flash_nystrom_attention(q, k, v, num_landmarks=64, newton_iter=6)
 
 ## Latency
 
-Forward and backward latency in milliseconds on an RTX 5060 Laptop, FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6. Median of 50 runs after 10 warmup iterations.
+Forward and backward latency in milliseconds on an RTX 5060 Laptop, FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6. Median of 30 runs after 5 warmup iterations.
 
 | N    | FN fwd | FN bwd | SDPA fwd | SDPA bwd |
 |-----:|-------:|-------:|---------:|---------:|
@@ -88,13 +88,29 @@ The forward pass is faster than SDPA at every N. The backward crosses over near 
 
 Reproduce with `python benchmarks/bench_fwd_bwd.py`.
 
+### vs the PyTorch Nystrom reference
+
+Same Nystrom algorithm implemented in pure PyTorch dispatches every matmul through cuBLAS via the `@` operator and uses torch's fused softmax. Total fwd+bwd latency, FP16, niter=6, median of 30 runs:
+
+| Config                          | FN      | Ref     | FN/Ref |
+|---------------------------------|--------:|--------:|-------:|
+| B=1 H=4 N= 4096 D= 64 m=32      |   0.98  |  4.48   | 4.60x  |
+| B=1 H=8 N= 4096 D=128 m=64      |   2.96  |  4.26   | 1.44x  |
+| B=4 H=8 N= 4096 D= 64 m=32      |   3.20  |  5.66   | 1.77x  |
+| B=1 H=4 N= 8192 D= 64 m=32      |   1.40  |  3.94   | 2.81x  |
+| B=1 H=8 N= 8192 D=128 m=64      |   4.34  |  5.84   | 1.34x  |
+| B=4 H=8 N= 8192 D= 64 m=32      |   6.26  |  7.84   | 1.25x  |
+| B=1 H=4 N=16384 D= 64 m=32      |   2.31  |  4.61   | 1.99x  |
+| B=1 H=8 N=16384 D=128 m=64      |   8.61  |  9.00   | 1.05x  |
+| B=1 H=8 N=24576 D=128 m=64      |  10.86  | 11.69   | 1.08x  |
+
+FN beats the reference at every configuration tested, from N=4K to N=24K across batch-head counts of 4 to 32.
+
 ## The fast_dk2inv flag
 
-`compute_dk2inv` is the kernel that produces the gradient of the loss with respect to the pseudoinverse iterate Z_N. By default (`fast_dk2inv=True`) it runs through a tensor-core path that is 4-6x faster than the FP32 scalar fallback on the full backward (it dominates bwd time when the scalar path is used). The TC path converts the softmax output P from FP32 to FP16/BF16 before the second GEMM, trimming P to a 10-bit mantissa. On 20-epoch CIFAR-10 ViT this falls within FP16 single-seed variance and accuracy is preserved within the noise floor. The accumulator stays in FP32 so the loss-of-precision is bounded to one quantization step per P element.
+`compute_dk2inv` is the kernel that produces the gradient of the loss with respect to the pseudoinverse iterate Z_N. In normal use the backward picks up B = softmax(Q_tilde @ K^T) @ V from a small tensor the forward saved, then runs two tiny matmuls. The N-walk that used to dominate the backward (the previous default, `fast_dk2inv=False`, was 4-6x slower than the rest of the bwd combined) is gone.
 
-Set `fast_dk2inv=False` to use the FP32 scalar fallback. The fallback is bit-for-bit consistent with PyTorch autograd modulo FP32 reduction order. Use this when accuracy comparisons need the last fraction of a percentage point.
-
-The flag does nothing on FP32 input dtype. The tensor-core kernels require 16-bit operands, so FP32 inputs always go through the scalar fallback.
+The `fast_dk2inv` flag controls behavior only in the legacy fallback branch that fires when the saved B is unavailable (the debug pybind hook is the only path that hits it). Default is True. The flag is kept for backward compatibility; you can ignore it.
 
 ## PyTorch compatibility
 
@@ -134,7 +150,7 @@ for x, y in loader:
 | `newton_iter`      |       6 | NS iterations for the pseudoinverse. Backward correctness is independent of convergence. |
 | `conv_kernel_size` |       3 | Depthwise conv1d residual on V. Set to 0 to disable. |
 | `use_conv_residual`|    True | Master switch for the conv residual. |
-| `fast_dk2inv`      |    True | Tensor-core path for `compute_dk2inv` in the backward (4-6x faster). FP16/BF16 only; FP32 always uses the scalar fallback. Set False to opt into bit-for-bit-with-autograd FP32 scalar. |
+| `fast_dk2inv`      |    True | Legacy flag, normally ignored. The backward reuses `B` from the forward and skips the N-walk entirely. The flag now only matters in the debug pybind hook fallback. |
 
 ## Limitations
 
