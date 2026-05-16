@@ -165,13 +165,77 @@ std::vector<torch::Tensor> nystrom_bwd(
     c10::optional<torch::Tensor> conv_weight,
     bool fast_dk2inv
 ) {
+    // ------------------------------------------------------------------
+    // Input validation. Backward gets called from autograd with saved
+    // tensors that the forward produced; in normal use these are well
+    // shaped. But this entry point is also reachable directly through
+    // the pybind binding, and any drift between forward/backward
+    // signatures or any user error would otherwise produce a kernel
+    // crash with a CUDA error code rather than a clear Python message.
+    // The checks below are O(1) (no tensor reads), so they cost nothing
+    // on the hot path.
+    // ------------------------------------------------------------------
+    CHECK_DEVICE(dO); CHECK_CONTIGUOUS(dO);
+    TORCH_CHECK(dO.dim() == 4, "dO must be 4D (B, H, N, D), got ", dO.dim(), "D");
+
     const auto dtype = dO.scalar_type();
     const int64_t B = dO.size(0), H = dO.size(1), N = dO.size(2), D = dO.size(3);
     const int64_t m = num_landmarks;
 
+    TORCH_CHECK(dtype == at::ScalarType::Float ||
+                dtype == at::ScalarType::Half ||
+                dtype == at::ScalarType::BFloat16,
+                "dO dtype must be float32, float16, or bfloat16; got ", dtype);
     TORCH_CHECK(!(dtype == at::ScalarType::Float && D == 128),
                 "FP32 backward with D=128 is not supported (scalar kernel SMEM overflow). "
                 "Use FP16 or BF16 for D=128.");
+    TORCH_CHECK(D == 64 || D == 128,
+                "head_dim must be 64 or 128, got ", D);
+    TORCH_CHECK(m > 0 && m <= 64,
+                "num_landmarks must be in [1, 64], got ", m);
+    TORCH_CHECK(N >= m,
+                "seq_len (", N, ") must be >= num_landmarks (", m, ")");
+    TORCH_CHECK(newton_iter >= 1 && newton_iter <= 20,
+                "newton_iter must be in [1, 20], got ", newton_iter);
+    TORCH_CHECK(B > 0 && H > 0,
+                "batch_size and num_heads must be positive (got B=", B, ", H=", H, ")");
+    TORCH_CHECK(B * H * N * D <= INT32_MAX,
+                "Tensor element count overflows int32 (B*H*N*D=", B * H * N * D, ")");
+
+    auto _ck = [&](const torch::Tensor& t, const char* name,
+                   torch::IntArrayRef expected_shape, at::ScalarType expected_dtype) {
+        CHECK_DEVICE(t);
+        CHECK_CONTIGUOUS(t);
+        TORCH_CHECK(t.scalar_type() == expected_dtype,
+                    name, " must be ", expected_dtype, ", got ", t.scalar_type());
+        TORCH_CHECK(t.sizes() == expected_shape,
+                    name, " shape mismatch: expected ", expected_shape,
+                    ", got ", t.sizes());
+    };
+
+    _ck(q_s,           "q_s",           {B, H, N, D},                    dtype);
+    _ck(k_s,           "k_s",           {B, H, N, D},                    dtype);
+    _ck(v,             "v",             {B, H, N, D},                    dtype);
+    _ck(output,        "output",        {B, H, N, D},                    dtype);
+    _ck(q_tilde,       "q_tilde",       {B, H, m, D},                    dtype);
+    _ck(k_tilde,       "k_tilde",       {B, H, m, D},                    dtype);
+    _ck(step2,         "step2",         {B, H, m, D},                    dtype);
+    _ck(b_saved,       "b_saved",       {B, H, m, D},                    dtype);
+    _ck(kernel2_inv,   "kernel2_inv",   {B, H, m, m},                    at::ScalarType::Float);
+    _ck(k2_softmax,    "k2_softmax",    {B, H, m, m},                    at::ScalarType::Float);
+    _ck(softmax1_lse,  "softmax1_lse",  {B, H, N},                       at::ScalarType::Float);
+    _ck(softmax2_lse,  "softmax2_lse",  {B, H, m},                       at::ScalarType::Float);
+    _ck(softmax3_lse,  "softmax3_lse",  {B, H, m},                       at::ScalarType::Float);
+    _ck(ns_iterates,   "ns_iterates",   {B, H, newton_iter + 1, m, m},   at::ScalarType::Float);
+
+    if (conv_weight.has_value() && conv_kernel_size > 0) {
+        TORCH_CHECK(conv_kernel_size % 2 == 1,
+                    "conv_kernel_size must be odd, got ", conv_kernel_size);
+        _ck(conv_weight.value(), "conv_weight", {H, conv_kernel_size}, dtype);
+    } else {
+        TORCH_CHECK(conv_kernel_size == 0,
+                    "conv_kernel_size > 0 but conv_weight not provided");
+    }
 
     const at::cuda::CUDAGuard device_guard(dO.device());
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -198,13 +262,8 @@ std::vector<torch::Tensor> nystrom_bwd(
     constexpr int kNumSplits = 64;
     auto dQ_tilde_split = torch::zeros({kNumSplits, B, H, m, D}, opts_f32);
 
-    // Workspaces for the unrolled NS backward.
-    auto ns_dZ_ws  = torch::empty({B, H, m, m}, opts_f32);
-    auto ns_dK2_ws = torch::empty({B, H, m, m}, opts_f32);
-    // Scratch for the cuBLAS-based NS step: 11 FP32 buffers each shape
-    // (B, H, m, m), concatenated into one allocation for cache locality.
-    // Used by launch_kernel2_inv_bwd when cuBLAS path is enabled.
-    auto ns_step_scratch = torch::empty({11, B, H, m, m}, opts_f32);
+    // No NS backward workspaces here. launch_kernel2_inv_bwd owns its own
+    // thread-local persistent workspaces (NsBwdGraphState).
 
     // dO3 intermediate (always allocated — used by precompute_d3 and the TC
     // kernel3_bwd). Allocated in input dtype: FP16/BF16 for the TC path,
@@ -260,9 +319,6 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.D1_ptr = D1.data_ptr<float>();
     params.D3_ptr = D3.data_ptr<float>();
     params.dO3_ptr = dO3.data_ptr();
-    params.ns_dZ_workspace_ptr  = ns_dZ_ws.data_ptr<float>();
-    params.ns_dK2_workspace_ptr = ns_dK2_ws.data_ptr<float>();
-    params.ns_step_scratch_ptr  = ns_step_scratch.data_ptr<float>();
     params.stream = stream;
 
     if (dtype == at::ScalarType::Float) {
@@ -403,21 +459,13 @@ std::vector<torch::Tensor> debug_kernel2_inv_bwd_full(
     auto opts_f32 = q_tilde.options();
     auto dQ_tilde = torch::zeros({BH, m, D}, opts_f32);
     auto dK_tilde = torch::zeros({BH, m, D}, opts_f32);
-    auto dZ_ws    = torch::empty({BH, m, m}, opts_f32);
-    auto dK2_ws   = torch::empty({BH, m, m}, opts_f32);
-    // Per-iter NS step scratch for the cuBLAS path. Single allocation
-    // partitioned into 11 (BH, m, m) buffers inside launch_kernel2_inv_bwd.
-    auto ns_step_scratch = torch::empty({11, BH, m, m}, opts_f32);
 
     flash_nystrom::launch_kernel2_inv_bwd<float>(
         q_tilde.data_ptr<float>(), k_tilde.data_ptr<float>(),
-        /*lse2=*/nullptr, /*k2_inv=*/nullptr,
         dK2_inv_in.data_ptr<float>(),
         ns_iterates.data_ptr<float>(),
         K2_softmax.data_ptr<float>(),
         dQ_tilde.data_ptr<float>(), dK_tilde.data_ptr<float>(),
-        dZ_ws.data_ptr<float>(), dK2_ws.data_ptr<float>(),
-        ns_step_scratch.data_ptr<float>(),
         BH, D, m, static_cast<int>(newton_iter), stream);
 
     return {dQ_tilde, dK_tilde};
@@ -524,6 +572,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Returns (dQ_tilde, dK_tilde) FP32.",
           py::arg("q_tilde"), py::arg("k_tilde"), py::arg("K2_softmax"),
           py::arg("ns_iterates"), py::arg("dK2_inv_in"), py::arg("newton_iter"));
+    m.def("reset_caches", &flash_nystrom::reset_ns_bwd_caches,
+          "Free the thread-local NS-backward graph caches and workspaces. "
+          "Reclaims GPU memory held by FlashNystrom across all dtypes. "
+          "Safe to call between calls but not during a graph capture.");
 
     // ----- Occupancy probe -----
     py::class_<flash_nystrom::OccupancyRow>(m, "OccupancyRow")

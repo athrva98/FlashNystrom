@@ -38,32 +38,25 @@ __global__ void ns_bwd_final_kernel(
 // -- Production launch wrapper used by run_nystrom_bwd_impl --
 //
 // Unrolls all NS backward iterations and runs the final softmax-bwd step.
+// The cuBLAS + CUDA-graph implementation owns its own persistent workspaces
+// (thread-local NsBwdGraphState cache keyed by shape). The caller does not
+// pass any scratch tensors: inputs are memcpy'd into the workspaces, the
+// captured graph is replayed, outputs are memcpy'd back.
+//
 // Inputs:
-//   q_tilde, k_tilde     (BH, m, D)               — input/output dtype
-//   lse2                 (unused, kept for ABI)
-//   k2_inv               (unused — Z_N is in ns_iterates)
-//   dK2_inv_in           (BH, m, m)  FP32         — incoming gradient dZ_N
-//   ns_iterates          (BH, newton_iter+1, m, m) FP32 — Z_0 .. Z_N
-//   K2_softmax           (BH, m, m) FP32          — softmax(QK^T) output
-// Outputs (accumulated):
-//   dQ_tilde, dK_tilde   (BH, m, D) FP32
-// Workspace (caller-allocated):
-//   dZ_workspace         (BH, m, m) FP32 — rolling dZ
-//   dK2_workspace        (BH, m, m) FP32 — accumulator
+//   q_tilde, k_tilde   (BH, m, D)               — input dtype
+//   dK2_inv_in         (BH, m, m)  FP32         — incoming gradient dZ_N
+//   ns_iterates        (BH, newton_iter+1, m, m) FP32 — Z_0 .. Z_N from forward
+//   K2_softmax         (BH, m, m) FP32          — softmax(QK^T) output
+// Outputs (accumulated; caller-allocated, copied in then back out):
+//   dQ_tilde, dK_tilde (BH, m, D) FP32
 template <typename scalar_t>
 void launch_kernel2_inv_bwd(
     const scalar_t* q_tilde, const scalar_t* k_tilde,
-    const float* lse2,
-    const float* k2_inv,
     const float* dK2_inv_in,
     const float* ns_iterates,
     const float* K2_softmax,
     float* dQ_tilde, float* dK_tilde,
-    float* dZ_workspace,
-    float* dK2_workspace,
-    // 11 * BH * m * m FP32 scratch for the cuBLAS-based per-iter NS step
-    // (M, M2, V, T, dT, dV, dM_T, dV_MT, dU, dM, dZ_outer interleaved).
-    float* ns_step_scratch,
     int BH, int D, int m, int newton_iter, cudaStream_t stream);
 
 // -- Test-only standalone launchers (used by debug pybind hooks) --
@@ -91,5 +84,10 @@ void launch_ns_bwd_final_test(
     const float* K2_in, const float* dZ0_in,
     float* dK2_inout, float* dQ_tilde_out, float* dK_tilde_out,
     int BH, int D, int m, cudaStream_t stream);
+
+// Free all thread-local NS-backward graph caches and workspaces. Use to
+// reclaim GPU memory after a shape change, or before measuring residual
+// memory usage. Per-dtype caches: float, half_t, bfloat16_t.
+void reset_ns_bwd_caches();
 
 } // namespace flash_nystrom

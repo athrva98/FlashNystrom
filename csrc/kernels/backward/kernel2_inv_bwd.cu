@@ -597,6 +597,24 @@ struct NsBwdGraphState {
         if (graph) { cudaGraphDestroy(graph);    graph = nullptr; }
     }
 
+    // Free workspaces and reset cached graph. Safe to call any time outside
+    // of an active graph capture. Restores the state to "uninitialized";
+    // the next call to allocate() will re-allocate fresh.
+    void reset() {
+        invalidate_graph();
+        K2_buf       = at::Tensor();
+        ns_iter_buf  = at::Tensor();
+        q_tilde_buf  = at::Tensor();
+        k_tilde_buf  = at::Tensor();
+        dZ_buf       = at::Tensor();
+        dK2_buf      = at::Tensor();
+        dQ_tilde_buf = at::Tensor();
+        dK_tilde_buf = at::Tensor();
+        scratch_buf  = at::Tensor();
+        dS2_buf      = at::Tensor();
+        m = -1; BH = -1; niter = -1; D = -1;
+    }
+
     void allocate(int m_, int BH_, int n_, int D_) {
         m = m_; BH = BH_; niter = n_; D = D_;
         invalidate_graph();
@@ -617,9 +635,17 @@ struct NsBwdGraphState {
 
     ~NsBwdGraphState() {
         // Best-effort cleanup on thread exit. CUDA context may already be
-        // gone at process exit; ignore errors silently.
-        if (exec)  cudaGraphExecDestroy(exec);
-        if (graph) cudaGraphDestroy(graph);
+        // gone at process exit; ignore errors silently. Note: a thrown
+        // exception here would terminate during stack unwinding, so the
+        // wrapping if-checks deliberately swallow any error.
+        if (exec) {
+            (void)cudaGraphExecDestroy(exec);
+            exec = nullptr;
+        }
+        if (graph) {
+            (void)cudaGraphDestroy(graph);
+            graph = nullptr;
+        }
     }
 };
 
@@ -768,23 +794,12 @@ static void record_ns_bwd_on_workspace(
 template <typename scalar_t>
 void launch_kernel2_inv_bwd(
     const scalar_t* q_tilde, const scalar_t* k_tilde,
-    const float* lse2,
-    const float* k2_inv,
     const float* dK2_inv_in,
     const float* ns_iterates,
     const float* K2_softmax,
     float* dQ_tilde, float* dK_tilde,
-    float* dZ_workspace,
-    float* dK2_workspace,
-    float* ns_step_scratch,
     int BH, int D, int m, int newton_iter, cudaStream_t stream
 ) {
-    (void)k2_inv;
-    (void)lse2;
-    (void)dZ_workspace;     // graph state owns its own dZ buffer
-    (void)dK2_workspace;    // graph state owns its own dK2 buffer
-    (void)ns_step_scratch;  // graph state owns its own NS step scratch
-
     const int mm = m * m;
     const int mD = m * D;
 
@@ -854,16 +869,19 @@ void launch_kernel2_inv_bwd(
 // occupancy probe in flash_nystrom.cu) can take the kernel function
 // pointer without seeing the kernel definition.
 template void launch_kernel2_inv_bwd<float>(
-    const float*, const float*, const float*, const float*, const float*,
-    const float*, const float*, float*, float*, float*, float*, float*,
+    const float*, const float*,
+    const float*, const float*, const float*,
+    float*, float*,
     int, int, int, int, cudaStream_t);
 template void launch_kernel2_inv_bwd<cutlass::half_t>(
-    const cutlass::half_t*, const cutlass::half_t*, const float*, const float*, const float*,
-    const float*, const float*, float*, float*, float*, float*, float*,
+    const cutlass::half_t*, const cutlass::half_t*,
+    const float*, const float*, const float*,
+    float*, float*,
     int, int, int, int, cudaStream_t);
 template void launch_kernel2_inv_bwd<cutlass::bfloat16_t>(
-    const cutlass::bfloat16_t*, const cutlass::bfloat16_t*, const float*, const float*, const float*,
-    const float*, const float*, float*, float*, float*, float*, float*,
+    const cutlass::bfloat16_t*, const cutlass::bfloat16_t*,
+    const float*, const float*, const float*,
+    float*, float*,
     int, int, int, int, cudaStream_t);
 
 template __global__ void ns_bwd_final_kernel<float>(
@@ -928,6 +946,21 @@ void launch_ns_bwd_final_test(
     ns_bwd_final_kernel<float><<<grid, block, smem, stream>>>(
         q_tilde, k_tilde, K2_in, dZ0_in, dK2_inout, dQ_tilde_out, dK_tilde_out, D, m);
     FN_CUDA_KERNEL_CHECK();
+}
+
+// =========================================================================
+// Public cache-reset hook. Frees the thread-local NsBwdGraphState
+// workspaces and destroys the cached cudaGraphExec across all dtypes.
+// Called from Python via _C.reset_caches() when the user wants to reclaim
+// GPU memory after a shape change or before measuring memory usage.
+// Safe to call concurrently with nystrom_bwd on a different thread (the
+// state is thread-local). Not safe to call from a CUDA-graph capture
+// context, but no user code should be doing that.
+// =========================================================================
+void reset_ns_bwd_caches() {
+    get_ns_bwd_graph_state<float>().reset();
+    get_ns_bwd_graph_state<cutlass::half_t>().reset();
+    get_ns_bwd_graph_state<cutlass::bfloat16_t>().reset();
 }
 
 } // namespace flash_nystrom

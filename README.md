@@ -25,7 +25,7 @@ where Qt and Kt are landmarks formed by segmented mean pooling of Q and K. The p
 ## Install
 
 ```
-git clone --recursive https://github.com/<your-fork>/FlashNystrom.git
+git clone --recursive https://github.com/athrva98/FlashNystrom.git
 cd FlashNystrom
 pip install -e . --no-build-isolation
 ```

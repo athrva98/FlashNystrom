@@ -117,14 +117,9 @@ struct NystromBwdParams {
     // Intermediate for TC kernel3_bwd: dO3 = K2_inv^T @ dstep2, stored as elem_type
     void* __restrict__ dO3_ptr;              // (B,H,m,D) FP16/BF16, or nullptr for FP32
 
-    // Workspace for unrolled NS backward.
-    float* __restrict__ ns_dZ_workspace_ptr;   // (B,H,m,m) FP32 — rolling dZ_j
-    float* __restrict__ ns_dK2_workspace_ptr;  // (B,H,m,m) FP32 — accumulated dK2 from NS
-    // Scratch for the cuBLAS-based ns_bwd_step (M, M2, V, T, dT, dV, dM_T,
-    // dV_MT, dU, dM, dZ_outer interleaved). Size 11 * BH * m * m FP32 = 176 KB
-    // at the common (BH=8, m=64) config. If null the launcher falls back to
-    // the legacy monolithic ns_bwd_step_kernel.
-    float* __restrict__ ns_step_scratch_ptr;   // 11 * (B,H,m,m) FP32 or nullptr
+    // No NS-backward workspace pointers here: launch_kernel2_inv_bwd owns
+    // its own persistent thread-local NsBwdGraphState cache (workspaces
+    // sized by shape, reused across calls).
 
     cudaStream_t stream;
 
