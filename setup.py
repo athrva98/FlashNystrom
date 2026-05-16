@@ -1,77 +1,170 @@
 # Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
 # Licensed under the Apache License, Version 2.0
+#
+# setup.py is intentionally cautious about its imports. Three command paths
+# matter:
+#
+#   1. `python -m build --sdist` builds a source tarball. No compilation. No
+#      CUDA needed. setup.py must import cleanly even when CUDA is absent.
+#
+#   2. `python -m build --wheel` or `pip install .` builds the extension.
+#      Requires CUDA toolkit, nvcc on PATH, and a torch install whose
+#      torch.utils.cpp_extension can find CUDA_HOME.
+#
+#   3. `pip install <sdist tarball>` on a user's machine. Same requirements
+#      as (2). This is what PyPI users hit.
+#
+# We achieve (1) by deferring the import of torch.utils.cpp_extension and the
+# instantiation of CUDAExtension until setup() actually needs an ext_modules
+# list. When the command is `sdist` we skip all of that.
 
 import os
+import sys
 import subprocess
 from setuptools import setup, find_packages
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-this_dir = os.path.dirname(os.path.abspath(__file__))
-cutlass_include = os.path.join(this_dir, "third_party", "cutlass", "include")
+# ---------------------------------------------------------------------------
+# Compute capability detection. nvidia-smi may not exist (sdist build on a
+# machine without GPU, CI runner with CPU only, docker image during sdist).
+# In that case we fall back to a multi-arch wheel that covers Ampere, Ada,
+# Hopper, and Blackwell consumer (SM 8.0 / 8.6 / 8.9 / 9.0 / 12.0). Users
+# building from source on a specific machine can override via
+# `FLASH_NYSTROM_CUDA_ARCH_LIST=90` (NVCC arch flag list, semicolon or
+# space separated). Matches PyTorch's TORCH_CUDA_ARCH_LIST convention.
+# ---------------------------------------------------------------------------
 
-nvcc_flags = [
-    "-O3",
-    "--use_fast_math",
-    "--expt-relaxed-constexpr",
-    "--expt-extended-lambda",
-    "-lineinfo",
-    "-std=c++17",
-    # Resource visibility. Print registers, stack, spill, and shared-memory
-    # usage per kernel at compile time. Required for any informed occupancy
-    # tuning. Can be disabled by setting FLASH_NYSTROM_QUIET=1.
-    *([] if os.environ.get("FLASH_NYSTROM_QUIET") else ["-Xptxas=-v", "--resource-usage"]),
-]
+def _detect_cuda_arches():
+    """Return a sorted list of compute capabilities (strings like '80', '90')."""
+    env = os.environ.get("FLASH_NYSTROM_CUDA_ARCH_LIST") \
+        or os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if env:
+        # PyTorch accepts forms like "8.0 8.6+PTX" or "8.0;8.6". Normalize to
+        # bare two-digit strings.
+        toks = env.replace(";", " ").replace(",", " ").split()
+        out = set()
+        for t in toks:
+            t = t.replace("+PTX", "").replace(".", "").strip()
+            if t.isdigit():
+                out.add(t)
+        if out:
+            return sorted(out)
 
-# Detect GPU architecture from nvidia-smi
-try:
-    result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if result.returncode == 0:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        result = None
+
+    if result is not None and result.returncode == 0:
         caps = set()
         for line in result.stdout.strip().split("\n"):
             cap = line.strip().replace(".", "")
-            if cap:
+            if cap and cap.isdigit():
                 caps.add(cap)
-        for cap in sorted(caps):
-            nvcc_flags.append(f"-gencode=arch=compute_{cap},code=sm_{cap}")
-    else:
-        # Fallback: common architectures
-        nvcc_flags.append("-gencode=arch=compute_80,code=sm_80")
-except Exception:
-    nvcc_flags.append("-gencode=arch=compute_80,code=sm_80")
+        if caps:
+            return sorted(caps)
 
-ext_modules = [
-    CUDAExtension(
-        name="flash_nystrom._C",
-        sources=[
-            "csrc/flash_nystrom.cu",
-            "csrc/flash_nystrom_kernels.cu",
-            "csrc/kernels/backward/kernel2_inv_bwd.cu",
-        ],
-        include_dirs=[
-            os.path.join(this_dir, "csrc"),
-            cutlass_include,
-        ],
-        # cuBLAS is used for the m-bounded dense GEMMs (Newton-Schulz step,
-        # Newton-Schulz final, landmark projection). Pure dense matmuls with
-        # no softmax fusion, so we let NVIDIA's tuned kernels do the work.
-        # Tensor-core flash kernels (kernel1_fused_tc, kernel3_fused_tc and
-        # their backwards) keep streaming custom kernels.
-        libraries=["cublas"],
-        extra_compile_args={
-            "cxx": ["/O2", "/std:c++17"] if os.name == "nt" else ["-O3", "-std=c++17"],
-            "nvcc": nvcc_flags,
-        },
-    ),
-]
+    # Fallback: ship a multi-arch wheel covering the supported range.
+    # SM 7.5 and earlier are explicitly unsupported (no SM80 mma atom).
+    return ["80", "86", "89", "90"]
+
+
+def _build_ext_modules():
+    """Build CUDAExtension list. Imports torch lazily so sdist does not need CUDA."""
+    # Deferred import: only required when we actually build an extension.
+    from torch.utils.cpp_extension import CUDAExtension
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    cutlass_include = os.path.join(this_dir, "third_party", "cutlass", "include")
+
+    if not os.path.isdir(cutlass_include):
+        # The CUTLASS submodule has not been initialized. Fail with a clear
+        # message rather than letting nvcc complain about missing headers.
+        raise RuntimeError(
+            f"CUTLASS submodule not found at {cutlass_include!r}.\n"
+            "Initialize it with:\n"
+            "  git submodule update --init --recursive\n"
+            "or clone the repository with --recursive."
+        )
+
+    nvcc_flags = [
+        "-O3",
+        "--use_fast_math",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "-lineinfo",
+        "-std=c++17",
+        # Resource visibility. Off by default in CI / PyPI builds (verbose,
+        # slows compile). Set FLASH_NYSTROM_VERBOSE=1 to re-enable for tuning.
+        *(["-Xptxas=-v", "--resource-usage"]
+          if os.environ.get("FLASH_NYSTROM_VERBOSE") else []),
+    ]
+    for cap in _detect_cuda_arches():
+        nvcc_flags.append(f"-gencode=arch=compute_{cap},code=sm_{cap}")
+
+    cxx_flags = (["/O2", "/std:c++17"] if os.name == "nt" else ["-O3", "-std=c++17"])
+
+    return [
+        CUDAExtension(
+            name="flash_nystrom._C",
+            sources=[
+                "csrc/flash_nystrom.cu",
+                "csrc/flash_nystrom_kernels.cu",
+                "csrc/kernels/backward/kernel2_inv_bwd.cu",
+            ],
+            include_dirs=[
+                os.path.join(this_dir, "csrc"),
+                cutlass_include,
+            ],
+            # cuBLAS is used for the m-bounded dense matmuls in the
+            # Newton-Schulz backward. Tensor-core flash kernels stay custom.
+            libraries=["cublas"],
+            extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
+        ),
+    ]
+
+
+def _cmdclass():
+    """Return cmdclass dict. Imports BuildExtension lazily."""
+    from torch.utils.cpp_extension import BuildExtension
+    return {"build_ext": BuildExtension}
+
+
+# ---------------------------------------------------------------------------
+# Skip CUDA-touching work for commands that don't need it.
+#
+# Commands like `sdist`, `egg_info`, `--version` should not require torch
+# to be importable or CUDA to be available. The PyPI sdist build runs setup.py
+# inside an isolated env that may not have torch, and CI sdist jobs may not
+# have CUDA on the runner. By gating the extension construction we keep
+# those commands working in CUDA-less environments.
+# ---------------------------------------------------------------------------
+
+_CUDA_LESS_COMMANDS = {
+    "sdist", "egg_info", "dist_info", "check", "clean",
+    "--help", "--help-commands", "--version",
+}
+
+_needs_extension = not any(
+    arg in _CUDA_LESS_COMMANDS for arg in sys.argv[1:]
+)
+
+if _needs_extension:
+    ext_modules = _build_ext_modules()
+    cmdclass = _cmdclass()
+else:
+    ext_modules = []
+    cmdclass = {}
 
 setup(
     name="flash-nystrom",
-    version="0.1.0",
+    # Version is the single source of truth in pyproject.toml; setup() reads
+    # it from there via the PEP 621 mechanism. We omit version= here to
+    # avoid drift.
     packages=find_packages(),
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass=cmdclass,
     python_requires=">=3.9",
 )

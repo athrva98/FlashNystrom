@@ -14,39 +14,50 @@
 #include <cstdlib>
 #include <cfloat>
 #include <cassert>
+#include <stdexcept>
+#include <string>
+#include <sstream>
 
 #include <cutlass/numeric_types.h>
 
-// error checking macros — these just abort on failure, no fancy recovery
-// honestly the best thing you can do with a cuda error is die loudly
+// Error checking macros. These throw std::runtime_error rather than calling
+// abort() so a failure inside the kernel pipeline propagates as a normal
+// Python exception. Aborting the host process from a library used inside a
+// training loop would kill the user's whole run on an intermittent failure
+// (e.g. a transient OOM); a thrown exception lets PyTorch's autograd unwind
+// cleanly and surface a recoverable RuntimeError to Python.
 
 #define FN_CUDA_CHECK(call)                                                    \
-    do {                                                                        \
-        cudaError_t err = (call);                                               \
-        if (err != cudaSuccess) {                                               \
-            fprintf(stderr, "[FlashNystrom] CUDA error at %s:%d: %s (code %d)\n",\
-                    __FILE__, __LINE__, cudaGetErrorString(err), (int)err);     \
-            abort();                                                            \
-        }                                                                       \
+    do {                                                                       \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess) {                                              \
+            std::ostringstream _fn_oss;                                        \
+            _fn_oss << "[FlashNystrom] CUDA error at " << __FILE__             \
+                    << ":" << __LINE__ << ": " << cudaGetErrorString(err)      \
+                    << " (code " << static_cast<int>(err) << ")";              \
+            throw std::runtime_error(_fn_oss.str());                           \
+        }                                                                      \
     } while (0)
 
 #define FN_CUDA_KERNEL_CHECK()                                                 \
-    do {                                                                        \
-        cudaError_t err = cudaGetLastError();                                   \
-        if (err != cudaSuccess) {                                               \
-            fprintf(stderr, "[FlashNystrom] Kernel launch error at %s:%d: %s\n",\
-                    __FILE__, __LINE__, cudaGetErrorString(err));               \
-            abort();                                                            \
-        }                                                                       \
+    do {                                                                       \
+        cudaError_t err = cudaGetLastError();                                  \
+        if (err != cudaSuccess) {                                              \
+            std::ostringstream _fn_oss;                                        \
+            _fn_oss << "[FlashNystrom] Kernel launch error at " << __FILE__    \
+                    << ":" << __LINE__ << ": " << cudaGetErrorString(err);     \
+            throw std::runtime_error(_fn_oss.str());                           \
+        }                                                                      \
     } while (0)
 
 #define FN_CHECK(cond, msg)                                                    \
-    do {                                                                        \
-        if (!(cond)) {                                                          \
-            fprintf(stderr, "[FlashNystrom] CHECK failed at %s:%d: %s\n",      \
-                    __FILE__, __LINE__, (msg));                                 \
-            abort();                                                            \
-        }                                                                       \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            std::ostringstream _fn_oss;                                        \
+            _fn_oss << "[FlashNystrom] CHECK failed at " << __FILE__           \
+                    << ":" << __LINE__ << ": " << (msg);                       \
+            throw std::runtime_error(_fn_oss.str());                           \
+        }                                                                      \
     } while (0)
 
 // hard limits — kernels actualy only support D in {64, 128} and m <= 64

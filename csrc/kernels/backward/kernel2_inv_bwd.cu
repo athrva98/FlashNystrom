@@ -537,8 +537,12 @@ inline void rm_gemm_ex_strided_batched(
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT);
     if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("[cublas] GemmEx strided batched failed: %d\n", (int)status);
-        abort();
+        std::ostringstream oss;
+        oss << "[FlashNystrom] cublasGemmStridedBatchedEx failed with status "
+            << static_cast<int>(status)
+            << " (shape M_rm=" << M_rm << ", N_rm=" << N_rm
+            << ", K_rm=" << K_rm << ", batch=" << batch << ")";
+        throw std::runtime_error(oss.str());
     }
 }
 

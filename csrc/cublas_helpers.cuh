@@ -60,8 +60,12 @@ inline void rm_sgemm_strided_batched(
         batch);
 
     if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("[cublas] sgemm strided batched failed: %d\n", (int)status);
-        abort();
+        std::ostringstream oss;
+        oss << "[FlashNystrom] cublasSgemmStridedBatched failed with status "
+            << static_cast<int>(status)
+            << " (shape M_rm=" << M_rm << ", N_rm=" << N_rm
+            << ", K_rm=" << K_rm << ", batch=" << batch << ")";
+        throw std::runtime_error(oss.str());
     }
 }
 
