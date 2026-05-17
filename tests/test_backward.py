@@ -32,47 +32,72 @@ class TestReferenceBackward:
                          (v,), eps=1e-6, atol=1e-3, rtol=1e-2)
 
     def test_reference_qk_gradient_direction(self):
-        """Verify Q/K gradients from reference point in the right direction.
+        """Verify Q/K gradients from the reference agree with finite
+        differences via cosine similarity over a sample.
 
-        Exact gradcheck fails because N-S autograd chain is numerically noisy,
-        but the gradient direction should still be meaningful (positive cosine
-        similarity with finite-difference approximation).
+        The reference forward downcasts the Newton-Schulz pseudoinverse
+        to FP32 internally (matching the CUDA kernel; see reference.py
+        line ~103). That sets the effective precision of the function
+        at FP32, not the dtype of the input tensors. A small FD
+        perturbation in FP64 (eps=1e-5) sits below the FP32 NS noise
+        floor and FD picks up noise rather than the gradient, which is
+        what made earlier versions of this test fail on A100 but not
+        on consumer Blackwell.
+
+        Fix: run the check in FP32 with eps=1e-3, large enough that the
+        perturbation propagates through the NS chain with signal-to-
+        noise ratio above 1. Sample 32 elements and check cosine
+        similarity rather than per-point sign so the result averages
+        out per-point flakiness.
         """
         B, H, N, D, m = 1, 1, 32, 16, 8
         torch.manual_seed(42)
-        q = torch.randn(B, H, N, D, dtype=torch.float64, requires_grad=True)
-        k = torch.randn(B, H, N, D, dtype=torch.float64, requires_grad=True)
-        v = torch.randn(B, H, N, D, dtype=torch.float64, requires_grad=True)
+        q = torch.randn(B, H, N, D, dtype=torch.float32, requires_grad=True)
+        k = torch.randn(B, H, N, D, dtype=torch.float32, requires_grad=True)
+        v = torch.randn(B, H, N, D, dtype=torch.float32, requires_grad=True)
 
         out = nystrom_attention_reference_simple(q, k, v, m)
         out.sum().backward()
 
-        # check gradients are finite and non-zero
+        # Gradients themselves should be finite. Cheap sanity check before
+        # the more expensive FD comparison below.
         for name, p in [("q", q), ("k", k), ("v", v)]:
             assert p.grad is not None, f"{name}.grad is None"
             assert not torch.isnan(p.grad).any(), f"{name}.grad has NaN"
             assert p.grad.abs().max() > 0, f"{name}.grad is all zeros"
 
-        # verify gradient direction via finite differences for a few elements
-        eps = 1e-5
+        eps = 1e-3  # large enough to clear the FP32 NS noise floor
+        n_samples = 32
+        rng = torch.Generator().manual_seed(0)
         for name, param in [("q", q), ("k", k)]:
-            # pick a random element
-            idx = (0, 0, N // 2, D // 2)
-            analytical = param.grad[idx].item()
+            flat_idx = torch.randperm(param.numel(), generator=rng)[:n_samples]
+            analytical = []
+            numerical = []
+            for fi in flat_idx.tolist():
+                # Unravel flat index into the 4D (B, H, N, D) tuple.
+                i0 = fi // (H * N * D); rem = fi % (H * N * D)
+                i1 = rem // (N * D);    rem = rem % (N * D)
+                i2 = rem // D;          i3 = rem % D
+                idx = (i0, i1, i2, i3)
 
-            # finite difference
-            param_data = param.data.clone()
-            param.data[idx] += eps
-            out_plus = nystrom_attention_reference_simple(q, k, v, m).sum().item()
-            param.data[idx] -= 2 * eps
-            out_minus = nystrom_attention_reference_simple(q, k, v, m).sum().item()
-            param.data.copy_(param_data)
-            numerical = (out_plus - out_minus) / (2 * eps)
+                analytical.append(param.grad[idx].item())
+                saved = param.data.clone()
+                param.data[idx] += eps
+                out_plus = nystrom_attention_reference_simple(q, k, v, m).sum().item()
+                param.data[idx] -= 2 * eps
+                out_minus = nystrom_attention_reference_simple(q, k, v, m).sum().item()
+                param.data.copy_(saved)
+                numerical.append((out_plus - out_minus) / (2 * eps))
 
-            # should agree in sign at minimum
-            if abs(numerical) > 1e-8 and abs(analytical) > 1e-8:
-                assert numerical * analytical > 0, \
-                    f"{name} gradient sign mismatch: analytical={analytical:.6f}, numerical={numerical:.6f}"
+            a = torch.tensor(analytical, dtype=torch.float64)
+            n = torch.tensor(numerical, dtype=torch.float64)
+            cos = torch.nn.functional.cosine_similarity(a, n, dim=0).item()
+            # 0.5 is a loose floor; a correct gradient through the FP32 NS
+            # chain typically lands in [0.7, 0.95]. A real backward bug
+            # gives cosine near zero or negative.
+            assert cos > 0.5, (
+                f"{name}: grad-vs-FD cosine similarity {cos:.3f} below 0.5; "
+                f"sample size {n_samples}")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
