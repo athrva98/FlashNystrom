@@ -45,7 +45,7 @@ git submodule update --init
 Requirements:
 
 * PyTorch 2.0+ with CUDA support
-* CUDA toolkit 11.8+
+* CUDA toolkit 12.2+
 * Compute capability 8.0+ (Ampere, Ada, Hopper, Blackwell). The kernels use the SM80 16x8x16 mma atom and opt into up to ~96 KB of dynamic shared memory per CTA. They run on Hopper and Blackwell but are not Hopper-native (no WGMMA/TMA). SM75 and earlier are not supported.
 
 ## Quickstart
