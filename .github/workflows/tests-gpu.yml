@@ -55,9 +55,9 @@ jobs:
           pip install pytest ninja
 
       - name: Build flash-nystrom extension
-        env:
-          FLASH_NYSTROM_QUIET: "1"
         run: |
+          # Build defaults to quiet (no ptxas -v). Set FLASH_NYSTROM_VERBOSE=1
+          # if you want resource-usage output for kernel tuning.
           pip install -e . --no-build-isolation -v
 
       - name: Run test suite

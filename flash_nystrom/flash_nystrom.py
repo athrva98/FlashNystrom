@@ -131,9 +131,9 @@ def flash_nystrom_attention(
 
     The conv residual (when enabled) is computed via cuDNN through F.conv1d,
     OUTSIDE the FlashNystromFunction autograd boundary. PyTorch handles its
-    backward automatically. The custom CUDA conv kernels (`dconv_residual.cuh`
-    and `dconv_residual_bwd.cuh`) are no longer used by this path — they remain
-    in the codebase only for the reference implementation's compatibility.
+    backward automatically. The previous custom CUDA conv kernels
+    (dconv_residual.cuh / dconv_residual_bwd.cuh) have been removed; only
+    the cuDNN path exists now.
 
     `fast_dk2inv` controls the `compute_dk2inv` path in the backward (FP16/BF16
     only). Default True uses the tensor-core kernel (4-6x faster on the full
