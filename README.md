@@ -10,6 +10,12 @@ attention(Q, K, V) = softmax(Q @ Kt^T) @ softmax(Qt @ Kt^T)^+ @ softmax(Qt @ K^T
 
 where Qt and Kt are landmarks formed by segmented mean pooling of Q and K. The pseudoinverse is computed by unrolled Newton-Schulz iteration in FP32. The backward pass differentiates through every NS iterate via the chain rule. There is no Implicit Function Theorem dependence and no requirement that NS has converged.
 
+## Scope
+
+FlashNystrom is not a FlashAttention competitor. FlashAttention (v1/v2/v3/v4) implements *exact* O(N²) attention with IO-aware tiling — the versions are hardware-targeted rewrites of the same algorithm (FA2 → Ampere/Ada, FA3 → Hopper WGMMA+TMA, FA4 → Blackwell TMEM). FlashNystrom implements a *different* attention math: the Nyström low-rank factorization, which is O(m·N·D + m³) with m landmarks. The relevant comparison is FlashNystrom vs. SDPA (any FA generation) at long sequence length, where O(N²) starts to dominate and the approximation becomes worthwhile. At short N (under ~1–2K), exact attention is faster and you should use it.
+
+The kernels borrow the FA2-era CUTLASS SM80 mma atom and the tiled-softmax / running-LSE pattern, but apply them to the three Nyström softmaxes rather than to one big QK^T. They are written in pre-Hopper idioms — no WGMMA, no TMA, no warp specialization, no TMEM. They run on Hopper and Blackwell (the build covers `sm_80;86;89;90`) and benefit from the higher SMEM and register counts on those parts via occupancy, but a Hopper-native rewrite would extract more peak throughput. See [the SMEM sizing discussion](#smem-sizing-and-occupancy) below.
+
 ## Status
 
 20-epoch CIFAR-10 ViT (default settings, FP16 autocast, num_landmarks=32, newton_iter=6) reaches the same test accuracy as the SDPA and pure-PyTorch Nystromformer baselines:
@@ -20,7 +26,7 @@ where Qt and Kt are landmarks formed by segmented mean pooling of Q and K. The p
 | Pure-PyTorch Nystromformer      |    66.3% |
 | FlashNystrom (this repo)        |    66.7% |
 
-71 tests cover forward, backward, kernel-level isolation, and per-kernel regression against autograd-derived references.
+84 tests cover forward, backward, kernel-level isolation, the production cuBLAS + CUDA-graph NS backward path, and per-kernel regression against autograd-derived references.
 
 ## Install
 
@@ -40,7 +46,7 @@ Requirements:
 
 * PyTorch 2.0+ with CUDA support
 * CUDA toolkit 11.8+
-* Compute capability 8.0+ (Ampere, Ada, Hopper). The kernels use the SM80 16x8x16 mma atom and opt into roughly 100 KB of dynamic shared memory per CTA. SM75 and earlier are not supported.
+* Compute capability 8.0+ (Ampere, Ada, Hopper, Blackwell). The kernels use the SM80 16x8x16 mma atom and opt into up to ~96 KB of dynamic shared memory per CTA. They run on Hopper and Blackwell but are not Hopper-native (no WGMMA/TMA). SM75 and earlier are not supported.
 
 ## Quickstart
 
@@ -106,6 +112,65 @@ Same Nystrom algorithm implemented in pure PyTorch dispatches every matmul throu
 
 FN beats the reference at every configuration tested, from N=4K to N=24K across batch-head counts of 4 to 32.
 
+## SMEM sizing and occupancy
+
+The kernels are sized for the consumer SMEM envelope (~100 KB/SM on Ampere
+consumer, Ada, and Blackwell consumer). The build does not auto-tune
+tile sizes to the runtime device — the choice is fixed at compile time.
+
+Per-kernel SMEM usage (probe output on an RTX 5060 Laptop, 100 KB/SM,
+m=64, D=128, FP16, niter=6):
+
+| Kernel                        | Dyn SMEM (KB) | Regs/thr | Blocks/SM (consumer) | Binding constraint |
+|-------------------------------|--------------:|---------:|---------------------:|--------------------|
+| `kernel1_fused_tc` (fwd)      |          32   |      71  |                  3   | registers          |
+| `kernel3_fused_tc` (fwd)      |          32   |     165  |                  3   | registers          |
+| `kernel1_bwd_tc`              |          48   |     163  |                  2   | SMEM + registers   |
+| `kernel3_bwd_tc`              |          40   |     170  |                  2   | registers          |
+| `compute_dk2inv_tc`           |          64   |     206  |                  1   | registers          |
+| `kernel2_inv` (NS forward)    |          96   |      42  |                  1   | SMEM               |
+| `ns_bwd_step`                 |          96   |      40  |                  1   | SMEM               |
+
+Reproduce with `python tools/kernel_report.py`.
+
+**Are we leaving performance on the table on bigger-SMEM GPUs?**
+
+Yes and no — and not in the way most people assume.
+
+What we get for free on bigger SMEM (H100 has 228 KB/SM, ~2.3× consumer):
+- Occupancy scales automatically. The SMEM-bound kernels (`kernel2_inv`,
+  `ns_bwd_step`) double their blocks/SM. The 40–48 KB bwd kernels gain
+  roughly one extra block/SM until registers become the binder.
+- The three matmul-heavy hot kernels (`kernel3_fused_tc`,
+  `kernel3_bwd_tc`, `compute_dk2inv_tc`) are register-bound, not
+  SMEM-bound — see the regs/thr column above (165–206 regs/thr at
+  128 threads/block). Larger SMEM does nothing for those: register
+  count caps occupancy first. A real win there requires fewer
+  registers (smaller accumulator fragments, recomputation), not
+  more SMEM.
+
+What we miss by not sizing for big SMEM:
+- We do not multi-stage. Each kernel uses one SMEM buffer per role
+  (sQ, sK, sV); the next tile cannot be prefetched while the current
+  tile computes. FA2 uses a 2-stage `cp.async` pipeline on Ampere; FA3
+  uses TMA-driven asynchronous loads with producer/consumer warp
+  specialization on Hopper. Both trade SMEM for memory-latency hiding.
+  Adding a second stage to our K/V buffer would roughly double its
+  SMEM cost and is only a clear win where memory latency dominates
+  compute — which is exactly the regime that benefits from bigger SMEM.
+- We do not opt into the Hopper 228 KB envelope. The
+  `cudaFuncSetAttribute(MaxDynamicSharedMemorySize, ...)` calls request
+  the kernel's compile-time SMEM size, not the device max. On Hopper a
+  multi-stage rewrite could push tiles to 128 KB+ and use TMA bulk
+  copies. That is an FA3-class engineering effort.
+
+The TL;DR: for the kernels that *are* SMEM-bound, bigger SMEM helps via
+occupancy automatically. For the kernels that are register- or
+compute-bound, more SMEM does nothing. The structural win we leave on
+the table is async multi-stage pipelining, which is a non-trivial
+rewrite and is also the rewrite that would unlock FA3/FA4-style
+hardware-native idioms — they are the same project.
+
 ## The fast_dk2inv flag
 
 `compute_dk2inv` is the kernel that produces the gradient of the loss with respect to the pseudoinverse iterate Z_N. In normal use the backward picks up B = softmax(Q_tilde @ K^T) @ V from a small tensor the forward saved, then runs two tiny matmuls. The N-walk that used to dominate the backward (the previous default, `fast_dk2inv=False`, was 4-6x slower than the rest of the bwd combined) is gone.
@@ -169,7 +234,7 @@ csrc/                          CUDA source
   kernels/                     forward kernels
   kernels/backward/            backward kernels and isolation hooks
 flash_nystrom/                 Python package (autograd Function, config, reference)
-tests/                         71 pytest tests
+tests/                         84 pytest tests
 benchmarks/                    latency and CIFAR-10 training scripts
 examples/                      end-to-end usage examples
 docs/                          longer technical writeup
@@ -189,8 +254,14 @@ pytest tests/
 * Xiong, Zeng, Chakraborty, Tan, Fung, Li, Singh. *Nystromformer: A Nystrom-based Algorithm for Approximating Self-Attention*. AAAI 2021.
 * Dao, Fu, Ermon, Rudra, Re. *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*. NeurIPS 2022.
 * Dao. *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*. ICLR 2024.
+* Shah, Bikshandi, Zhang, Thakkar, Ramani, Dao. *FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-Precision*. NeurIPS 2024.
 
-The kernel layouts and CUTE patterns are adapted from FlashAttention-2.
+The kernel layouts, tiled-softmax running-LSE state machine, and CUTE
+SmemLayoutAtomQ/KV patterns are adapted from FlashAttention-2. We do not
+implement FA3-style asynchrony (WGMMA + TMA + warp specialization) — those
+are Hopper-specific and would be a separate kernel family. FlashAttention
+solves exact O(N²) attention; FlashNystrom uses these techniques to
+implement the Nyström low-rank factorization instead.
 
 ## License
 
