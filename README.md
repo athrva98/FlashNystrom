@@ -78,39 +78,34 @@ out = flash_nystrom_attention(q, k, v, num_landmarks=64, newton_iter=6)
 
 ## Latency
 
-Forward and backward latency in milliseconds on an RTX 5060 Laptop, FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6. Median of 30 runs after 5 warmup iterations.
+Forward and backward latency in milliseconds on an RTX 5060 Laptop (Blackwell consumer, 8 GB VRAM, sm_120), FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6. Three implementations: FN (this repo), Ref (pure-PyTorch Nyström, same algorithm), SDPA (`F.scaled_dot_product_attention`, which dispatches to PyTorch's memory-efficient attention backend). CUDA-event timed, median of 30 fwd+bwd runs after 5 warmups; reduced rep counts at N ≥ 16384 to keep wall-clock manageable.
 
-| N    | FN fwd | FN bwd | SDPA fwd | SDPA bwd |
-|-----:|-------:|-------:|---------:|---------:|
-|  128 |   0.15 |   0.84 |     0.03 |     0.23 |
-|  256 |   0.15 |   0.51 |     0.03 |     0.24 |
-|  512 |   0.16 |   0.50 |     0.04 |     0.20 |
-| 1024 |   0.18 |   0.48 |     0.10 |     0.31 |
-| 2048 |   0.21 |   0.50 |     0.29 |     0.95 |
-| 4096 |   0.29 |   0.57 |     1.07 |     3.51 |
-| 8192 |   0.43 |   0.82 |     4.16 |    13.69 |
+| N      | FN fwd | FN bwd | FN tot | Ref tot | SDPA fwd | SDPA bwd | SDPA tot | FN/Ref | FN/SDPA |
+|-------:|-------:|-------:|-------:|--------:|---------:|---------:|---------:|-------:|--------:|
+|    128 |   0.16 |   0.71 |   0.87 |    4.68 |     0.03 |     0.23 |     0.26 |  5.4x  |   0.30x |
+|    256 |   0.15 |   0.50 |   0.65 |    4.64 |     0.03 |     0.23 |     0.26 |  7.1x  |   0.40x |
+|    512 |   0.16 |   0.49 |   0.65 |    5.30 |     0.04 |     0.19 |     0.23 |  8.2x  |   0.35x |
+|   1024 |   0.18 |   0.48 |   0.66 |    4.78 |     0.10 |     0.31 |     0.41 |  7.2x  |   0.62x |
+|   2048 |   0.21 |   0.50 |   0.72 |    5.68 |     0.29 |     0.96 |     1.24 |  7.9x  |   1.7x  |
+|   4096 |   0.29 |   0.57 |   0.86 |    4.72 |     1.07 |     3.51 |     4.58 |  5.5x  |   5.3x  |
+|   8192 |   0.43 |   0.78 |   1.21 |    4.79 |     4.15 |    13.71 |    17.86 |  4.0x  |  14.8x  |
+|  16384 |   0.82 |   1.36 |   2.18 |    5.08 |    16.95 |    56.97 |    73.92 |  2.3x  |  33.9x  |
+|  32768 |   1.65 |   2.58 |   4.23 |    8.06 |    69.22 |   222.01 |   291.24 |  1.9x  |  68.9x  |
+|  65536 |   4.01 |   4.86 |   8.87 |   10.96 |   278.64 |   948.59 |  1227.23 |  1.2x  |   138x  |
+| 131072 |   7.91 |   9.55 |  17.46 |   21.16 |  1125.10 |  3761.69 |  4886.79 |  1.2x  |   280x  |
+| 262144 |  15.72 |  18.52 |  34.24 |   48.58 |  4599.10 | 15279.00 | 19878.10 |  1.4x  |   581x  |
 
-The forward pass is faster than SDPA at every N. The backward crosses over near N=2048. At N=8192 the total fwd+bwd is roughly 14x faster than SDPA.
+The speedup columns are *base time / FN time*. Values > 1 mean FN is faster; values < 1 mean FN is slower than the base.
+
+Reading the table:
+
+- **At short N (≤ 1024), SDPA is faster than FN.** FN carries fixed overhead from its three softmaxes and the Newton-Schulz pseudoinverse; that overhead dominates while N² is still cheap. If your N stays under ~1 K, use SDPA.
+- **The fwd+bwd crossover is between N = 1024 and N = 2048.** At N = 2048 FN is 1.7x faster than SDPA total. Above that point the gap widens monotonically.
+- **Above N ≈ 8 K the speedup grows roughly linearly with N**, as expected from FN's O(N) compute versus SDPA's O(N²). Doubling N from 16 K to 32 K doubles the speedup (34x → 69x). Same at 32 K → 64 K (69x → 138x), 64 K → 128 K (138x → 280x), and 128 K → 256 K (280x → 581x).
+- **FN beats the pure-PyTorch Nyström reference at every N tested.** The Ref column is the same algorithm in plain PyTorch (cuBLAS matmuls + torch softmax) and shows what's bought by the custom kernels. The FN/Ref ratio shrinks at large N because both methods are O(N) and the gap is the per-call kernel-launch + memory-traffic overhead, not asymptotic complexity.
+- **Neither method OOMs at N = 262144 on 8 GB.** SDPA's wall is wall-clock (~20 s per fwd+bwd at N = 256 K), not memory. PyTorch's SDPA uses memory-efficient attention internally, so it scales linearly in memory; the O(N²) compute is what makes it unusable past 32 K or so in practice.
 
 Reproduce with `python benchmarks/bench_fwd_bwd.py`.
-
-### vs the PyTorch Nystrom reference
-
-Same Nystrom algorithm implemented in pure PyTorch dispatches every matmul through cuBLAS via the `@` operator and uses torch's fused softmax. Total fwd+bwd latency, FP16, niter=6, median of 30 runs:
-
-| Config                          | FN      | Ref     | FN/Ref |
-|---------------------------------|--------:|--------:|-------:|
-| B=1 H=4 N= 4096 D= 64 m=32      |   0.98  |  4.48   | 4.60x  |
-| B=1 H=8 N= 4096 D=128 m=64      |   2.96  |  4.26   | 1.44x  |
-| B=4 H=8 N= 4096 D= 64 m=32      |   3.20  |  5.66   | 1.77x  |
-| B=1 H=4 N= 8192 D= 64 m=32      |   1.40  |  3.94   | 2.81x  |
-| B=1 H=8 N= 8192 D=128 m=64      |   4.34  |  5.84   | 1.34x  |
-| B=4 H=8 N= 8192 D= 64 m=32      |   6.26  |  7.84   | 1.25x  |
-| B=1 H=4 N=16384 D= 64 m=32      |   2.31  |  4.61   | 1.99x  |
-| B=1 H=8 N=16384 D=128 m=64      |   8.61  |  9.00   | 1.05x  |
-| B=1 H=8 N=24576 D=128 m=64      |  10.86  | 11.69   | 1.08x  |
-
-FN beats the reference at every configuration tested, from N=4K to N=24K across batch-head counts of 4 to 32.
 
 ## SMEM sizing and occupancy
 

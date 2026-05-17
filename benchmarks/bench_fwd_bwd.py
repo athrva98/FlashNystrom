@@ -30,11 +30,39 @@ def benchmark_cuda(fn, warmup=10, repeat=50):
     return times[len(times) // 2]   # median
 
 
+def _bench_safe(label, fn, warmup, repeat):
+    """Run benchmark_cuda(fn, ...), returning float or 'OOM' on CUDA OOM.
+
+    Each measurement is wrapped independently so that a method running out
+    of memory at large N does not abort the whole row. After an OOM we
+    empty_cache and reset_peak_memory_stats to give later measurements a
+    clean baseline.
+    """
+    try:
+        return benchmark_cuda(fn, warmup=warmup, repeat=repeat)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        return "OOM"
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            return "OOM"
+        raise
+
+
 def bench_one(N, B=1, H=4, D=64, m=32, niter=6, dtype=torch.float16):
-    q = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
-    k = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
-    v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
-    dout = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+    try:
+        q = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+        k = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+        v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+        dout = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if isinstance(e, RuntimeError) and "out of memory" not in str(e).lower():
+            raise
+        torch.cuda.empty_cache()
+        return {"N": N, "input_oom": True}
 
     # ---- forward ----
     def fwd_fn():
@@ -47,9 +75,12 @@ def bench_one(N, B=1, H=4, D=64, m=32, niter=6, dtype=torch.float16):
         with torch.no_grad():
             return F.scaled_dot_product_attention(q, k, v)
 
-    fwd_fn_t = benchmark_cuda(fwd_fn)
-    fwd_ref_t = benchmark_cuda(fwd_ref)
-    fwd_sdpa_t = benchmark_cuda(fwd_sdpa)
+    # Reduce repeat count at large N to keep the wall-clock manageable.
+    fwd_repeat = 50 if N <= 8192 else 20 if N <= 32768 else 10 if N <= 131072 else 5
+
+    fwd_fn_t   = _bench_safe("FN fwd",   fwd_fn,   warmup=10, repeat=fwd_repeat)
+    fwd_ref_t  = _bench_safe("Ref fwd",  fwd_ref,  warmup=10, repeat=fwd_repeat)
+    fwd_sdpa_t = _bench_safe("SDPA fwd", fwd_sdpa, warmup=10, repeat=fwd_repeat)
 
     # ---- forward + backward ----
     def fwdbwd_fn():
@@ -71,20 +102,30 @@ def bench_one(N, B=1, H=4, D=64, m=32, niter=6, dtype=torch.float16):
         out = F.scaled_dot_product_attention(qq, kk, vv)
         out.backward(dout)
 
-    fb_fn_t = benchmark_cuda(fwdbwd_fn, warmup=5, repeat=30)
-    fb_ref_t = benchmark_cuda(fwdbwd_ref, warmup=5, repeat=30)
-    fb_sdpa_t = benchmark_cuda(fwdbwd_sdpa, warmup=5, repeat=30)
+    fb_repeat = 30 if N <= 8192 else 15 if N <= 32768 else 8 if N <= 131072 else 3
 
-    bwd_fn_t = fb_fn_t - fwd_fn_t
-    bwd_ref_t = fb_ref_t - fwd_ref_t
-    bwd_sdpa_t = fb_sdpa_t - fwd_sdpa_t
+    fb_fn_t   = _bench_safe("FN tot",   fwdbwd_fn,   warmup=5, repeat=fb_repeat)
+    fb_ref_t  = _bench_safe("Ref tot",  fwdbwd_ref,  warmup=5, repeat=fb_repeat)
+    fb_sdpa_t = _bench_safe("SDPA tot", fwdbwd_sdpa, warmup=5, repeat=fb_repeat)
+
+    def _diff(tot, fwd):
+        if tot == "OOM" or fwd == "OOM":
+            return "OOM"
+        return tot - fwd
 
     return {
         "N": N,
-        "fwd_fn_ms":   fwd_fn_t,   "bwd_fn_ms":   bwd_fn_t,   "tot_fn_ms":   fb_fn_t,
-        "fwd_ref_ms":  fwd_ref_t,  "bwd_ref_ms":  bwd_ref_t,  "tot_ref_ms":  fb_ref_t,
-        "fwd_sdpa_ms": fwd_sdpa_t, "bwd_sdpa_ms": bwd_sdpa_t, "tot_sdpa_ms": fb_sdpa_t,
+        "input_oom": False,
+        "fwd_fn_ms":   fwd_fn_t,   "bwd_fn_ms":   _diff(fb_fn_t,   fwd_fn_t),   "tot_fn_ms":   fb_fn_t,
+        "fwd_ref_ms":  fwd_ref_t,  "bwd_ref_ms":  _diff(fb_ref_t,  fwd_ref_t),  "tot_ref_ms":  fb_ref_t,
+        "fwd_sdpa_ms": fwd_sdpa_t, "bwd_sdpa_ms": _diff(fb_sdpa_t, fwd_sdpa_t), "tot_sdpa_ms": fb_sdpa_t,
     }
+
+
+def _fmt(v, width, prec=2):
+    if v == "OOM":
+        return f"{'OOM':>{width}}"
+    return f"{v:>{width}.{prec}f}"
 
 
 def main():
@@ -93,26 +134,26 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print()
 
-    seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192]
+    # Stop at 262144 (256K). Neither method OOMs at this size on an 8 GB
+    # consumer card; SDPA hits a practical wall via wall-clock long before
+    # memory does (~20 seconds per fwd+bwd at N=262144 on a 5060). If you
+    # want OOM-finding, extend this list and accept the time cost.
+    seq_lengths = [128, 256, 512, 1024, 2048, 4096, 8192,
+                    16384, 32768, 65536, 131072, 262144]
 
-    print(f"{'N':>6} | {'FN fwd':>8} {'FN bwd':>8} {'FN tot':>8} | "
+    print(f"{'N':>7} | {'FN fwd':>8} {'FN bwd':>8} {'FN tot':>8} | "
           f"{'Ref fwd':>8} {'Ref bwd':>8} {'Ref tot':>8} | "
-          f"{'SDPA fwd':>9} {'SDPA bwd':>9} {'SDPA tot':>9} | "
-          f"{'FN/Ref':>7} {'FN/SDPA':>8}")
-    print("-" * 130)
+          f"{'SDPA fwd':>9} {'SDPA bwd':>9} {'SDPA tot':>9}")
+    print("-" * 122)
     for N in seq_lengths:
-        try:
-            r = bench_one(N)
-        except RuntimeError as e:
-            print(f"{N:>6} | OOM or error: {e}")
-            continue
-        fn_ref_ratio = r["tot_fn_ms"] / r["tot_ref_ms"]
-        fn_sdpa_ratio = r["tot_fn_ms"] / r["tot_sdpa_ms"]
-        print(f"{r['N']:>6} | "
-              f"{r['fwd_fn_ms']:>8.2f} {r['bwd_fn_ms']:>8.2f} {r['tot_fn_ms']:>8.2f} | "
-              f"{r['fwd_ref_ms']:>8.2f} {r['bwd_ref_ms']:>8.2f} {r['tot_ref_ms']:>8.2f} | "
-              f"{r['fwd_sdpa_ms']:>9.2f} {r['bwd_sdpa_ms']:>9.2f} {r['tot_sdpa_ms']:>9.2f} | "
-              f"{fn_ref_ratio:>6.2f}x {fn_sdpa_ratio:>7.2f}x")
+        r = bench_one(N)
+        if r.get("input_oom"):
+            print(f"{N:>7} | OOM allocating Q/K/V inputs; stopping.")
+            break
+        print(f"{r['N']:>7} | "
+              f"{_fmt(r['fwd_fn_ms'],   8)} {_fmt(r['bwd_fn_ms'],   8)} {_fmt(r['tot_fn_ms'],   8)} | "
+              f"{_fmt(r['fwd_ref_ms'],  8)} {_fmt(r['bwd_ref_ms'],  8)} {_fmt(r['tot_ref_ms'],  8)} | "
+              f"{_fmt(r['fwd_sdpa_ms'], 9)} {_fmt(r['bwd_sdpa_ms'], 9)} {_fmt(r['tot_sdpa_ms'], 9)}")
         torch.cuda.empty_cache()
 
 
