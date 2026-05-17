@@ -80,29 +80,30 @@ out = flash_nystrom_attention(q, k, v, num_landmarks=64, newton_iter=6)
 
 Forward and backward latency in milliseconds on an RTX 5060 Laptop (Blackwell consumer, 8 GB VRAM, sm_120), FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6. Three implementations: FN (this repo), Ref (pure-PyTorch Nyström, same algorithm), SDPA (`F.scaled_dot_product_attention`, which dispatches to PyTorch's memory-efficient attention backend). CUDA-event timed, median of 30 fwd+bwd runs after 5 warmups; reduced rep counts at N ≥ 16384 to keep wall-clock manageable.
 
-| N      | FN fwd | FN bwd | FN tot | Ref tot | SDPA fwd | SDPA bwd | SDPA tot | FN/Ref | FN/SDPA |
-|-------:|-------:|-------:|-------:|--------:|---------:|---------:|---------:|-------:|--------:|
-|    128 |   0.16 |   0.71 |   0.87 |    4.68 |     0.03 |     0.23 |     0.26 |  5.4x  |   0.30x |
-|    256 |   0.15 |   0.50 |   0.65 |    4.64 |     0.03 |     0.23 |     0.26 |  7.1x  |   0.40x |
-|    512 |   0.16 |   0.49 |   0.65 |    5.30 |     0.04 |     0.19 |     0.23 |  8.2x  |   0.35x |
-|   1024 |   0.18 |   0.48 |   0.66 |    4.78 |     0.10 |     0.31 |     0.41 |  7.2x  |   0.62x |
-|   2048 |   0.21 |   0.50 |   0.72 |    5.68 |     0.29 |     0.96 |     1.24 |  7.9x  |   1.7x  |
-|   4096 |   0.29 |   0.57 |   0.86 |    4.72 |     1.07 |     3.51 |     4.58 |  5.5x  |   5.3x  |
-|   8192 |   0.43 |   0.78 |   1.21 |    4.79 |     4.15 |    13.71 |    17.86 |  4.0x  |  14.8x  |
-|  16384 |   0.82 |   1.36 |   2.18 |    5.08 |    16.95 |    56.97 |    73.92 |  2.3x  |  33.9x  |
-|  32768 |   1.65 |   2.58 |   4.23 |    8.06 |    69.22 |   222.01 |   291.24 |  1.9x  |  68.9x  |
-|  65536 |   4.01 |   4.86 |   8.87 |   10.96 |   278.64 |   948.59 |  1227.23 |  1.2x  |   138x  |
-| 131072 |   7.91 |   9.55 |  17.46 |   21.16 |  1125.10 |  3761.69 |  4886.79 |  1.2x  |   280x  |
-| 262144 |  15.72 |  18.52 |  34.24 |   48.58 |  4599.10 | 15279.00 | 19878.10 |  1.4x  |   581x  |
+| N      | FN fwd | FN bwd | FN tot | Ref tot | SDPA fwd | SDPA bwd | SDPA tot | FN/Ref | FN/SDPA | SDPA − FN (ms) |
+|-------:|-------:|-------:|-------:|--------:|---------:|---------:|---------:|-------:|--------:|---------------:|
+|    128 |   0.16 |   0.71 |   0.87 |    4.68 |     0.03 |     0.23 |     0.26 |  5.4x  |   0.30x |          −0.61 |
+|    256 |   0.15 |   0.50 |   0.65 |    4.64 |     0.03 |     0.23 |     0.26 |  7.1x  |   0.40x |          −0.39 |
+|    512 |   0.16 |   0.49 |   0.65 |    5.30 |     0.04 |     0.19 |     0.23 |  8.2x  |   0.35x |          −0.42 |
+|   1024 |   0.18 |   0.48 |   0.66 |    4.78 |     0.10 |     0.31 |     0.41 |  7.2x  |   0.62x |          −0.25 |
+|   2048 |   0.21 |   0.50 |   0.72 |    5.68 |     0.29 |     0.96 |     1.24 |  7.9x  |   1.7x  |          +0.52 |
+|   4096 |   0.29 |   0.57 |   0.86 |    4.72 |     1.07 |     3.51 |     4.58 |  5.5x  |   5.3x  |          +3.72 |
+|   8192 |   0.43 |   0.78 |   1.21 |    4.79 |     4.15 |    13.71 |    17.86 |  4.0x  |  14.8x  |         +16.65 |
+|  16384 |   0.82 |   1.36 |   2.18 |    5.08 |    16.95 |    56.97 |    73.92 |  2.3x  |  33.9x  |         +71.74 |
+|  32768 |   1.65 |   2.58 |   4.23 |    8.06 |    69.22 |   222.01 |   291.24 |  1.9x  |  68.9x  |           +287 |
+|  65536 |   4.01 |   4.86 |   8.87 |   10.96 |   278.64 |   948.59 |  1227.23 |  1.2x  |   138x  |         +1,218 |
+| 131072 |   7.91 |   9.55 |  17.46 |   21.16 |  1125.10 |  3761.69 |  4886.79 |  1.2x  |   280x  |         +4,869 |
+| 262144 |  15.72 |  18.52 |  34.24 |   48.58 |  4599.10 | 15279.00 | 19878.10 |  1.4x  |   581x  |        +19,844 |
 
-The speedup columns are *base time / FN time*. Values > 1 mean FN is faster; values < 1 mean FN is slower than the base.
+The speedup columns are *base time / FN time*. Values > 1 mean FN is faster; values < 1 mean FN is slower than the base. The last column is the absolute time difference per fwd+bwd call (positive means FN is faster).
 
 Reading the table:
 
-- **At short N (≤ 1024), SDPA is faster than FN.** FN carries fixed overhead from its three softmaxes and the Newton-Schulz pseudoinverse; that overhead dominates while N² is still cheap. If your N stays under ~1 K, use SDPA.
+- **The ratio compresses both ends. The absolute difference does not.** At N ≤ 1024 where SDPA wins, the loss is between 0.25 ms and 0.61 ms per call. That is below the noise floor of a typical training loop and well below any optimizer step. At N = 262144 where FN wins, the save is 19.8 seconds per fwd+bwd call. The ratio and the absolute column tell the same story but the absolute column is the one that matters for "does this make my training run actually finish."
+- **At short N (≤ 1024), SDPA is faster than FN.** FN carries fixed overhead from its three softmaxes and the Newton-Schulz pseudoinverse. That overhead dominates while N² is still cheap. If your N stays under ~1 K, use SDPA.
 - **The fwd+bwd crossover is between N = 1024 and N = 2048.** At N = 2048 FN is 1.7x faster than SDPA total. Above that point the gap widens monotonically.
-- **Above N ≈ 8 K the speedup grows roughly linearly with N**, as expected from FN's O(N) compute versus SDPA's O(N²). Doubling N from 16 K to 32 K doubles the speedup (34x → 69x). Same at 32 K → 64 K (69x → 138x), 64 K → 128 K (138x → 280x), and 128 K → 256 K (280x → 581x).
-- **FN beats the pure-PyTorch Nyström reference at every N tested.** The Ref column is the same algorithm in plain PyTorch (cuBLAS matmuls + torch softmax) and shows what's bought by the custom kernels. The FN/Ref ratio shrinks at large N because both methods are O(N) and the gap is the per-call kernel-launch + memory-traffic overhead, not asymptotic complexity.
+- **Above N ≈ 8 K the speedup grows roughly linearly with N**, as expected from FN's O(N) compute versus SDPA's O(N²). Doubling N from 16 K to 32 K doubles the speedup (34x to 69x). Same at 32 K to 64 K (69x to 138x), 64 K to 128 K (138x to 280x), and 128 K to 256 K (280x to 581x).
+- **FN beats the pure-PyTorch Nyström reference at every N tested.** The Ref column is the same algorithm in plain PyTorch (cuBLAS matmuls + torch softmax) and shows what is bought by the custom kernels. The FN/Ref ratio shrinks at large N because both methods are O(N); the gap is per-call kernel-launch and memory-traffic overhead, not asymptotic complexity.
 - **Neither method OOMs at N = 262144 on 8 GB.** SDPA's wall is wall-clock (~20 s per fwd+bwd at N = 256 K), not memory. PyTorch's SDPA uses memory-efficient attention internally, so it scales linearly in memory; the O(N²) compute is what makes it unusable past 32 K or so in practice.
 
 Reproduce with `python benchmarks/bench_fwd_bwd.py`.
