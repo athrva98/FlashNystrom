@@ -413,8 +413,9 @@ kernel3_bwd_tc(
     __syncthreads();
 
     // ======== Phase 7: GEMM_dV — dV += P^T @ dO3 (accumulate to existing) ========
-    // Must accumulate (not overwrite): dconv_bwd writes its dV contribution
-    // before this kernel runs, and we must not clobber it.
+    // dV is zero-initialized by the bwd caller; this is the only writer.
+    // The += form (rather than =) keeps the kernel composable with any
+    // future dV contribution that runs before this one.
     {
         auto acc_dv = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});
         clear(acc_dv);

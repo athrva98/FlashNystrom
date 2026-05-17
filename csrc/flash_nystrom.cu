@@ -28,9 +28,7 @@ std::vector<torch::Tensor> nystrom_fwd(
     torch::Tensor k,
     torch::Tensor v,
     int64_t num_landmarks,
-    int64_t newton_iter,
-    int64_t conv_kernel_size,
-    c10::optional<torch::Tensor> conv_weight
+    int64_t newton_iter
 ) {
     // Input validation
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
@@ -63,22 +61,6 @@ std::vector<torch::Tensor> nystrom_fwd(
     TORCH_CHECK(D == 64 || D == 128,
                 "head_dim must be 64 or 128 (other values not yet supported)");
     TORCH_CHECK(newton_iter >= 1 && newton_iter <= 20, "newton_iter must be in [1, 20]");
-    TORCH_CHECK(conv_kernel_size >= 0, "conv_kernel_size must be non-negative");
-    if (conv_kernel_size > 0) {
-        TORCH_CHECK(conv_kernel_size % 2 == 1, "conv_kernel_size must be odd");
-    }
-
-    if (conv_weight.has_value()) {
-        auto cw = conv_weight.value();
-        CHECK_DEVICE(cw); CHECK_CONTIGUOUS(cw);
-        TORCH_CHECK(cw.dtype() == dtype, "conv_weight dtype must match q/k/v");
-        TORCH_CHECK(cw.dim() == 2, "conv_weight must be 2D (H, kernel_size)");
-        TORCH_CHECK(cw.size(0) == H && cw.size(1) == conv_kernel_size,
-                     "conv_weight shape must be (", H, ", ", conv_kernel_size, ")");
-    } else {
-        TORCH_CHECK(conv_kernel_size == 0,
-                     "conv_kernel_size > 0 but conv_weight not provided");
-    }
 
     // FP32 scalar kernels need 4 bytes/elem vs 2 for FP16/BF16.
     // At D=128, m=64: SMEM = ~144KB which exceeds all GPU limits.
@@ -118,7 +100,6 @@ std::vector<torch::Tensor> nystrom_fwd(
     params.head_dim = static_cast<int>(D);
     params.num_landmarks = static_cast<int>(m);
     params.newton_iter = static_cast<int>(newton_iter);
-    params.conv_kernel_size = static_cast<int>(conv_kernel_size);
     params.is_bf16 = (dtype == at::ScalarType::BFloat16);
 
     params.q_ptr = q_s.data_ptr();
@@ -135,7 +116,6 @@ std::vector<torch::Tensor> nystrom_fwd(
     params.softmax3_lse_ptr = softmax3_lse.data_ptr<float>();
     params.ns_iterates_ptr = ns_iterates.data_ptr<float>();
     params.k2_softmax_ptr  = k2_softmax.data_ptr<float>();
-    params.conv_weight_ptr = conv_weight.has_value() ? conv_weight.value().data_ptr() : nullptr;
     params.stream = stream;
 
     if (dtype == at::ScalarType::Float) {
@@ -161,8 +141,7 @@ std::vector<torch::Tensor> nystrom_bwd(
     torch::Tensor ns_iterates, torch::Tensor k2_softmax,
     torch::Tensor b_saved,
     torch::Tensor v, torch::Tensor output,
-    int64_t num_landmarks, int64_t newton_iter, int64_t conv_kernel_size,
-    c10::optional<torch::Tensor> conv_weight,
+    int64_t num_landmarks, int64_t newton_iter,
     bool fast_dk2inv
 ) {
     // ------------------------------------------------------------------
@@ -228,15 +207,6 @@ std::vector<torch::Tensor> nystrom_bwd(
     _ck(softmax3_lse,  "softmax3_lse",  {B, H, m},                       at::ScalarType::Float);
     _ck(ns_iterates,   "ns_iterates",   {B, H, newton_iter + 1, m, m},   at::ScalarType::Float);
 
-    if (conv_weight.has_value() && conv_kernel_size > 0) {
-        TORCH_CHECK(conv_kernel_size % 2 == 1,
-                    "conv_kernel_size must be odd, got ", conv_kernel_size);
-        _ck(conv_weight.value(), "conv_weight", {H, conv_kernel_size}, dtype);
-    } else {
-        TORCH_CHECK(conv_kernel_size == 0,
-                    "conv_kernel_size > 0 but conv_weight not provided");
-    }
-
     const at::cuda::CUDAGuard device_guard(dO.device());
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
@@ -270,12 +240,6 @@ std::vector<torch::Tensor> nystrom_bwd(
     // FP32 for the FP32 scalar path.
     auto dO3 = torch::empty({B, H, m, D}, opts);
 
-    // dconv_weight (FP32 accumulator, converted back to dtype at the end)
-    torch::Tensor dconv_weight;
-    if (conv_weight.has_value() && conv_kernel_size > 0) {
-        dconv_weight = torch::zeros({H, conv_kernel_size}, opts_f32);
-    }
-
     NystromBwdParams params = {};
     params.batch_size = static_cast<int>(B);
     params.num_heads = static_cast<int>(H);
@@ -283,7 +247,6 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.head_dim = static_cast<int>(D);
     params.num_landmarks = static_cast<int>(m);
     params.newton_iter = static_cast<int>(newton_iter);
-    params.conv_kernel_size = static_cast<int>(conv_kernel_size);
     params.is_bf16 = (dtype == at::ScalarType::BFloat16);
     params.fast_dk2inv = fast_dk2inv;
 
@@ -301,14 +264,11 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.lse3_ptr = softmax3_lse.data_ptr<float>();
     params.ns_iterates_ptr = ns_iterates.data_ptr<float>();
     params.k2_softmax_ptr  = k2_softmax.data_ptr<float>();
-    params.conv_weight_ptr = conv_weight.has_value() ? conv_weight.value().data_ptr() : nullptr;
 
     params.dO_ptr = dO.data_ptr();
     params.dQ_ptr = dQ.data_ptr();
     params.dK_ptr = dK.data_ptr();
     params.dV_ptr = dV.data_ptr();
-    params.dconv_weight_ptr = (conv_weight.has_value() && conv_kernel_size > 0) ?
-        dconv_weight.data_ptr<float>() : nullptr;
 
     params.dstep2_ptr = dstep2.data_ptr<float>();
     params.dQ_tilde_ptr = dQ_tilde.data_ptr<float>();
@@ -327,13 +287,7 @@ std::vector<torch::Tensor> nystrom_bwd(
         run_nystrom_bwd(params);
     }
 
-    // Convert dconv_weight from FP32 to output dtype
-    torch::Tensor dconv_out;
-    if (conv_weight.has_value() && conv_kernel_size > 0) {
-        dconv_out = dconv_weight.to(dtype);
-    }
-
-    return {dQ, dK, dV, dconv_out};
+    return {dQ, dK, dV};
 }
 
 // ===== Debug entry points for kernel2_inv backward isolation tests =====
@@ -532,12 +486,12 @@ std::vector<torch::Tensor> debug_compute_dk2inv(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &flash_nystrom::nystrom_fwd,
-          "FlashNystrom forward (CUDA)",
+          "FlashNystrom forward (CUDA). The depthwise-conv residual is computed "
+          "at the Python level via cuDNN (F.conv1d) and is not part of this entry "
+          "point. See flash_nystrom.flash_nystrom_attention.",
           py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("num_landmarks") = 64,
-          py::arg("newton_iter") = 6,
-          py::arg("conv_kernel_size") = 0,
-          py::arg("conv_weight") = c10::nullopt);
+          py::arg("newton_iter") = 6);
     m.def("backward", &flash_nystrom::nystrom_bwd,
           "FlashNystrom backward (CUDA). Pass b_saved = softmax(Q_tilde @ K^T) "
           "@ V from the forward to skip the N-walk in compute_dk2inv. "
@@ -550,8 +504,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("ns_iterates"), py::arg("k2_softmax"),
           py::arg("b_saved"),
           py::arg("v"), py::arg("output"),
-          py::arg("num_landmarks"), py::arg("newton_iter"), py::arg("conv_kernel_size"),
-          py::arg("conv_weight"),
+          py::arg("num_landmarks"), py::arg("newton_iter"),
           py::arg("fast_dk2inv") = true);
     m.def("debug_ns_bwd_step", &flash_nystrom::debug_ns_bwd_step,
           "Debug: single NS backward iteration (returns dZ_j, dK2_contrib).",

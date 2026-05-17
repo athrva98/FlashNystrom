@@ -39,7 +39,7 @@ class FNFwdTorchBwdFunction(torch.autograd.Function):
         ctx.m, ctx.niter = m, niter
         # FN forward (no autograd graph attached; we'll handle backward manually)
         with torch.no_grad():
-            results = _C.forward(q, k, v, m, niter, 0, None)
+            results = _C.forward(q, k, v, m, niter)
         return results[0]  # output
 
     @staticmethod
@@ -75,7 +75,7 @@ class TorchFwdFNBwdFunction(torch.autograd.Function):
 
         # 2. FN forward to obtain the saved tensors needed by FN backward.
         with torch.no_grad():
-            results = _C.forward(q, k, v, m, niter, 0, None)
+            results = _C.forward(q, k, v, m, niter)
             # [output, q_s, k_s, q_tilde, k_tilde, k2inv, step2,
             #  lse1, lse2, lse3, ns_iterates, k2_softmax]
             fn_out = results[0]
@@ -90,15 +90,16 @@ class TorchFwdFNBwdFunction(torch.autograd.Function):
         q_s, k_s, q_tilde, k_tilde, k2_inv, step2 = saved[0:6]
         lse1, lse2, lse3 = saved[6:9]
         ns_iterates, k2_softmax = saved[9], saved[10]
-        v, fn_out = saved[11], saved[12]
-        results = _C.backward(
+        b_saved = saved[11]
+        v, fn_out = saved[12], saved[13]
+        dQ, dK, dV = _C.backward(
             dout.contiguous(),
             q_s, k_s, q_tilde, k_tilde, k2_inv, step2,
             lse1, lse2, lse3, ns_iterates, k2_softmax,
+            b_saved,
             v, fn_out,
-            ctx.m, ctx.niter, 0, None,
+            ctx.m, ctx.niter, False,
         )
-        dQ, dK, dV = results[0], results[1], results[2]
         return dQ, dK, dV, None, None
 
 
@@ -161,7 +162,7 @@ class FullFNAttention(_NystromBase):
     """Full FlashNystrom (CUDA fwd + CUDA bwd)."""
     def forward(self, x):
         q, k, v, B, N = self._qkv(x)
-        out = FlashNystromFunction.apply(q, k, v, None, self.m, self.niter, 0, False)
+        out = FlashNystromFunction.apply(q, k, v, self.m, self.niter, False)
         return self._project_out(out, B, N)
 
 

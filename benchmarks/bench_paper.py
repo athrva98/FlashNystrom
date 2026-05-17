@@ -91,14 +91,14 @@ def section_latency(B, H, D, m, dtype, seq_lengths):
 
         # FlashNystrom forward
         fn_fwd = benchmark_cuda(
-            lambda: FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False))
+            lambda: FlashNystromFunction.apply(q, k, v, m, 6, False))
 
         # FlashNystrom fwd+bwd
         def fn_fwd_bwd():
             qq = q.detach().requires_grad_(True)
             kk = k.detach().requires_grad_(True)
             vv = v.detach().requires_grad_(True)
-            FlashNystromFunction.apply(qq, kk, vv, None, m, 6, 0, False).sum().backward()
+            FlashNystromFunction.apply(qq, kk, vv, m, 6, False).sum().backward()
 
         fn_fb = benchmark_cuda(fn_fwd_bwd, warmup=5, repeat=30)
         fn_bwd = fn_fb["median_ms"] - fn_fwd["median_ms"]
@@ -170,7 +170,7 @@ def section_memory(B, H, D, m, dtype, seq_lengths):
             q = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
             k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
             v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
-            FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+            FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
         fn_mem = peak_memory_mb(fn_run, warmup=2)
 
         # SDPA
@@ -227,7 +227,7 @@ def section_correctness(D_vals, dtype):
             k = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
             v = torch.randn(B, H, N, D, dtype=dtype, device="cuda", requires_grad=True)
 
-            FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+            FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
             q2 = q.detach().float().cpu().requires_grad_(True)
             k2 = k.detach().float().cpu().requires_grad_(True)
@@ -283,7 +283,7 @@ def section_cuda_graphs(B, H, D, m, dtype, seq_lengths):
             for p in (q, k, v):
                 if p.grad is not None:
                     p.grad = None
-            out = FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False)
+            out = FlashNystromFunction.apply(q, k, v, m, 6, False)
             out.backward(grad_out)
 
         # Warmup on the side stream as required by torch.cuda.graph()

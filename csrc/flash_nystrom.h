@@ -20,13 +20,12 @@ namespace flash_nystrom {
 
 struct NystromParams {
     int batch_size, num_heads, seq_len, head_dim, num_landmarks;
-    int newton_iter, conv_kernel_size;
+    int newton_iter;
     bool is_bf16;
 
     void* __restrict__ q_ptr;             // (B, H, N, D)
     void* __restrict__ k_ptr;             // (B, H, N, D)
     void* __restrict__ v_ptr;             // (B, H, N, D)
-    void* __restrict__ conv_weight_ptr;   // (H, ks) or nullptr
     void* __restrict__ o_ptr;             // (B, H, N, D)
 
     void* __restrict__ q_tilde_ptr;       // (B, H, m, D)
@@ -61,7 +60,7 @@ struct NystromParams {
 
 struct NystromBwdParams {
     int batch_size, num_heads, seq_len, head_dim, num_landmarks;
-    int newton_iter, conv_kernel_size;
+    int newton_iter;
     bool is_bf16;
     // Opt-in tensor-core path for compute_dk2inv. Default false → FP32 scalar.
     // True only for FP16/BF16 input dtype; trades a small precision drop for
@@ -86,7 +85,6 @@ struct NystromBwdParams {
     const float* __restrict__ lse3_ptr;      // (B,H,m)
     const float* __restrict__ ns_iterates_ptr; // (B,H,newton_iter+1,m,m) FP32 — Z_0..Z_N
     const float* __restrict__ k2_softmax_ptr;  // (B,H,m,m) FP32 — softmax K2 (saved from fwd)
-    const void* __restrict__ conv_weight_ptr;  // (H,ks) or nullptr
 
     // Gradient input
     const void* __restrict__ dO_ptr;         // (B,H,N,D)
@@ -95,7 +93,6 @@ struct NystromBwdParams {
     void* __restrict__ dQ_ptr;               // (B,H,N,D) zero-initialized
     void* __restrict__ dK_ptr;               // (B,H,N,D) zero-initialized
     void* __restrict__ dV_ptr;               // (B,H,N,D) zero-initialized
-    void* __restrict__ dconv_weight_ptr;     // (H,ks) or nullptr
 
     // Intermediate FP32 accumulators (zero-initialized by caller)
     float* __restrict__ dstep2_ptr;          // (B,H,m,D) FP32

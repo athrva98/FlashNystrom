@@ -43,7 +43,7 @@ def bench_nystrom_bwd(B, H, N, D, m, dtype):
 
     # benchmark forward
     def fwd():
-        return FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False)
+        return FlashNystromFunction.apply(q, k, v, m, 6, False)
 
     fwd_result = benchmark_fn(fwd)
 
@@ -53,7 +53,7 @@ def bench_nystrom_bwd(B, H, N, D, m, dtype):
             q.detach().requires_grad_(True),
             k.detach().requires_grad_(True),
             v.detach().requires_grad_(True),
-            None, m, 6, 0, False
+            m, 6, False,
         )
         out.sum().backward()
 

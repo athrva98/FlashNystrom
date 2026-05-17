@@ -7,6 +7,12 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `tests/test_ns_bwd_graph.py` — isolation tests for the production
+  cuBLAS + CUDA-graph NS backward (`launch_kernel2_inv_bwd`). Pins
+  graph-replay correctness, shape-change cache invalidation,
+  `reset_caches()` behaviour, and a memory-leak smoke test. Previously
+  this code path was only reachable through the end-to-end autograd
+  pipeline, which made bisecting a graph-capture regression painful.
 - `flash_nystrom._C.reset_caches()` — frees the thread-local NS-backward
   graph caches and workspaces across all dtypes. Useful between training
   runs of different shapes, or before measuring residual GPU memory.
@@ -19,6 +25,19 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Actions sdist workflow (`sdist.yml`, CPU-only, always-on) and
   GPU test workflow scaffold (`tests-gpu.yml`, self-hosted runner, gated
   by `if: false` until a runner is attached).
+
+### Removed
+- The custom CUDA depthwise-conv kernels (`csrc/kernels/dconv_residual.cuh`
+  and `csrc/kernels/backward/dconv_residual_bwd.cuh`) and all conv plumbing
+  through the C extension boundary. The conv residual is now exclusively
+  computed at the Python level via `F.conv1d` (cuDNN) inside
+  `flash_nystrom_attention`; the bypassed C++ path was bit-rotting unused
+  code reachable only by passing `conv_weight=` directly to `_C.forward`.
+- Removed conv arguments from `_C.forward`, `_C.backward`,
+  `NystromParams`, `NystromBwdParams`, and `FlashNystromFunction.{forward,
+  backward}`. The public Python API (`flash_nystrom_attention` keyword
+  args `conv_weight=` and `conv_kernel_size=`) is unchanged — those are
+  applied via cuDNN.
 
 ### Changed
 - CUDA errors and cuBLAS errors now throw `std::runtime_error` instead of

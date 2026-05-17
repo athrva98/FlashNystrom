@@ -90,7 +90,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        out = FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False)
+        out = FlashNystromFunction.apply(q, k, v, m, 6, False)
         out.sum().backward()
 
         for name, p in [("q", q), ("k", k), ("v", v)]:
@@ -112,7 +112,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda")
         v_cuda = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        out = FlashNystromFunction.apply(q, k, v_cuda, None, m, 6, 0, False)
+        out = FlashNystromFunction.apply(q, k, v_cuda, m, 6, False)
         out.sum().backward()
 
         v_ref = v_cuda.detach().float().cpu().requires_grad_(True)
@@ -139,7 +139,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().float().cpu().requires_grad_(True)
         k2 = k.detach().float().cpu().requires_grad_(True)
@@ -170,7 +170,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
         for name, p in [("q", q), ("k", k), ("v", v)]:
             assert not torch.isnan(p.grad).any(), f"{name}.grad has NaN"
             assert p.grad.abs().max() > 0, f"{name}.grad is all zeros"
@@ -188,7 +188,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().cpu().requires_grad_(True)
         k2 = k.detach().cpu().requires_grad_(True)
@@ -216,7 +216,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
         for name, p in [("q", q), ("k", k), ("v", v)]:
             assert not torch.isnan(p.grad).any(), f"{name}.grad has NaN at N=300"
 
@@ -233,7 +233,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
         for name, p in [("q", q), ("k", k), ("v", v)]:
             assert not torch.isnan(p.grad).any(), f"{name}.grad has NaN for batch=4"
             assert p.grad.abs().max() > 0, f"{name}.grad is all zeros for batch=4"
@@ -251,7 +251,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().float().cpu().requires_grad_(True)
         k2 = k.detach().float().cpu().requires_grad_(True)
@@ -284,7 +284,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().float().cpu().requires_grad_(True)
         k2 = k.detach().float().cpu().requires_grad_(True)
@@ -312,7 +312,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().float().cpu().requires_grad_(True)
         k2 = k.detach().float().cpu().requires_grad_(True)
@@ -343,7 +343,7 @@ class TestCUDABackward:
         v = torch.randn(B, H, N, D, dtype=torch.float32, device="cuda", requires_grad=True)
 
         with pytest.raises(RuntimeError, match="FP32.*D=128 is not supported"):
-            FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False)
+            FlashNystromFunction.apply(q, k, v, m, 6, False)
 
     # -- partial tile edge cases --
 
@@ -360,7 +360,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().float().cpu().requires_grad_(True)
         k2 = k.detach().float().cpu().requires_grad_(True)
@@ -386,7 +386,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
         for name, p in [("q", q), ("k", k), ("v", v)]:
             assert not torch.isnan(p.grad).any(), f"{name}.grad has NaN at N=63"
             assert p.grad.abs().max() > 0, f"{name}.grad is all zeros at N=63"
@@ -404,7 +404,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().float().cpu().requires_grad_(True)
         k2 = k.detach().float().cpu().requires_grad_(True)
@@ -432,7 +432,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().float().cpu().requires_grad_(True)
         k2 = k.detach().float().cpu().requires_grad_(True)
@@ -465,7 +465,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().float().cpu().requires_grad_(True)
         k2 = k.detach().float().cpu().requires_grad_(True)
@@ -493,7 +493,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
         for name, p in [("q", q), ("k", k), ("v", v)]:
             assert not torch.isnan(p.grad).any(), f"{name}.grad NaN at m=16 D=128"
             assert p.grad.abs().max() > 0, f"{name}.grad zeros at m=16 D=128"
@@ -522,8 +522,8 @@ class TestCUDABackward:
         k2 = k1.detach().clone().requires_grad_(True)
         v2 = v1.detach().clone().requires_grad_(True)
 
-        FlashNystromFunction.apply(q1, k1, v1, None, m, 6, 0, False).sum().backward()
-        FlashNystromFunction.apply(q2, k2, v2, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q1, k1, v1, m, 6, False).sum().backward()
+        FlashNystromFunction.apply(q2, k2, v2, m, 6, False).sum().backward()
 
         # dV should be bit-exact (no atomicAdd in V path)
         assert torch.equal(v1.grad, v2.grad), \
@@ -544,7 +544,7 @@ class TestCUDABackward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda", requires_grad=True)
 
-        FlashNystromFunction.apply(q, k, v, None, m, 6, 0, False).sum().backward()
+        FlashNystromFunction.apply(q, k, v, m, 6, False).sum().backward()
 
         q2 = q.detach().float().cpu().requires_grad_(True)
         k2 = k.detach().float().cpu().requires_grad_(True)

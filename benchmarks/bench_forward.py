@@ -40,8 +40,8 @@ def bench_nystrom_cuda(B, H, N, D, m, dtype):
     k = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
     v = torch.randn(B, H, N, D, dtype=dtype, device="cuda")
     # Warmup
-    _C.forward(q, k, v, m, 6, 0, None)
-    return benchmark_fn(lambda: _C.forward(q, k, v, m, 6, 0, None))
+    _C.forward(q, k, v, m, 6)
+    return benchmark_fn(lambda: _C.forward(q, k, v, m, 6))
 
 
 def bench_nystrom_ref(B, H, N, D, m, dtype):

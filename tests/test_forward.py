@@ -127,7 +127,7 @@ class TestCUDAForward:
 
         try:
             from flash_nystrom._C import forward as cuda_forward
-            results = cuda_forward(q, k, v, m, 6, 0, None)
+            results = cuda_forward(q, k, v, m, 6)
             cuda_out = results[0]
             assert not torch.isnan(cuda_out).any(), "CUDA output contains NaN"
             # K2_inv (exact LU) can have elements up to ~1000, so element-level
@@ -183,7 +183,7 @@ class TestCUDAForward:
         v = torch.randn(1, 2, 256, 128, dtype=torch.float32, device="cuda")
 
         with pytest.raises(RuntimeError, match="FP32 with D=128 is not supported"):
-            cuda_forward(q, k, v, 64, 6, 0, None)
+            cuda_forward(q, k, v, 64, 6)
 
     # -- partial tile edge cases --
 
@@ -232,7 +232,7 @@ class TestCUDAForward:
         k = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
         v = torch.randn(B, H, N, D, dtype=torch.bfloat16, device="cuda")
 
-        cuda_out = cuda_forward(q, k, v, m, 6, 0, None)[0]
+        cuda_out = cuda_forward(q, k, v, m, 6)[0]
         ref = nystrom_attention_reference_simple(
             q.float().cpu(), k.float().cpu(), v.float().cpu(), m)
 
@@ -256,8 +256,8 @@ class TestCUDAForward:
         k = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda")
         v = torch.randn(B, H, N, D, dtype=torch.float16, device="cuda")
 
-        out1 = cuda_forward(q, k, v, m, 6, 0, None)[0]
-        out2 = cuda_forward(q, k, v, m, 6, 0, None)[0]
+        out1 = cuda_forward(q, k, v, m, 6)[0]
+        out2 = cuda_forward(q, k, v, m, 6)[0]
         assert torch.equal(out1, out2), f"Forward not deterministic, max diff: {(out1-out2).abs().max().item()}"
 
     # -- multi-batch at D=128 --

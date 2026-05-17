@@ -14,7 +14,6 @@
 #include "kernels/kernel3_scalar.cuh"        // Scalar fallback (FP32)
 #include "kernels/kernel1_output_fused.cuh"  // Tensor-core version (FP16/BF16)
 #include "kernels/kernel1_scalar.cuh"        // Scalar fallback (FP32)
-#include "kernels/dconv_residual.cuh"
 
 // Backward kernels
 #include "kernels/backward/precompute_di.cuh"
@@ -24,7 +23,6 @@
 #include "kernels/backward/compute_dk2inv.cuh"
 #include "kernels/backward/kernel2_inv_bwd.cuh"
 #include "kernels/backward/landmark_bwd.cuh"
-#include "kernels/backward/dconv_residual_bwd.cuh"
 
 namespace flash_nystrom {
 
@@ -61,12 +59,6 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     launch_kernel1_output_fused<elem_type>(q_m, kt, s2,
         o, p.softmax1_lse_ptr,
         p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
-
-    if (p.conv_weight_ptr != nullptr && p.conv_kernel_size > 0) {
-        auto* cw = static_cast<const elem_type*>(p.conv_weight_ptr);
-        launch_dconv_residual<elem_type>(v, cw, o,
-            p.BH, p.seq_len, p.head_dim, p.num_heads, p.conv_kernel_size, p.stream);
-    }
 }
 
 // FP32 path: uses scalar kernel1 (LDSM doesn't support 32-bit elements)
@@ -101,12 +93,6 @@ static void run_nystrom_fwd_fp32_impl(NystromParams &p) {
     launch_kernel1_scalar<T>(q_m, kt, s2,
         o, p.softmax1_lse_ptr,
         p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
-
-    if (p.conv_weight_ptr != nullptr && p.conv_kernel_size > 0) {
-        auto* cw = static_cast<const T*>(p.conv_weight_ptr);
-        launch_dconv_residual<T>(v, cw, o,
-            p.BH, p.seq_len, p.head_dim, p.num_heads, p.conv_kernel_size, p.stream);
-    }
 }
 
 void run_nystrom_fwd(NystromParams &params) {
@@ -139,13 +125,6 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
     auto* dV      = static_cast<elem_type*>(p.dV_ptr);
 
     int BH = p.BH, N = p.seq_len, D = p.head_dim, m = p.num_landmarks;
-
-    if (p.conv_weight_ptr != nullptr && p.conv_kernel_size > 0) {
-        launch_dconv_bwd<elem_type>(dO, v,
-            static_cast<const elem_type*>(p.conv_weight_ptr),
-            dV, static_cast<float*>(p.dconv_weight_ptr),
-            BH, N, D, p.num_heads, p.batch_size, p.conv_kernel_size, p.stream);
-    }
 
     launch_precompute_di<elem_type>(dO, output, p.D1_ptr, BH, N, D, p.stream);
 
