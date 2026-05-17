@@ -25,12 +25,17 @@ template <bool A_in_regs=false, bool B_in_regs=false,
           typename TiledMma, typename TiledCopyA, typename TiledCopyB,
           typename ThrCopyA, typename ThrCopyB>
 __forceinline__ __device__ void gemm_smem(
-    Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
+    Tensor0 &acc, Tensor1 &&tCrA, Tensor2 &&tCrB,
     Tensor3 const& tCsA, Tensor4 const& tCsB,
     TiledMma tiled_mma,
     TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
     ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B
 ) {
+    // tCrA, tCrB are forwarding references so callers can pass either named
+    // lvalues or the rvalue returned by `thr_mma.partition_fragment_A(...)`
+    // directly. Plain `Tensor1 &` would reject rvalues under the C++ standard;
+    // MSVC accepts it as a non-standard extension but gcc and nvcc-on-Linux
+    // do not, which broke the Colab/Linux build.
     auto tCrA_view = smem_thr_copy_A.retile_D(tCrA);
     auto tCrB_view = smem_thr_copy_B.retile_D(tCrB);
     if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_view(_, _, _0{})); }
@@ -51,10 +56,12 @@ __forceinline__ __device__ void gemm_smem(
 template <typename Tensor0, typename Tensor1, typename Tensor2,
           typename Tensor3, typename TiledMma, typename TiledCopy, typename ThrCopy>
 __forceinline__ __device__ void gemm_rs(
-    Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
+    Tensor0 &acc, Tensor1 &&tCrA, Tensor2 &&tCrB,
     Tensor3 const& tCsB,
     TiledMma tiled_mma, TiledCopy smem_tiled_copy_B, ThrCopy smem_thr_copy_B
 ) {
+    // Same rationale as gemm_smem above: forwarding refs for tCrA, tCrB so
+    // both lvalue and rvalue callers compile.
     auto tCrB_view = smem_thr_copy_B.retile_D(tCrB);
     cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_view(_, _, _0{}));
     #pragma unroll
