@@ -78,7 +78,13 @@ out = flash_nystrom_attention(q, k, v, num_landmarks=64, newton_iter=6)
 
 ## Latency
 
-Forward and backward latency in milliseconds on an RTX 5060 Laptop (Blackwell consumer, 8 GB VRAM, sm_120), FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6. Three implementations: FN (this repo), Ref (pure-PyTorch Nyström, same algorithm), SDPA (`F.scaled_dot_product_attention`, which dispatches to PyTorch's memory-efficient attention backend). CUDA-event timed, median of 30 fwd+bwd runs after 5 warmups; reduced rep counts at N ≥ 16384 to keep wall-clock manageable.
+Forward and backward latency in milliseconds on an RTX 5060 Laptop (Blackwell consumer, 8 GB VRAM, sm_120), FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6. CUDA-event timed, median of 30 fwd+bwd runs after 5 warmups; reduced rep counts at N ≥ 16384 to keep wall-clock manageable.
+
+Three implementations are compared, and "Ref" in particular is not a strawman:
+
+- **FN** is this repo (custom CUDA + cuBLAS-graphs backward).
+- **Ref** is the same Nyström algorithm written in plain PyTorch. Every matmul still dispatches to cuBLAS via the `@` operator, every softmax goes through `torch.softmax` (which itself calls a fused CUDA softmax kernel), and every elementwise op lowers to a torch CUDA kernel. It is *not* a Python loop or a CPU reference. The only thing missing versus FN is the kernel fusion: each PyTorch op is a separate CUDA launch with full HBM round-trips between them, and there is no online-softmax fusion of the three softmax stages into a single pass. So FN/Ref measures the win from kernel fusion + flash-style tiling, holding the algorithm fixed. See `flash_nystrom/reference.py` for the Ref implementation.
+- **SDPA** is `F.scaled_dot_product_attention`, which on PyTorch 2.x dispatches to the memory-efficient attention backend (a FlashAttention-class kernel). This is exact O(N²) attention, the production baseline most people compare against.
 
 | N      | FN fwd | FN bwd | FN tot | Ref tot | SDPA fwd | SDPA bwd | SDPA tot | FN/Ref | FN/SDPA | SDPA − FN (ms) |
 |-------:|-------:|-------:|-------:|--------:|---------:|---------:|---------:|-------:|--------:|---------------:|
@@ -103,7 +109,7 @@ Reading the table:
 - **At short N (≤ 1024), SDPA is faster than FN.** FN carries fixed overhead from its three softmaxes and the Newton-Schulz pseudoinverse. That overhead dominates while N² is still cheap. If your N stays under ~1 K, use SDPA.
 - **The fwd+bwd crossover is between N = 1024 and N = 2048.** At N = 2048 FN is 1.7x faster than SDPA total. Above that point the gap widens monotonically.
 - **Above N ≈ 8 K the speedup grows roughly linearly with N**, as expected from FN's O(N) compute versus SDPA's O(N²). Doubling N from 16 K to 32 K doubles the speedup (34x to 69x). Same at 32 K to 64 K (69x to 138x), 64 K to 128 K (138x to 280x), and 128 K to 256 K (280x to 581x).
-- **FN beats the pure-PyTorch Nyström reference at every N tested.** The Ref column is the same algorithm in plain PyTorch (cuBLAS matmuls + torch softmax) and shows what is bought by the custom kernels. The FN/Ref ratio shrinks at large N because both methods are O(N); the gap is per-call kernel-launch and memory-traffic overhead, not asymptotic complexity.
+- **FN beats Ref at every N tested.** Ref is the same algorithm running on cuBLAS + torch softmax (see the framing above); the gap is the kernel-fusion win, not an algorithmic edge. The FN/Ref ratio shrinks at large N because both methods are O(N); above ~64 K the saving is per-call kernel-launch and HBM traffic overhead, not asymptotic complexity. At N = 16 K the FN/Ref ratio is 2.3x; at N = 64 K it is 1.2x. If you do not have the time or appetite to write fused CUDA, the cuBLAS-dispatch Ref path is a respectable fallback at long N.
 - **Neither method OOMs at N = 262144 on 8 GB.** SDPA's wall is wall-clock (~20 s per fwd+bwd at N = 256 K), not memory. PyTorch's SDPA uses memory-efficient attention internally, so it scales linearly in memory; the O(N²) compute is what makes it unusable past 32 K or so in practice.
 
 Reproduce with `python benchmarks/bench_fwd_bwd.py`.
