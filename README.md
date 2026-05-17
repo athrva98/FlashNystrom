@@ -270,3 +270,5 @@ Apache License 2.0. See `LICENSE`.
 ## Author
 
 Athrva Pandhare. athrva98@gmail.com.
+
+Developed with Claude's help.
