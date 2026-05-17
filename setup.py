@@ -96,6 +96,13 @@ def _build_ext_modules():
         "--expt-extended-lambda",
         "-lineinfo",
         "-std=c++17",
+        # Pin the current cross-TU template instantiation behaviour. nvcc 12.8+
+        # warns (#20281-D) that the default will flip to true in a future
+        # release, which would break our pattern of declaring __global__
+        # template kernels in headers and explicitly instantiating them in a
+        # separate .cu (see kernel2_inv_bwd.cuh / kernel2_inv_bwd.cu). Setting
+        # this to false locks in the behaviour we depend on.
+        "-static-global-template-stub=false",
         # Resource visibility. Off by default in CI / PyPI builds (verbose,
         # slows compile). Set FLASH_NYSTROM_VERBOSE=1 to re-enable for tuning.
         *(["-Xptxas=-v", "--resource-usage"]
@@ -104,7 +111,86 @@ def _build_ext_modules():
     for cap in _detect_cuda_arches():
         nvcc_flags.append(f"-gencode=arch=compute_{cap},code=sm_{cap}")
 
-    cxx_flags = (["/O2", "/std:c++17"] if os.name == "nt" else ["-O3", "-std=c++17"])
+    # ---------------------- Strict compilation -----------------------------
+    # Default ON. The local build was producing standards-noncompliant code
+    # that MSVC silently accepted via its rvalue-to-lvalue-ref extension and
+    # gcc rejected on Linux (Colab). To prevent that class of bug from
+    # recurring, force the MSVC host compiler into standard-conformance mode
+    # (/permissive-) and elevate warnings to errors on both host compilers
+    # and nvcc itself.
+    #
+    # Disable via FLASH_NYSTROM_LAX_BUILD=1 if a transient nvcc/CUTLASS
+    # warning is blocking work. The lax path should be used sparingly; the
+    # default exists because of a real bug it would have caught.
+    strict = not os.environ.get("FLASH_NYSTROM_LAX_BUILD")
+
+    # Warnings we cannot fix because they originate in headers we do not own
+    # (CUDA SDK, CUTLASS, PyTorch). Suppressed so /WX and -Werror only fire
+    # on warnings in *our* code.
+    #
+    #   MSVC C4996: deprecated declarations. Fired by cusparse.h in CUDA 12.9.
+    #   MSVC C4505/C4100: unused static / unused param, fired by CUTLASS.
+    #   MSVC C4127: conditional expression constant, fired by CUTLASS unroll
+    #   macros.
+    third_party_suppressions_msvc = ["/wd4996", "/wd4505", "/wd4100", "/wd4127"]
+    third_party_suppressions_gcc = [
+        "-Wno-deprecated-declarations",
+        "-Wno-unused-function",
+        "-Wno-unused-parameter",
+        # CUTLASS spams these on Hopper-target builds. Not our bugs.
+        "-Wno-strict-aliasing",
+        "-Wno-sign-compare",
+    ]
+
+    if os.name == "nt":
+        cxx_flags = ["/O2", "/std:c++17"]
+        if strict:
+            # /permissive- disables MSVC's non-conforming extensions. This
+            # is the flag that makes the build refuse the rvalue-to-non-
+            # const-lvalue-ref binding that previously broke gcc/Linux.
+            # /WX promotes warnings to errors. /W3 sets a reasonable warning
+            # level (W4 is too noisy on CUTLASS/PyTorch headers).
+            cxx_flags += ["/permissive-", "/W3", "/WX"]
+            cxx_flags += third_party_suppressions_msvc
+            # Mirror the host-compiler strictness through nvcc's -Xcompiler
+            # so device-side TUs the host frontend sees also enforce it.
+            nvcc_flags += [
+                "-Xcompiler", "/permissive-",
+                "-Xcompiler", "/W3",
+                "-Xcompiler", "/WX",
+            ]
+            for f in third_party_suppressions_msvc:
+                nvcc_flags += ["-Xcompiler", f]
+    else:
+        cxx_flags = ["-O3", "-std=c++17"]
+        if strict:
+            cxx_flags += ["-Wall", "-Wextra", "-Werror"]
+            cxx_flags += third_party_suppressions_gcc
+            nvcc_flags += [
+                "-Xcompiler", "-Wall",
+                "-Xcompiler", "-Wextra",
+                "-Xcompiler", "-Werror",
+            ]
+            for f in third_party_suppressions_gcc:
+                nvcc_flags += ["-Xcompiler", f]
+
+    if strict:
+        # nvcc-specific diagnostics. cross-execution-space-call catches host
+        # functions called from device code (silent UB otherwise). reorder
+        # catches member-init-order bugs. all-warnings promotes every other
+        # nvcc-level warning (narrowing, undefined behaviour, etc.) to an
+        # error. We deliberately do NOT promote deprecated-declarations
+        # because CUDA 12.9's cusparse.h trips it on its own typedefs;
+        # that's NVIDIA's bug, not ours.
+        nvcc_flags += [
+            "-Werror", "cross-execution-space-call",
+            "-Werror", "reorder",
+            "-Werror", "all-warnings",
+        ]
+        # Suppress specific nvcc warnings that come from CUTLASS headers
+        # which we cannot modify. 550 = "variable set but never used"
+        # (cute/layout.hpp:1443 has this pattern intentionally).
+        nvcc_flags += ["-Xcudafe", "--diag_suppress=550"]
 
     return [
         CUDAExtension(

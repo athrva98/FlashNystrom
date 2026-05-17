@@ -204,7 +204,7 @@ kernel3_fused_tc(
     Tensor row_max = make_tensor<float>(Shape<Int<nrow>>{});
     Tensor row_sum = make_tensor<float>(Shape<Int<nrow>>{});
     #pragma unroll
-    for (int i = 0; i < nrow; i++) { row_max(i) = -INFINITY; row_sum(i) = 0.0f; }
+    for (int i = 0; i < nrow; i++) { row_max(i) = fp32_neg_inf(); row_sum(i) = 0.0f; }
 
     // Main tile loop over K/V
     const int num_tiles = (N + kBlockN - 1) / kBlockN;
@@ -261,13 +261,13 @@ kernel3_fused_tc(
         #pragma unroll
         for (int i = 0; i < size(acc_s); i++) {
             int col = get<1>(tScS(i));
-            if (col >= valid_cols) acc_s(i) = -INFINITY;
+            if (col >= valid_cols) acc_s(i) = fp32_neg_inf();
         }
         // Also mask rows >= m
         #pragma unroll
         for (int i = 0; i < size(acc_s); i++) {
             int row = get<0>(tScS(i));
-            if (row >= m) acc_s(i) = -INFINITY;
+            if (row >= m) acc_s(i) = fp32_neg_inf();
         }
 
         // Online softmax update

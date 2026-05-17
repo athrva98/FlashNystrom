@@ -151,13 +151,9 @@ inline std::vector<OccupancyRow> probe_all(
     auto lim = query_sm_limits();
     std::vector<OccupancyRow> rows;
 
-    auto probe_half = [&](const auto& adder) { adder(cutlass::half_t{}); };
-    auto probe_bf16 = [&](const auto& adder) { adder(cutlass::bfloat16_t{}); };
-
     auto run = [&](auto Element_tag, const std::string& tag) {
         using Element = decltype(Element_tag);
         const int mm = m * m;
-        const int Bc = 64;
 
         // Forward
         rows.push_back(probe("landmark_kernel<" + tag + ">",

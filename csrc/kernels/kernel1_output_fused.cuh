@@ -240,7 +240,7 @@ kernel1_fused_tc(
     #pragma unroll
     for (int i = 0; i < size(acc_s); i++) {
         if (get<1>(tScS(i)) >= m) {
-            acc_s(i) = -INFINITY;
+            acc_s(i) = fp32_neg_inf();
         }
     }
 

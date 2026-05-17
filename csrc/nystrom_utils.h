@@ -11,10 +11,22 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/array.h>
 #include <cutlass/numeric_conversion.h>
+#include <limits>
 
 namespace flash_nystrom {
 
 using namespace cute;
+
+// Float-typed negative infinity. The naive `-INFINITY` and `-HUGE_VALF`
+// both trip nvcc 12.x's diagnostic #221-D (floating-point value does not
+// fit in required floating-point type) because nvcc's constant evaluator
+// reasons about the underlying double overflow that the macros expand to,
+// even after the C99-mandated float cast. std::numeric_limits is the only
+// portable constexpr source of a typed-float infinity that nvcc accepts
+// without complaint. Used in the softmax masking sites.
+__device__ __host__ inline constexpr float fp32_neg_inf() {
+    return -std::numeric_limits<float>::infinity();
+}
 
 // gemm with both operands from shared memory. prefetches next k-slice
 // while current one is being crunched by the tensor cores
