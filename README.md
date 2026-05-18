@@ -1,6 +1,10 @@
 # FlashNystrom
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/athrva98/FlashNystrom/blob/master/notebooks/quickstart.ipynb)
+
 CUDA kernels for Nystromformer approximate attention. Forward and backward run in linear time and memory with respect to sequence length. The matmul-heavy stages use tensor cores. Backward gradients are exact against PyTorch autograd at FP32 numerical noise.
+
+Open the Colab notebook above for a one-click install + smoke test + short latency demo. Switch the Colab runtime to L4 or A100 first; free-tier T4 (sm_75) is not supported.
 
 The Nystromformer factorization is
 
@@ -231,7 +235,7 @@ flash_nystrom/                 Python package (autograd Function, config, refere
 tests/                         84 pytest tests
 benchmarks/                    latency and CIFAR-10 training scripts
 examples/                      end-to-end usage examples
-docs/                          longer technical writeup
+notebooks/                     Colab quickstart
 third_party/cutlass/           CUTLASS submodule
 ```
 
