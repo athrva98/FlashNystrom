@@ -7,6 +7,7 @@
 
 #include "flash_nystrom.h"
 #include "utils.h"
+#include "profile.h"
 #include "static_switch.h"
 #include "kernels/landmark.cuh"
 #include "kernels/kernel2_inv.cuh"
@@ -40,25 +41,34 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     auto* q_m = static_cast<elem_type*>(p.q_ptr);
     auto* k_m = static_cast<elem_type*>(p.k_ptr);
 
-    launch_landmarks<elem_type>(q, k, qt, kt,
-        p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
-
+    KernelProfiler prof(p.stream);
     int total = p.BH * p.seq_len * p.head_dim;
-    launch_scale_inplace<elem_type>(q_m, total, p.scale, p.stream);
-    launch_scale_inplace<elem_type>(k_m, total, p.scale, p.stream);
 
-    launch_kernel2_inv<elem_type>(qt, kt,
-        p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
-        p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream);
-
-    launch_kernel3_output_fused<elem_type>(qt, k_m, v,
-        p.kernel2_inv_ptr, s2, b, p.softmax3_lse_ptr,
-        p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
-
-    // Tensor-core kernel1 (the main performance kernel)
-    launch_kernel1_output_fused<elem_type>(q_m, kt, s2,
-        o, p.softmax1_lse_ptr,
-        p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
+    prof.run("landmarks", [&] {
+        launch_landmarks<elem_type>(q, k, qt, kt,
+            p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
+    });
+    prof.run("scale_inplace(q,k)", [&] {
+        launch_scale_inplace<elem_type>(q_m, total, p.scale, p.stream);
+        launch_scale_inplace<elem_type>(k_m, total, p.scale, p.stream);
+    });
+    prof.run("kernel2_inv", [&] {
+        launch_kernel2_inv<elem_type>(qt, kt,
+            p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
+            p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream);
+    });
+    prof.run("kernel3_output_fused", [&] {
+        launch_kernel3_output_fused<elem_type>(qt, k_m, v,
+            p.kernel2_inv_ptr, s2, b, p.softmax3_lse_ptr,
+            p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
+    });
+    prof.run("kernel1_output_fused", [&] {
+        // Tensor-core kernel1 (the main performance kernel)
+        launch_kernel1_output_fused<elem_type>(q_m, kt, s2,
+            o, p.softmax1_lse_ptr,
+            p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
+    });
+    prof.report("forward (FP16/BF16)");
 }
 
 // FP32 path: uses scalar kernel1 (LDSM doesn't support 32-bit elements)
@@ -126,17 +136,24 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
 
     int BH = p.BH, N = p.seq_len, D = p.head_dim, m = p.num_landmarks;
 
-    launch_precompute_di<elem_type>(dO, output, p.D1_ptr, BH, N, D, p.stream);
+    KernelProfiler prof(p.stream);
 
-    launch_kernel1_bwd<elem_type>(q_s, k_tilde, step2, p.lse1_ptr, p.D1_ptr, dO,
-        dQ, p.dstep2_ptr, p.dK_tilde_ptr, BH, N, D, m, p.stream);
+    prof.run("precompute_di", [&] {
+        launch_precompute_di<elem_type>(dO, output, p.D1_ptr, BH, N, D, p.stream);
+    });
+    prof.run("kernel1_bwd", [&] {
+        launch_kernel1_bwd<elem_type>(q_s, k_tilde, step2, p.lse1_ptr, p.D1_ptr, dO,
+            dQ, p.dstep2_ptr, p.dK_tilde_ptr, BH, N, D, m, p.stream);
+    });
 
     // dO3 = K2_inv^T @ dstep2 — precomputed in GMEM for both the FP32 scalar
     // and FP16/BF16 TC paths. Used by the kernel3_bwd softmax-bwd stage and
     // by compute_dk2inv (for the D3 byproduct).
     auto* dO3 = static_cast<elem_type*>(p.dO3_ptr);
-    launch_compute_dO3<elem_type>(p.k2_inv_ptr, p.dstep2_ptr, dO3,
-        BH, D, m, p.stream);
+    prof.run("compute_dO3", [&] {
+        launch_compute_dO3<elem_type>(p.k2_inv_ptr, p.dstep2_ptr, dO3,
+            BH, D, m, p.stream);
+    });
 
     // B = softmax(Q_tilde @ K_s^T) @ V is saved from the forward kernel3.
     // When B is provided, compute_dk2inv collapses to two small m-bounded
@@ -144,29 +161,37 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
     // If B is null (FP32 input without a saved B, for example), the path
     // falls back to the prior N-walking compute_dk2inv variants.
     auto* b_saved = static_cast<const elem_type*>(p.b_ptr);
-    launch_compute_dk2inv<elem_type>(q_tilde, k_s, v, b_saved, dO3,
-        p.lse3_ptr, p.dstep2_ptr,
-        p.dK2_inv_ptr, p.D3_ptr,
-        BH, N, D, m, p.fast_dk2inv, p.stream);
-
-    launch_kernel3_bwd<elem_type>(q_tilde, k_s, v, p.k2_inv_ptr, p.lse3_ptr,
-        p.D3_ptr, p.dstep2_ptr, dV, dK, p.dQ_tilde_ptr, p.dK2_inv_ptr,
-        static_cast<const elem_type*>(dO3),
-        p.dQ_tilde_split_ptr, p.num_splits,
-        BH, N, D, m, p.stream);
-
-    launch_kernel2_inv_bwd<elem_type>(q_tilde, k_tilde,
-        p.dK2_inv_ptr,
-        p.ns_iterates_ptr, p.k2_softmax_ptr,
-        p.dQ_tilde_ptr, p.dK_tilde_ptr,
-        BH, D, m, p.newton_iter, p.stream);
-
-    launch_landmark_bwd<elem_type>(p.dQ_tilde_ptr, p.dK_tilde_ptr, dQ, dK,
-        BH, N, D, m, p.stream);
+    prof.run("compute_dk2inv", [&] {
+        launch_compute_dk2inv<elem_type>(q_tilde, k_s, v, b_saved, dO3,
+            p.lse3_ptr, p.dstep2_ptr,
+            p.dK2_inv_ptr, p.D3_ptr,
+            BH, N, D, m, p.fast_dk2inv, p.stream);
+    });
+    prof.run("kernel3_bwd", [&] {
+        launch_kernel3_bwd<elem_type>(q_tilde, k_s, v, p.k2_inv_ptr, p.lse3_ptr,
+            p.D3_ptr, p.dstep2_ptr, dV, dK, p.dQ_tilde_ptr, p.dK2_inv_ptr,
+            static_cast<const elem_type*>(dO3),
+            p.dQ_tilde_split_ptr, p.num_splits,
+            BH, N, D, m, p.stream);
+    });
+    prof.run("kernel2_inv_bwd", [&] {
+        launch_kernel2_inv_bwd<elem_type>(q_tilde, k_tilde,
+            p.dK2_inv_ptr,
+            p.ns_iterates_ptr, p.k2_softmax_ptr,
+            p.dQ_tilde_ptr, p.dK_tilde_ptr,
+            BH, D, m, p.newton_iter, p.stream);
+    });
+    prof.run("landmark_bwd", [&] {
+        launch_landmark_bwd<elem_type>(p.dQ_tilde_ptr, p.dK_tilde_ptr, dQ, dK,
+            BH, N, D, m, p.stream);
+    });
 
     int total = BH * N * D;
-    launch_scale_inplace<elem_type>(dQ, total, p.scale, p.stream);
-    launch_scale_inplace<elem_type>(dK, total, p.scale, p.stream);
+    prof.run("scale_inplace(dQ,dK)", [&] {
+        launch_scale_inplace<elem_type>(dQ, total, p.scale, p.stream);
+        launch_scale_inplace<elem_type>(dK, total, p.scale, p.stream);
+    });
+    prof.report("backward (FP16/BF16)");
 }
 
 void run_nystrom_bwd(NystromBwdParams &params) {
