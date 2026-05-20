@@ -525,10 +525,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Returns (dQ_tilde, dK_tilde) FP32.",
           py::arg("q_tilde"), py::arg("k_tilde"), py::arg("K2_softmax"),
           py::arg("ns_iterates"), py::arg("dK2_inv_in"), py::arg("newton_iter"));
-    m.def("reset_caches", &flash_nystrom::reset_ns_bwd_caches,
-          "Free the thread-local NS-backward graph caches and workspaces. "
-          "Reclaims GPU memory held by FlashNystrom across all dtypes. "
-          "Safe to call between calls but not during a graph capture.");
+    m.def("reset_caches", []() {
+              flash_nystrom::reset_ns_bwd_caches();
+              flash_nystrom::reset_kernel3_caches();
+          },
+          "Free the thread-local NS-backward graph caches/workspaces and the "
+          "kernel3 split-N scratch buffers. Reclaims GPU memory held by "
+          "FlashNystrom across all dtypes. Safe to call between calls but not "
+          "during a graph capture.");
 
     // ----- Occupancy probe -----
     py::class_<flash_nystrom::OccupancyRow>(m, "OccupancyRow")

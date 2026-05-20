@@ -137,4 +137,10 @@ void run_nystrom_fwd_fp32(NystromParams &params);
 void run_nystrom_bwd(NystromBwdParams &params);
 void run_nystrom_bwd_fp32(NystromBwdParams &params);
 
+// Free the kernel3 split-N scratch buffers. Defined in flash_nystrom_kernels.cu
+// (bridges to the inline reset_kernel3_scratch in kernel3_output_fused.cuh) so
+// the pybind reset_caches can free them without flash_nystrom.cu pulling in the
+// full CUTLASS header.
+void reset_kernel3_caches();
+
 } // namespace flash_nystrom

@@ -99,6 +99,22 @@ inline size_t get_max_smem_per_block() {
     return cached;
 }
 
+// SM count for the current device. Used by launch-time dispatch to decide
+// whether a grid is large enough to fill the GPU (e.g. grid(BH) starves a
+// 108-SM A100 when BH is 4). Cached after first query.
+inline int get_sm_count() {
+    static int cached = -1;
+    if (cached < 0) {
+        int device = -1;
+        FN_CUDA_CHECK(cudaGetDevice(&device));
+        int val = 0;
+        FN_CUDA_CHECK(cudaDeviceGetAttribute(
+            &val, cudaDevAttrMultiProcessorCount, device));
+        cached = val;
+    }
+    return cached;
+}
+
 // type conversions — cutlass types (half_t, bfloat16_t) to/from float
 // these are ABI-compatible with __half / __nv_bfloat16 so reinterpret_cast is fine
 // following the same pattern as FlashAttention for type dispatch
@@ -164,7 +180,13 @@ __device__ __forceinline__ float block_reduce_max(float val, float* scratch) {
     __syncthreads();
     if (threadIdx.x == 0) scratch[0] = val;
     __syncthreads();
-    return scratch[0];
+    // Capture, then sync before returning. Without the trailing barrier a
+    // caller that reuses `scratch` immediately (e.g. block_reduce_sum on the
+    // same buffer) can write scratch[warp] while another thread is still
+    // reading scratch[0] here — a real read/write race (caught by racecheck).
+    float result = scratch[0];
+    __syncthreads();
+    return result;
 }
 
 __device__ __forceinline__ float block_reduce_sum(float val, float* scratch) {
@@ -181,7 +203,11 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* scratch) {
     __syncthreads();
     if (threadIdx.x == 0) scratch[0] = val;
     __syncthreads();
-    return scratch[0];
+    // See block_reduce_max: trailing barrier so a subsequent reduction reusing
+    // `scratch` cannot overwrite scratch[0] before all threads have read it.
+    float result = scratch[0];
+    __syncthreads();
+    return result;
 }
 
 } // namespace flash_nystrom

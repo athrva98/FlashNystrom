@@ -206,4 +206,7 @@ void run_nystrom_bwd_fp32(NystromBwdParams &params) {
     run_nystrom_bwd_impl<float>(params);
 }
 
+// Bridge so the pybind reset_caches can free the kernel3 split-N scratch.
+void reset_kernel3_caches() { reset_kernel3_scratch(); }
+
 } // namespace flash_nystrom
