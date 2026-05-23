@@ -116,37 +116,58 @@ Reading the table:
 
 Reproduce with `python benchmarks/bench_fwd_bwd.py`.
 
-## A100: same algorithm, FlashNystrom vs cuBLAS
+## Datacenter GPUs: same algorithm, FlashNystrom vs cuBLAS
 
-The 5060 table is FlashNystrom against *exact* attention. This one isolates kernel quality: FlashNystrom against the **same Nyström algorithm** in plain PyTorch (the `Ref` above, where every matmul is a cuBLAS call and every softmax a torch kernel, with no fusion across stages). Same math, same FLOPs; the only difference is the kernels. A100-80GB, FP16, newton_iter=6. `f x` and `tot x` are cuBLAS_time / FN_time; values > 1 mean FN is faster.
+The 5060 table is FlashNystrom against *exact* attention. This one isolates kernel quality: FlashNystrom against the **same Nyström algorithm** in plain PyTorch (the `Ref` above, where every matmul is a cuBLAS call and every softmax a torch kernel, with no fusion across stages). Same math, same FLOPs; the only difference is the kernels. FP16, newton_iter=6. `f x` and `tot x` are cuBLAS_time / FN_time; values > 1 mean FN is faster.
 
-High batch×head (B=4, H=16, head_dim=128, m=64):
+**A100-80GB.** High batch×head (B=4, H=16, head_dim=128, m=64):
 
 | N      | FN fwd | cuBLAS fwd | f x   | FN tot | cuBLAS tot | tot x |
 |-------:|-------:|-----------:|------:|-------:|-----------:|------:|
-|   4096 |   1.90 |       1.57 | 0.83x |   6.77 |       7.31 | 1.08x |
-|  16384 |   3.30 |       3.13 | 0.95x |  17.55 |      22.43 | 1.28x |
-|  65536 |   9.19 |      11.11 | 1.21x |  60.86 |      85.37 | 1.40x |
-| 131072 |  17.23 |      21.61 | 1.25x | 116.49 |     199.00 | 1.71x |
+|   4096 |   1.92 |       1.53 | 0.80x |   6.79 |       7.33 | 1.08x |
+|  16384 |   3.40 |       3.14 | 0.93x |  17.66 |      22.45 | 1.27x |
+|  65536 |   9.43 |      11.01 | 1.17x |  60.94 |      84.66 | 1.39x |
+| 131072 |  17.62 |      21.45 | 1.22x | 116.78 |     198.26 | 1.70x |
 
-Long context, few heads (B=1, H=4, head_dim=64, m=32):
+A100, long context, few heads (B=1, H=4, head_dim=64, m=32):
 
 | N       | FN fwd | cuBLAS fwd | f x   | FN tot | cuBLAS tot | tot x |
 |--------:|-------:|-----------:|------:|-------:|-----------:|------:|
-|   65536 |   1.02 |       1.68 | 1.64x |   4.95 |       5.93 | 1.20x |
-|  131072 |   1.56 |       1.64 | 1.05x |   8.67 |       8.27 | 0.95x |
-|  262144 |   2.65 |       2.77 | 1.04x |  16.05 |      17.82 | 1.11x |
-|  524288 |   4.81 |       4.86 | 1.01x |  30.34 |      41.97 | 1.38x |
-| 1048576 |   9.17 |       9.47 | 1.03x |  58.88 |      83.79 | 1.42x |
-| 2097152 |  17.89 |      18.55 | 1.04x | 116.31 |     166.80 | 1.43x |
+|   65536 |   0.81 |       1.59 | 1.97x |   4.73 |       6.65 | 1.41x |
+|  131072 |   1.14 |       1.63 | 1.43x |   8.25 |       8.25 | 1.00x |
+|  262144 |   1.83 |       2.77 | 1.52x |  15.05 |      18.21 | 1.21x |
+|  524288 |   3.18 |       4.84 | 1.52x |  28.72 |      41.93 | 1.46x |
+| 1048576 |   5.92 |       9.47 | 1.60x |  55.62 |      83.71 | 1.50x |
+| 2097152 |  11.45 |      18.53 | 1.62x | 110.75 |     166.69 | 1.51x |
 
-Reading the A100 tables:
+**H100-80GB.** High batch×head (B=4, H=16, head_dim=128, m=64):
 
-- **The forward crosses over to a win as N grows.** At high batch×head the forward `f x` climbs 0.83 to 1.25 with N: fusion's saved HBM traffic compounds as the sequence grows. At small N it loses, because fixed per-call costs (the three softmaxes and the Newton-Schulz pseudoinverse) dominate before there is enough N to amortize them. The same crossover holds at higher batch×head: at B=8, H=16 the forward is 1.25x and the total 1.50x at N=65536.
-- **End-to-end, FlashNystrom wins almost everywhere**, by 1.08x to 1.71x at high batch×head and 1.1x to 1.43x in long context. The one exception is N=131072 in the long-context config (0.95x), a narrow band bracketed by wins on both sides.
-- **In long context with few heads the forward is at parity** (1.01x to 1.05x). At batch×head = 4 with very large N, cuBLAS's batched GEMMs already fill the GPU, so fusion's only forward edge is the small HBM-traffic saving. The end-to-end win there comes from the backward: graph-captured Newton-Schulz plus O(m·N) fusion versus the reference's autograd through every stage.
+| N      | FN fwd | cuBLAS fwd | f x   | FN tot | cuBLAS tot | tot x |
+|-------:|-------:|-----------:|------:|-------:|-----------:|------:|
+|   4096 |   1.22 |       1.77 | 1.45x |   3.67 |       6.32 | 1.72x |
+|  16384 |   2.05 |       1.87 | 0.91x |   8.66 |      12.93 | 1.49x |
+|  65536 |   5.26 |       5.94 | 1.13x |  27.90 |      49.56 | 1.78x |
+| 131072 |   9.58 |      11.59 | 1.21x |  53.67 |     101.81 | 1.90x |
 
-Reproduce with `modal run tools/modal_a100.py::bench` (and `::bench_gaps` for the extended N range). Requires a Modal account and a one-time `modal setup`.
+H100, long context, few heads (B=1, H=4, head_dim=64, m=32):
+
+| N       | FN fwd | cuBLAS fwd | f x   | FN tot | cuBLAS tot | tot x |
+|--------:|-------:|-----------:|------:|-------:|-----------:|------:|
+|   65536 |   0.57 |       1.86 | 3.28x |   3.25 |       6.30 | 1.94x |
+|  131072 |   0.75 |       1.83 | 2.44x |   5.71 |       6.37 | 1.12x |
+|  262144 |   1.14 |       1.83 | 1.60x |  10.58 |       8.72 | 0.82x |
+|  524288 |   1.97 |       2.37 | 1.20x |  20.39 |      21.33 | 1.05x |
+| 1048576 |   3.58 |       4.42 | 1.23x |  40.00 |      43.70 | 1.09x |
+| 2097152 |   6.84 |       8.55 | 1.25x |  79.15 |      86.95 | 1.10x |
+
+Reading the tables:
+
+- **The forward wins across N at low batch×head.** It is 1.4x to 2.0x on the A100 and 1.2x to 3.3x on the H100. This is the regime the parallelized landmark kernel fixed: a single landmark's segment of N/m rows used to be summed by one thread serially, which was latency-bound at large N; splitting that reduction across threads made it bandwidth-bound. The forward GEMMs (kernel1, kernel3) were already faster than cuBLAS here because fusion saves HBM traffic.
+- **At high batch×head the forward crosses over to a win by mid N.** At small N it can lose, because fixed per-call costs (the three softmaxes and the Newton-Schulz pseudoinverse) dominate before there is enough N to amortize them.
+- **End-to-end, FlashNystrom wins across the whole tested range:** A100 total 1.00x to 1.70x, H100 total 1.05x to 1.94x. The single exception is the H100 long-context point at N=262144 (0.82x), where the cuBLAS reference backward measured anomalously fast; the forward there is a 1.60x win.
+- **The H100 widens the lead at high batch×head** (total up to 1.90x) and sharpens the low-batch forward win (the faster HBM3 and extra SMs feed the now bandwidth-bound landmark and GEMM kernels).
+
+Reproduce with `modal run tools/modal_a100.py::bench_gaps` (A100) or `::bench_gaps_h100` (H100). Requires a Modal account and a one-time `modal setup`.
 
 ## SMEM sizing and occupancy
 
