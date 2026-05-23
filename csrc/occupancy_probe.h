@@ -155,9 +155,14 @@ inline std::vector<OccupancyRow> probe_all(
         using Element = decltype(Element_tag);
         const int mm = m * m;
 
-        // Forward
+        // Forward. landmark_kernel launches with block = (1024/D)*D threads and
+        // dynamic SMEM = 2*tpd*D floats (tpd = 1024/D) for the split segment
+        // reduction; mirror that here so the probe reflects the real config.
+        int lm_tpd = 1024 / D; if (lm_tpd < 1) lm_tpd = 1;
+        const int lm_block = lm_tpd * D;
+        const int lm_smem = static_cast<int>(2 * lm_tpd * D * sizeof(float));
         rows.push_back(probe("landmark_kernel<" + tag + ">",
-            landmark_kernel<Element>, std::min(256, D), 0, lim));
+            landmark_kernel<Element>, lm_block, lm_smem, lim));
         rows.push_back(probe("kernel2_inv_kernel<" + tag + ">",
             kernel2_inv_kernel<Element>, 256, 6 * mm * (int)sizeof(float), lim));
 

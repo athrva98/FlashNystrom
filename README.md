@@ -180,31 +180,36 @@ m=64, D=128, FP16, niter=6):
 
 | Kernel                        | Dyn SMEM (KB) | Regs/thr | Blocks/SM (consumer) | Binding constraint |
 |-------------------------------|--------------:|---------:|---------------------:|--------------------|
-| `kernel1_fused_tc` (fwd)      |          32   |      71  |                  3   | registers          |
-| `kernel3_fused_tc` (fwd)      |          32   |     165  |                  3   | registers          |
-| `kernel1_bwd_tc`              |          48   |     163  |                  2   | SMEM + registers   |
-| `kernel3_bwd_tc`              |          40   |     170  |                  2   | registers          |
-| `compute_dk2inv_tc`           |          64   |     206  |                  1   | registers          |
+| `landmark_kernel` (fwd)       |           8   |      40  |                  1   | threads (1024/blk) |
+| `kernel1_fused_tc` (fwd)      |          32   |      71  |                  3   | SMEM               |
+| `kernel3_fused_tc` (fwd)      |          32   |     165  |                  3   | registers (= SMEM) |
+| `kernel1_bwd_tc`              |          48   |     163  |                  2   | SMEM               |
+| `kernel3_bwd_tc`              |          40   |     170  |                  2   | SMEM               |
+| `compute_dk2inv_tc`           |          64   |     206  |                  1   | SMEM               |
 | `kernel2_inv` (NS forward)    |          96   |      42  |                  1   | SMEM               |
 | `ns_bwd_step`                 |          96   |      40  |                  1   | SMEM               |
 
-Reproduce with `python tools/kernel_report.py`.
+Reproduce with `python tools/kernel_report.py`. (`landmark_kernel` is
+threads-bound, not occupancy-starved: one 1024-thread block is 32 warps, and
+it is bandwidth-bound after the segment-reduction parallelization.)
 
 **Are we leaving performance on the table on bigger-SMEM GPUs?**
 
 Yes and no, and not in the way most people assume.
 
 What we get for free on bigger SMEM (H100 has 228 KB/SM, ~2.3× consumer):
-- Occupancy scales automatically. The SMEM-bound kernels (`kernel2_inv`,
-  `ns_bwd_step`) double their blocks/SM. The 40 to 48 KB bwd kernels
-  gain roughly one extra block/SM until registers become the binder.
-- The three matmul-heavy hot kernels (`kernel3_fused_tc`,
-  `kernel3_bwd_tc`, `compute_dk2inv_tc`) are register-bound, not
-  SMEM-bound. See the regs/thr column above (165 to 206 regs/thr at
-  128 threads/block). Larger SMEM does nothing for those: register
-  count caps occupancy first. A real win there requires fewer
-  registers (smaller accumulator fragments, recomputation), not
-  more SMEM.
+- Occupancy scales automatically, because **most kernels are SMEM-bound**
+  on the consumer card (see the Binding column). `kernel2_inv` and
+  `ns_bwd_step` (96 KB, 1 block/SM at 100 KB) go to 2 blocks/SM. The 40 to
+  64 KB kernels (`kernel3_bwd_tc`, `kernel1_bwd_tc`, `compute_dk2inv_tc`)
+  each gain blocks/SM until their register count becomes the binder, e.g.
+  `compute_dk2inv_tc` (64 KB) goes from 1 block/SM to its ~2-block register
+  ceiling. So bigger SMEM does help these.
+- The one kernel bigger SMEM does **not** help is the forward
+  `kernel3_fused_tc`: registers and SMEM both allow only 3 blocks/SM at
+  128 threads/block (165 regs/thr), so it is already at its register
+  ceiling and extra SMEM changes nothing. A win there needs fewer
+  registers (smaller accumulator fragments, recomputation), not more SMEM.
 
 What we miss by not sizing for big SMEM:
 - We do not multi-stage. Each kernel uses one SMEM buffer per role
