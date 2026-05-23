@@ -85,17 +85,30 @@ image = (
 app = modal.App("flash-nystrom-a100", image=image)
 
 
-@app.function(gpu="A100-80GB", timeout=3600)
-def test():
-    """Run the full 84-test suite on the A100."""
+def _run_tests():
+    """Run the full test suite on whichever GPU the wrapper selected."""
     import subprocess
+    import torch
+    print(f"GPU: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
     r = subprocess.run(
         ["python", "-m", "pytest", "tests/", "-q", "--tb=short"],
         cwd=REMOTE,
     )
     if r.returncode != 0:
         raise RuntimeError(f"pytest failed with exit code {r.returncode}")
-    print("all tests passed on A100")
+    print(f"all tests passed on {torch.cuda.get_device_name(0)}")
+
+
+@app.function(gpu="A100-80GB", timeout=3600)
+def test():
+    """Run the full test suite on an A100-80GB."""
+    _run_tests()
+
+
+@app.function(gpu="H100", timeout=3600)
+def test_h100():
+    """Run the full test suite on an H100."""
+    _run_tests()
 
 
 def _run_bench():
