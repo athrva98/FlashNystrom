@@ -58,8 +58,10 @@ image = (
         "wheel",
         extra_index_url="https://download.pytorch.org/whl/cu128",
     )
-    # Build for A100 only (no nvidia-smi at image-build time, so pin the arch).
-    .env({"FLASH_NYSTROM_CUDA_ARCH_LIST": "80"})
+    # Build for A100 (sm_80) and H100 (sm_90): no nvidia-smi at image-build
+    # time, so pin both arches. The SM80 MMA / cp.async atoms compile and run
+    # on Hopper in Ampere-compatibility mode, so one image serves both GPUs.
+    .env({"FLASH_NYSTROM_CUDA_ARCH_LIST": "80 90"})
     .add_local_dir(
         str(REPO),
         remote_path=REMOTE,
@@ -96,9 +98,11 @@ def test():
     print("all tests passed on A100")
 
 
-@app.function(gpu="A100-80GB", timeout=3600)
-def bench():
-    """FN vs cuBLAS (pure-PyTorch Nystrom reference) on the A100. fwd, bwd, total."""
+def _run_bench():
+    """FN vs cuBLAS (pure-PyTorch Nystrom reference). fwd, bwd, total.
+
+    GPU-agnostic body; the decorated bench / bench_h100 wrappers pick the GPU.
+    """
     import torch
     from flash_nystrom.flash_nystrom import FlashNystromFunction
     from flash_nystrom.reference import nystrom_attention_reference
@@ -186,8 +190,19 @@ def bench():
     print("\nf x / tot x = cuBLAS_time / FN_time. >1 means FN faster.")
 
 
-@app.function(gpu="A100-80GB", timeout=5400)
-def bench_gaps():
+@app.function(gpu="A100-80GB", timeout=3600)
+def bench():
+    """FN vs cuBLAS head-to-head on an A100-80GB."""
+    _run_bench()
+
+
+@app.function(gpu="H100", timeout=3600)
+def bench_h100():
+    """FN vs cuBLAS head-to-head on an H100."""
+    _run_bench()
+
+
+def _run_bench_gaps():
     """Fill the two gaps in the main bench, thoroughly.
 
     1. High-BH at large N: B=8,H=16 (BH=128) overflows int32 at N=131072. Use
@@ -291,6 +306,18 @@ def bench_gaps():
 
     print("\nf x / tot x = cuBLAS_time / FN_time. >1 means FN faster. "
           "'-' = cuBLAS reference OOM'd at that N.")
+
+
+@app.function(gpu="A100-80GB", timeout=5400)
+def bench_gaps():
+    """Extended high-BH + long-context sweep on an A100-80GB."""
+    _run_bench_gaps()
+
+
+@app.function(gpu="H100", timeout=5400)
+def bench_gaps_h100():
+    """Extended high-BH + long-context sweep on an H100."""
+    _run_bench_gaps()
 
 
 @app.function(gpu="A100-80GB", timeout=3600)
