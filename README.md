@@ -90,31 +90,63 @@ Forward and backward latency in milliseconds on an RTX 5060 Laptop (Blackwell co
 
 | N      | FN fwd | FN bwd | FN tot | Ref tot | SDPA fwd | SDPA bwd | SDPA tot | FN/Ref | FN/SDPA | SDPA − FN (ms) |
 |-------:|-------:|-------:|-------:|--------:|---------:|---------:|---------:|-------:|--------:|---------------:|
-|    128 |   0.16 |   0.71 |   0.87 |    4.68 |     0.03 |     0.23 |     0.26 |  5.4x  |   0.30x |          −0.61 |
-|    256 |   0.15 |   0.50 |   0.65 |    4.64 |     0.03 |     0.23 |     0.26 |  7.1x  |   0.40x |          −0.39 |
-|    512 |   0.16 |   0.49 |   0.65 |    5.30 |     0.04 |     0.19 |     0.23 |  8.2x  |   0.35x |          −0.42 |
-|   1024 |   0.18 |   0.48 |   0.66 |    4.78 |     0.10 |     0.31 |     0.41 |  7.2x  |   0.62x |          −0.25 |
-|   2048 |   0.21 |   0.50 |   0.72 |    5.68 |     0.29 |     0.96 |     1.24 |  7.9x  |   1.7x  |          +0.52 |
-|   4096 |   0.29 |   0.57 |   0.86 |    4.72 |     1.07 |     3.51 |     4.58 |  5.5x  |   5.3x  |          +3.72 |
-|   8192 |   0.43 |   0.78 |   1.21 |    4.79 |     4.15 |    13.71 |    17.86 |  4.0x  |  14.8x  |         +16.65 |
-|  16384 |   0.82 |   1.36 |   2.18 |    5.08 |    16.95 |    56.97 |    73.92 |  2.3x  |  33.9x  |         +71.74 |
-|  32768 |   1.65 |   2.58 |   4.23 |    8.06 |    69.22 |   222.01 |   291.24 |  1.9x  |  68.9x  |           +287 |
-|  65536 |   4.01 |   4.86 |   8.87 |   10.96 |   278.64 |   948.59 |  1227.23 |  1.2x  |   138x  |         +1,218 |
-| 131072 |   7.91 |   9.55 |  17.46 |   21.16 |  1125.10 |  3761.69 |  4886.79 |  1.2x  |   280x  |         +4,869 |
-| 262144 |  15.72 |  18.52 |  34.24 |   48.58 |  4599.10 | 15279.00 | 19878.10 |  1.4x  |   581x  |        +19,844 |
+|    128 |   0.19 |   1.28 |   1.47 |    5.79 |     0.05 |     0.26 |     0.31 |  3.9x  |   0.21x |          −1.16 |
+|    256 |   0.16 |   0.60 |   0.76 |    5.88 |     0.06 |     0.27 |     0.33 |  7.7x  |   0.43x |          −0.43 |
+|    512 |   0.16 |   0.54 |   0.71 |    5.38 |     0.04 |     0.19 |     0.23 |  7.6x  |   0.32x |          −0.48 |
+|   1024 |   0.17 |   0.49 |   0.66 |    5.46 |     0.10 |     0.31 |     0.41 |  8.3x  |   0.62x |          −0.25 |
+|   2048 |   0.18 |   0.55 |   0.73 |    6.19 |     0.29 |     0.95 |     1.24 |  8.5x  |   1.7x  |          +0.51 |
+|   4096 |   0.20 |   0.57 |   0.77 |    4.99 |     1.06 |     3.51 |     4.56 |  6.5x  |   5.9x  |          +3.79 |
+|   8192 |   0.23 |   0.75 |   0.98 |    5.89 |     4.14 |    13.59 |    17.73 |  6.0x  |  18.1x  |         +16.75 |
+|  16384 |   0.38 |   1.29 |   1.67 |    6.49 |    17.07 |    57.01 |    74.08 |  3.9x  |  44.4x  |         +72.41 |
+|  32768 |   0.69 |   2.54 |   3.23 |    6.09 |    69.28 |   221.28 |   290.56 |  1.9x  |  90.0x  |           +287 |
+|  65536 |   1.47 |   4.79 |   6.26 |   11.06 |   276.98 |   921.72 |  1198.71 |  1.8x  |   191x  |         +1,192 |
+| 131072 |   2.77 |   9.19 |  11.96 |   21.45 |  1122.66 |  3770.79 |  4893.45 |  1.8x  |   409x  |         +4,881 |
+| 262144 |   5.35 |  18.05 |  23.40 |   48.59 |  4613.17 | 15081.63 | 19694.80 |  2.1x  |   842x  |        +19,671 |
 
 The speedup columns are *base time / FN time*. Values > 1 mean FN is faster; values < 1 mean FN is slower than the base. The last column is the absolute time difference per fwd+bwd call (positive means FN is faster).
 
 Reading the table:
 
-- **The ratio compresses both ends. The absolute difference does not.** At N ≤ 1024 where SDPA wins, the loss is between 0.25 ms and 0.61 ms per call. That is below the noise floor of a typical training loop and well below any optimizer step. At N = 262144 where FN wins, the save is 19.8 seconds per fwd+bwd call. The ratio and the absolute column tell the same story but the absolute column is the one that matters for "does this make my training run actually finish."
+- **The ratio compresses both ends. The absolute difference does not.** At N ≤ 1024 where SDPA wins, the loss is between 0.25 ms and 1.2 ms per call. That is below the noise floor of a typical training loop and well below any optimizer step. At N = 262144 where FN wins, the save is 19.7 seconds per fwd+bwd call. The ratio and the absolute column tell the same story but the absolute column is the one that matters for "does this make my training run actually finish."
 - **At short N (≤ 1024), SDPA is faster than FN.** FN carries fixed overhead from its three softmaxes and the Newton-Schulz pseudoinverse. That overhead dominates while N² is still cheap. If your N stays under ~1 K, use SDPA.
 - **The fwd+bwd crossover is between N = 1024 and N = 2048.** At N = 2048 FN is 1.7x faster than SDPA total. Above that point the gap widens monotonically.
-- **Above N ≈ 8 K the speedup grows roughly linearly with N**, as expected from FN's O(N) compute versus SDPA's O(N²). Doubling N from 16 K to 32 K doubles the speedup (34x to 69x). Same at 32 K to 64 K (69x to 138x), 64 K to 128 K (138x to 280x), and 128 K to 256 K (280x to 581x).
-- **FN beats Ref at every N tested.** Same algorithm; the gap is kernel fusion. The FN/Ref ratio shrinks at large N because both methods are O(N); above ~64 K the saving is per-call kernel-launch and HBM traffic overhead, not asymptotic complexity. At N = 16 K the ratio is 2.3x; at N = 64 K it is 1.2x.
+- **Above N ≈ 8 K the speedup over SDPA grows roughly linearly with N**, as expected from FN's O(N) compute versus SDPA's O(N²). Doubling N from 16 K to 32 K roughly doubles the speedup (44x to 90x). Same at 32 K to 64 K (90x to 191x), 64 K to 128 K (191x to 409x), and 128 K to 256 K (409x to 842x).
+- **FN beats Ref at every N tested.** Same algorithm; the gap is kernel fusion and GPU utilization. The FN/Ref ratio is largest at short N, where the reference pays fixed per-op launch overhead that FN folds into single kernels. It narrows to about 1.8x in the mid-range (32 K–64 K) and holds at 1.8x to 2.1x out to N = 256 K, where the saving is HBM traffic and the multi-CTA split that keeps the GPU busy at this batch×head.
 - **Neither method OOMs at N = 262144 on 8 GB.** SDPA's wall is wall-clock (~20 s per fwd+bwd at N = 256 K), not memory. PyTorch's SDPA uses memory-efficient attention internally, so it scales linearly in memory; the O(N²) compute is what makes it unusable past 32 K or so in practice.
 
 Reproduce with `python benchmarks/bench_fwd_bwd.py`.
+
+## A100: same algorithm, FlashNystrom vs cuBLAS
+
+The 5060 table is FlashNystrom against *exact* attention. This one isolates kernel quality: FlashNystrom against the **same Nyström algorithm** in plain PyTorch (the `Ref` above, where every matmul is a cuBLAS call and every softmax a torch kernel, with no fusion across stages). Same math, same FLOPs; the only difference is the kernels. A100-80GB, FP16, newton_iter=6. `f x` and `tot x` are cuBLAS_time / FN_time; values > 1 mean FN is faster.
+
+High batch×head (B=4, H=16, head_dim=128, m=64):
+
+| N      | FN fwd | cuBLAS fwd | f x   | FN tot | cuBLAS tot | tot x |
+|-------:|-------:|-----------:|------:|-------:|-----------:|------:|
+|   4096 |   1.90 |       1.57 | 0.83x |   6.77 |       7.31 | 1.08x |
+|  16384 |   3.30 |       3.13 | 0.95x |  17.55 |      22.43 | 1.28x |
+|  65536 |   9.19 |      11.11 | 1.21x |  60.86 |      85.37 | 1.40x |
+| 131072 |  17.23 |      21.61 | 1.25x | 116.49 |     199.00 | 1.71x |
+
+Long context, few heads (B=1, H=4, head_dim=64, m=32):
+
+| N       | FN fwd | cuBLAS fwd | f x   | FN tot | cuBLAS tot | tot x |
+|--------:|-------:|-----------:|------:|-------:|-----------:|------:|
+|   65536 |   1.02 |       1.68 | 1.64x |   4.95 |       5.93 | 1.20x |
+|  131072 |   1.56 |       1.64 | 1.05x |   8.67 |       8.27 | 0.95x |
+|  262144 |   2.65 |       2.77 | 1.04x |  16.05 |      17.82 | 1.11x |
+|  524288 |   4.81 |       4.86 | 1.01x |  30.34 |      41.97 | 1.38x |
+| 1048576 |   9.17 |       9.47 | 1.03x |  58.88 |      83.79 | 1.42x |
+| 2097152 |  17.89 |      18.55 | 1.04x | 116.31 |     166.80 | 1.43x |
+
+Reading the A100 tables:
+
+- **The forward crosses over to a win as N grows.** At high batch×head the forward `f x` climbs 0.83 to 1.25 with N: fusion's saved HBM traffic compounds as the sequence grows. At small N it loses, because fixed per-call costs (the three softmaxes and the Newton-Schulz pseudoinverse) dominate before there is enough N to amortize them. The same crossover holds at higher batch×head: at B=8, H=16 the forward is 1.25x and the total 1.50x at N=65536.
+- **End-to-end, FlashNystrom wins almost everywhere**, by 1.08x to 1.71x at high batch×head and 1.1x to 1.43x in long context. The one exception is N=131072 in the long-context config (0.95x), a narrow band bracketed by wins on both sides.
+- **In long context with few heads the forward is at parity** (1.01x to 1.05x). At batch×head = 4 with very large N, cuBLAS's batched GEMMs already fill the GPU, so fusion's only forward edge is the small HBM-traffic saving. The end-to-end win there comes from the backward: graph-captured Newton-Schulz plus O(m·N) fusion versus the reference's autograd through every stage.
+
+Reproduce with `modal run tools/modal_a100.py::bench` (and `::bench_gaps` for the extended N range). Requires a Modal account and a one-time `modal setup`.
 
 ## SMEM sizing and occupancy
 
