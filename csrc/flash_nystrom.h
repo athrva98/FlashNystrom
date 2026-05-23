@@ -23,8 +23,16 @@ struct NystromParams {
     int newton_iter;
     bool is_bf16;
 
-    void* __restrict__ q_ptr;             // (B, H, N, D)
-    void* __restrict__ k_ptr;             // (B, H, N, D)
+    // q_ptr/k_ptr hold the SCALED copies (q*scale, k*scale) that the forward
+    // kernels read and that are saved for the backward. q_in_ptr/k_in_ptr are
+    // the ORIGINAL unscaled user tensors, read by the landmark kernel and used
+    // as the source of the scaled copy. Folding the scale into that copy (one
+    // scaled_copy pass) removes the redundant clone + scale_inplace double pass
+    // over Q and K, which was ~44% of the forward at high batch*head.
+    const void* __restrict__ q_in_ptr;    // (B, H, N, D) unscaled
+    const void* __restrict__ k_in_ptr;    // (B, H, N, D) unscaled
+    void* __restrict__ q_ptr;             // (B, H, N, D) scaled (written by scaled_copy)
+    void* __restrict__ k_ptr;             // (B, H, N, D) scaled (written by scaled_copy)
     void* __restrict__ v_ptr;             // (B, H, N, D)
     void* __restrict__ o_ptr;             // (B, H, N, D)
 

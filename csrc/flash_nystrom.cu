@@ -74,9 +74,14 @@ std::vector<torch::Tensor> nystrom_fwd(
     auto opts = q.options();
     auto opts_f32 = opts.dtype(torch::kFloat32);
 
-    // Clone q, k for in-place scaling (originals are not modified)
-    auto q_s = q.clone();
-    auto k_s = k.clone();
+    // Scaled copies of q, k (q_s = q * scale). Allocated empty and filled by a
+    // single scaled_copy pass in the kernel pipeline -- this replaces the old
+    // "clone then scale_inplace" double pass (the clone existed only to avoid
+    // mutating the user's inputs; folding the scale into it removes a full
+    // redundant read+write of Q and K). The user's q, k are read-only. q_s, k_s
+    // are saved for the backward, which still consumes the SCALED values.
+    auto q_s = torch::empty_like(q);
+    auto k_s = torch::empty_like(k);
 
     auto output       = torch::empty({B, H, N, D}, opts);
     auto q_tilde      = torch::empty({B, H, m, D}, opts);
@@ -102,8 +107,10 @@ std::vector<torch::Tensor> nystrom_fwd(
     params.newton_iter = static_cast<int>(newton_iter);
     params.is_bf16 = (dtype == at::ScalarType::BFloat16);
 
-    params.q_ptr = q_s.data_ptr();
-    params.k_ptr = k_s.data_ptr();
+    params.q_in_ptr = q.data_ptr();   // unscaled user Q (landmark + scaled_copy source)
+    params.k_in_ptr = k.data_ptr();   // unscaled user K
+    params.q_ptr = q_s.data_ptr();    // scaled Q (filled by scaled_copy, saved for bwd)
+    params.k_ptr = k_s.data_ptr();    // scaled K
     params.v_ptr = v.data_ptr();
     params.o_ptr = output.data_ptr();
     params.q_tilde_ptr = q_tilde.data_ptr();

@@ -63,19 +63,45 @@ __global__ void landmark_kernel(
     }
 }
 
-// In-place scaling: Q *= scale, K *= scale
-// Grid: (ceil(total/256)), Block: 256
-
+// Scaled copy: dst[i] = src[i] * scale, for the full flattened tensor.
+//
+// This replaces the old "clone then scale_inplace" two-pass sequence. The
+// backward needs the SCALED q/k saved, and the forward already had to clone
+// q/k (to avoid mutating the user's inputs) -- so folding the scalar multiply
+// into that clone removes an entire redundant read+write of Q and K. At high
+// batch*head that pass was ~44% of the whole forward (a separate in-place
+// scale runs at ~0.87 TB/s, far below peak), so eliminating it is the single
+// biggest forward win.
+//
+// Vectorized: each thread moves 16 bytes (a uint4 = 8 fp16/bf16 or 4 fp32) so
+// the copy saturates HBM bandwidth instead of issuing 2-byte transactions.
+// src == dst is allowed (in-place scale): each thread owns disjoint elements,
+// so there is no aliasing hazard. Grid-stride so a capped grid is correct.
 template <typename scalar_t>
-__global__ void scale_inplace_kernel(
-    scalar_t* __restrict__ data,    // flattened array
-    int total_elements,
-    float scale
+__global__ void scaled_copy_kernel(
+    const scalar_t* __restrict__ src,
+    scalar_t* __restrict__ dst,
+    int total, float scale
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total_elements) {
-        data[idx] = from_float<scalar_t>(to_float(data[idx]) * scale);
+    constexpr int VEC = static_cast<int>(16 / sizeof(scalar_t));  // 8 fp16/bf16, 4 fp32
+    const int nvec = total / VEC;
+    const int stride = gridDim.x * blockDim.x;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (int v = tid; v < nvec; v += stride) {
+        // Load through a uint4 local (16-byte aligned by type) so the
+        // reinterpret to scalar_t* is properly aligned for element access.
+        uint4 vec = *reinterpret_cast<const uint4*>(src + v * VEC);
+        scalar_t* buf = reinterpret_cast<scalar_t*>(&vec);
+        #pragma unroll
+        for (int j = 0; j < VEC; j++)
+            buf[j] = from_float<scalar_t>(to_float(buf[j]) * scale);
+        *reinterpret_cast<uint4*>(dst + v * VEC) = vec;
     }
+    // Scalar tail (total is divisible by D>=64 hence by VEC in all supported
+    // shapes; this guard is defensive against future shapes).
+    for (int i = nvec * VEC + tid; i < total; i += stride)
+        dst[i] = from_float<scalar_t>(to_float(src[i]) * scale);
 }
 
 // -- launch wrapper --
@@ -101,16 +127,33 @@ void launch_landmarks(
     FN_CUDA_KERNEL_CHECK();
 }
 
+// dst[i] = src[i] * scale over `total` elements. src == dst is allowed.
+template <typename scalar_t>
+void launch_scaled_copy(
+    const scalar_t* src, scalar_t* dst, int total, float scale,
+    cudaStream_t stream
+) {
+    if (total <= 0) return;
+    constexpr int VEC = static_cast<int>(16 / sizeof(scalar_t));
+    const int threads = 256;
+    const int nvec = total / VEC;
+    // Cap the grid; the kernel is grid-stride so any cap stays correct.
+    const int kMaxBlocks = 65535;
+    int blocks = (nvec + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    if (blocks > kMaxBlocks) blocks = kMaxBlocks;
+    scaled_copy_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+        src, dst, total, scale);
+    FN_CUDA_KERNEL_CHECK();
+}
+
+// In-place scale: data[i] *= scale. Thin wrapper over the vectorized scaled
+// copy (still used by the backward to scale dQ/dK).
 template <typename scalar_t>
 void launch_scale_inplace(
     scalar_t* data, int total_elements, float scale, cudaStream_t stream
 ) {
-    if (total_elements <= 0) return;
-    int threads = 256;
-    int blocks = (total_elements + threads - 1) / threads;
-    scale_inplace_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-        data, total_elements, scale);
-    FN_CUDA_KERNEL_CHECK();
+    launch_scaled_copy<scalar_t>(data, data, total_elements, scale, stream);
 }
 
 } // namespace flash_nystrom

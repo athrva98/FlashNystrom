@@ -30,27 +30,29 @@ namespace flash_nystrom {
 // FP16/BF16 path: uses tensor-core kernel1
 template <typename elem_type>
 static void run_nystrom_fwd_half(NystromParams &p) {
-    auto* q   = static_cast<const elem_type*>(p.q_ptr);
-    auto* k   = static_cast<const elem_type*>(p.k_ptr);
+    auto* q_in = static_cast<const elem_type*>(p.q_in_ptr);  // unscaled user Q
+    auto* k_in = static_cast<const elem_type*>(p.k_in_ptr);  // unscaled user K
     auto* v   = static_cast<const elem_type*>(p.v_ptr);
     auto* o   = static_cast<elem_type*>(p.o_ptr);
     auto* qt  = static_cast<elem_type*>(p.q_tilde_ptr);
     auto* kt  = static_cast<elem_type*>(p.k_tilde_ptr);
     auto* s2  = static_cast<elem_type*>(p.step2_ptr);
     auto* b   = static_cast<elem_type*>(p.b_ptr);
-    auto* q_m = static_cast<elem_type*>(p.q_ptr);
-    auto* k_m = static_cast<elem_type*>(p.k_ptr);
+    auto* q_m = static_cast<elem_type*>(p.q_ptr);            // scaled Q (dst)
+    auto* k_m = static_cast<elem_type*>(p.k_ptr);            // scaled K (dst)
 
     KernelProfiler prof(p.stream);
     int total = p.BH * p.seq_len * p.head_dim;
 
     prof.run("landmarks", [&] {
-        launch_landmarks<elem_type>(q, k, qt, kt,
+        launch_landmarks<elem_type>(q_in, k_in, qt, kt,
             p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
     });
-    prof.run("scale_inplace(q,k)", [&] {
-        launch_scale_inplace<elem_type>(q_m, total, p.scale, p.stream);
-        launch_scale_inplace<elem_type>(k_m, total, p.scale, p.stream);
+    // Scaled copy q_in -> q_m, k_in -> k_m (folds the softmax scale into the
+    // clone the backward needs anyway, replacing a separate scale_inplace pass).
+    prof.run("scaled_copy(q,k)", [&] {
+        launch_scaled_copy<elem_type>(q_in, q_m, total, p.scale, p.stream);
+        launch_scaled_copy<elem_type>(k_in, k_m, total, p.scale, p.stream);
     });
     prof.run("kernel2_inv", [&] {
         launch_kernel2_inv<elem_type>(qt, kt,
@@ -74,23 +76,23 @@ static void run_nystrom_fwd_half(NystromParams &p) {
 // FP32 path: uses scalar kernel1 (LDSM doesn't support 32-bit elements)
 static void run_nystrom_fwd_fp32_impl(NystromParams &p) {
     using T = float;
-    auto* q   = static_cast<const T*>(p.q_ptr);
-    auto* k   = static_cast<const T*>(p.k_ptr);
+    auto* q_in = static_cast<const T*>(p.q_in_ptr);  // unscaled user Q
+    auto* k_in = static_cast<const T*>(p.k_in_ptr);  // unscaled user K
     auto* v   = static_cast<const T*>(p.v_ptr);
     auto* o   = static_cast<T*>(p.o_ptr);
     auto* qt  = static_cast<T*>(p.q_tilde_ptr);
     auto* kt  = static_cast<T*>(p.k_tilde_ptr);
     auto* s2  = static_cast<T*>(p.step2_ptr);
     auto* b   = static_cast<T*>(p.b_ptr);
-    auto* q_m = static_cast<T*>(p.q_ptr);
-    auto* k_m = static_cast<T*>(p.k_ptr);
+    auto* q_m = static_cast<T*>(p.q_ptr);            // scaled Q (dst)
+    auto* k_m = static_cast<T*>(p.k_ptr);            // scaled K (dst)
 
-    launch_landmarks<T>(q, k, qt, kt,
+    launch_landmarks<T>(q_in, k_in, qt, kt,
         p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
 
     int total = p.BH * p.seq_len * p.head_dim;
-    launch_scale_inplace<T>(q_m, total, p.scale, p.stream);
-    launch_scale_inplace<T>(k_m, total, p.scale, p.stream);
+    launch_scaled_copy<T>(q_in, q_m, total, p.scale, p.stream);
+    launch_scaled_copy<T>(k_in, k_m, total, p.scale, p.stream);
 
     launch_kernel2_inv<T>(qt, kt,
         p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
