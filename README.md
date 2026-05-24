@@ -103,6 +103,8 @@ Forward and backward latency in milliseconds on an RTX 5060 Laptop (Blackwell co
 | 131072 |   2.77 |   9.19 |  11.96 |   21.45 |  1122.66 |  3770.79 |  4893.45 |  1.8x  |   409x  |         +4,881 |
 | 262144 |   5.35 |  18.05 |  23.40 |   48.59 |  4613.17 | 15081.63 | 19694.80 |  2.1x  |   842x  |        +19,671 |
 
+![FlashNystrom vs cuBLAS-Nystrom vs SDPA fwd+bwd latency on an RTX 5060, log-log](assets/latency_5060.png)
+
 The speedup columns are *base time / FN time*. Values > 1 mean FN is faster; values < 1 mean FN is slower than the base. The last column is the absolute time difference per fwd+bwd call (positive means FN is faster).
 
 Reading the table:
@@ -160,6 +162,8 @@ H100, long context, few heads (B=1, H=4, head_dim=64, m=32):
 | 1048576 |   3.58 |       4.42 | 1.23x |  40.00 |      43.70 | 1.09x |
 | 2097152 |   6.84 |       8.55 | 1.25x |  79.15 |      86.95 | 1.10x |
 
+![FlashNystrom vs cuBLAS-Nystrom fwd+bwd latency on A100 and H100, log-log](assets/latency_datacenter_cublas.png)
+
 Reading the tables:
 
 - **The forward wins across N at low batch×head.** It is 1.4x to 2.0x on the A100 and 1.2x to 3.3x on the H100. This is the regime the parallelized landmark kernel fixed: a single landmark's segment of N/m rows used to be summed by one thread serially, which was latency-bound at large N; splitting that reduction across threads made it bandwidth-bound. The forward GEMMs (kernel1, kernel3) were already faster than cuBLAS here because fusion saves HBM traffic.
@@ -194,6 +198,8 @@ Long context, few heads (B=1, H=4, head_dim=64, m=32):
 | 1048576 |  39.5  | 13408   | 7904    |  340x  |  200x  |
 | 2097152 |  76.8  | n/r     | n/r     |   -    |   -    |
 
+![FlashNystrom (approx O(mN)) vs FlashAttention-2/3 (exact O(N^2)) fwd+bwd latency on H100, log-log](assets/latency_flashattention_h100.png)
+
 Reading the tables:
 
 - **At short N, use exact attention.** At N=4096 (high batch×head) FA3 is slightly faster than FN (0.9x), and the two are close in long context at N=16384 (1.3x). Exact attention is cheap when N² is small and carries no approximation error. The crossover is roughly N=4K to 16K.
@@ -226,6 +232,8 @@ m=64, D=128, FP16, niter=6):
 Reproduce with `python tools/kernel_report.py`. (`landmark_kernel` is
 threads-bound, not occupancy-starved: one 1024-thread block is 32 warps, and
 it is bandwidth-bound after the segment-reduction parallelization.)
+
+![Per-kernel dynamic SMEM and blocks/SM on an RTX 5060, colored by binding constraint](assets/occupancy_smem.png)
 
 **Are we leaving performance on the table on bigger-SMEM GPUs?**
 
