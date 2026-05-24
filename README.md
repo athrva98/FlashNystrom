@@ -209,6 +209,33 @@ Reading the tables:
 
 Built and measured with `modal run tools/modal_a100.py::bench_fa_h100` (installs FA2 plus a trimmed FA3 Hopper build, then benchmarks).
 
+### FlashAttention-4 (indirect estimate)
+
+We have no Blackwell card, so we cannot measure FlashNystrom against FlashAttention-4 directly: FA4 is Blackwell-native, and FN on H100 is the fastest we can run. But FA4 is still *exact* O(N²) attention, so the asymptotics do not change. A faster constant factor shifts the crossover; it does not escape the O(N²) wall.
+
+For a rough number we bridge through published peak attention throughput. FA4 reports **~1605 TFLOP/s** (BF16, 71% utilization) on B200; FA3 reports **~740 TFLOP/s** (FP16, 75% utilization) on H100. BF16 and FP16 run at the same tensor-core rate, so for compute-bound attention FA4-on-B200 is about **2.2x faster than FA3-on-H100** (1605 / 740). Dividing our *measured* FN-vs-FA3 ratios by that factor:
+
+`FN/FA4 (derived)  ≈  (FN/FA3 measured on H100)  /  2.2`
+
+Long context (B=1, H=4, head_dim=64, m=32):
+
+| N       | FA3/FN (measured, H100) | FA4/FN (derived) |
+|--------:|------------------------:|-----------------:|
+|   16384 |                    1.3x |            ~0.6x |
+|   65536 |                    9.9x |            ~4.5x |
+|  131072 |                   20.6x |            ~9.4x |
+|  262144 |                     46x |             ~21x |
+|  524288 |                     92x |             ~42x |
+| 1048576 |                    200x |             ~91x |
+
+(At high batch×head the same division applies: the measured 62x vs FA3 at N=131072 becomes ~28x vs FA4.)
+
+**Read this with the asterisk it deserves.** It is *derived, not measured*: we divided our wall-clock FN-vs-FA3 ratios by a ratio of two papers' peak forward throughputs on two different GPUs. And it *handicaps us on purpose*. FN runs on H100, FA4 on its native B200, and the 2.2x factor hands FA4 the entire B200-plus-next-gen-kernel improvement, so these are a **floor** on FN's advantage, not a ceiling; on equal hardware FN would look better, not worse. The throughput proxy is only fair in the large-N, compute-bound regime where FN's win lives (at small N exact attention wins and is the right choice anyway), and it is forward-throughput-based while the table is fwd+bwd.
+
+The point survives the caveats: at long context FN's O(m·N) is far enough ahead that even a ~2.2x-faster exact kernel on a newer GPU is still tens of times slower at N ≥ 128K. FA4 moves the crossover out (to roughly N = 16 to 32K here); it does not remove it.
+
+Sources: FlashAttention-4 (Colfax Research / Together AI, arXiv:2603.05451); FlashAttention-3 (Shah et al., 2024).
+
 ## SMEM sizing and occupancy
 
 The kernels are sized for the consumer SMEM envelope (~100 KB/SM on Ampere
@@ -353,6 +380,7 @@ pytest tests/
 * Dao, Fu, Ermon, Rudra, Re. *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*. NeurIPS 2022.
 * Dao. *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*. ICLR 2024.
 * Shah, Bikshandi, Zhang, Thakkar, Ramani, Dao. *FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision*. NeurIPS 2024.
+* Colfax Research / Together AI. *FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling*. arXiv:2603.05451, 2026. (Used only for the indirect FA4 throughput estimate; see the latency section.)
 
 The kernel layouts, the tiled-softmax running-LSE state machine, and the
 CUTE SmemLayoutAtomQ/KV patterns are adapted from FlashAttention-2. We do
