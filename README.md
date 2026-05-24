@@ -369,4 +369,7 @@ Apache License 2.0. See `LICENSE`.
 
 Athrva Pandhare. athrva98@gmail.com.
 
-Developed with Claude's help.
+## AI assistance
+
+Claude (Anthropic) was used as a coding aid, mostly for CUTLASS / CuTe
+device-API syntax. The kernel designs and the algorithm are my own.
