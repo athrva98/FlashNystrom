@@ -84,6 +84,52 @@ image = (
 
 app = modal.App("flash-nystrom-a100", image=image)
 
+# Image with FlashAttention-2 and FlashAttention-3 on top of the FN build, for
+# the head-to-head vs exact attention. FA2 ships wheels (falls back to source);
+# FA3 (Hopper) has no wheel and must build from the repo's hopper/ subdir. Both
+# installs are wrapped with `|| echo` so a failure does NOT abort the image
+# build -- bench_fa_h100 imports each at runtime and skips whichever is missing.
+fa_image = (
+    image
+    .env({
+        "TORCH_CUDA_ARCH_LIST": "9.0",
+        "MAX_JOBS": "4",
+        # Trim the FA3 (hopper) build to just what we benchmark: fp16, head
+        # dims 64/128, fwd+bwd. Disabling fp8, the larger head dims, paged-KV,
+        # split-KV, local/softcap/packgqa, and the sm8x fallback cuts the
+        # instantiation count (and the multi-minute compile + log volume that
+        # broke the client stream) by most. Unknown flag names are ignored, so
+        # this is safe across FA versions.
+        # Flag names verified against flash-attention hopper/setup.py. SM80 (not
+        # SM8x) is the sm_80 fallback toggle; we run on H100 so skip it, which
+        # drops the largest slice of the build. We use flash_attn_func (fixed
+        # length, same head dims for q/k/v), so varlen/appendkv/paged/split/
+        # packgqa/softcap/local and the non-64/128 head dims are all unused.
+        # Cluster and the hdim 64/128 same-dim paths are kept so the FA3 numbers
+        # reflect its best kernels.
+        "FLASH_ATTENTION_DISABLE_SM80": "TRUE",
+        "FLASH_ATTENTION_DISABLE_FP8": "TRUE",
+        "FLASH_ATTENTION_DISABLE_HDIM96": "TRUE",
+        "FLASH_ATTENTION_DISABLE_HDIM192": "TRUE",
+        "FLASH_ATTENTION_DISABLE_HDIM256": "TRUE",
+        "FLASH_ATTENTION_DISABLE_PAGEDKV": "TRUE",
+        "FLASH_ATTENTION_DISABLE_APPENDKV": "TRUE",
+        "FLASH_ATTENTION_DISABLE_SPLIT": "TRUE",
+        "FLASH_ATTENTION_DISABLE_LOCAL": "TRUE",
+        "FLASH_ATTENTION_DISABLE_SOFTCAP": "TRUE",
+        "FLASH_ATTENTION_DISABLE_PACKGQA": "TRUE",
+        "FLASH_ATTENTION_DISABLE_VARLEN": "TRUE",
+    })
+    .run_commands(
+        "pip install packaging ninja",
+        "pip install flash-attn --no-build-isolation || echo FA2_INSTALL_FAILED",
+        "git clone --depth 1 https://github.com/Dao-AILab/flash-attention "
+        "/tmp/flash-attention || echo FA_CLONE_FAILED",
+        "cd /tmp/flash-attention/hopper && python setup.py install "
+        "|| echo FA3_BUILD_FAILED",
+    )
+)
+
 
 def _run_tests():
     """Run the full test suite on whichever GPU the wrapper selected."""
@@ -455,6 +501,116 @@ def bench_profile():
     print("\nPer-kernel ms is event-timed with a sync after each kernel (profiling "
           "serializes the pipeline, so the sum overstates the real wall time, but "
           "the per-kernel ATTRIBUTION is accurate).")
+
+
+@app.function(gpu="H100", timeout=7200, image=fa_image)
+def bench_fa_h100():
+    """FlashNystrom vs FlashAttention-2 vs FlashAttention-3 on the H100.
+
+    FA2/FA3 compute EXACT O(N^2) attention; FN is approximate O(m*N). So this
+    is the "vs exact attention" comparison (like the 5060 SDPA table) but
+    against the actual SOTA Hopper kernels. FA expects (B, S, H, D); our
+    tensors are (B, H, N, D), so we transpose for the FA calls. FA is run only
+    where it is compute-feasible (it is O(N^2)); past that FN keeps scaling.
+    """
+    import torch
+    from flash_nystrom.flash_nystrom import flash_nystrom_attention
+
+    fa2 = fa3 = None
+    try:
+        from flash_attn import flash_attn_func as fa2
+    except Exception as e:  # noqa: BLE001
+        print("FA2 unavailable:", repr(e))
+    try:
+        from flash_attn_interface import flash_attn_func as fa3
+    except Exception as e:  # noqa: BLE001
+        print("FA3 unavailable:", repr(e))
+
+    dtype = torch.float16
+    dev = "cuda"
+    print(f"GPU: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
+    print(f"FA2: {'available' if fa2 else 'MISSING'}   "
+          f"FA3: {'available' if fa3 else 'MISSING'}\n")
+
+    def cuda_time(fn, warmup, reps):
+        try:
+            for _ in range(warmup):
+                fn()
+            torch.cuda.synchronize()
+            evs = [(torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True)) for _ in range(reps)]
+            for s, e in evs:
+                s.record(); fn(); e.record()
+            torch.cuda.synchronize()
+            return sorted(s.elapsed_time(e) for s, e in evs)[reps // 2]
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
+            torch.cuda.empty_cache()
+            return float("nan")
+
+    # FA takes (B, S, H, D); some versions return (out, lse). Normalize both.
+    def fa_out(o):
+        return o[0] if isinstance(o, tuple) else o
+
+    def fn_fwdbwd(q, k, v, dout, m):
+        def run():
+            qq = q.detach().requires_grad_(True)
+            kk = k.detach().requires_grad_(True)
+            vv = v.detach().requires_grad_(True)
+            flash_nystrom_attention(qq, kk, vv, num_landmarks=m,
+                                    newton_iter=6).backward(dout)
+        return run
+
+    def fa_fwdbwd(fa, q, k, v, dout):
+        def run():
+            qq = q.transpose(1, 2).detach().requires_grad_(True)
+            kk = k.transpose(1, 2).detach().requires_grad_(True)
+            vv = v.transpose(1, 2).detach().requires_grad_(True)
+            o = fa_out(fa(qq, kk, vv, causal=False))
+            o.backward(dout.transpose(1, 2))
+        return run
+
+    def reps_for(N):
+        if N <= 16384:   return 5, 15
+        if N <= 65536:   return 3, 8
+        if N <= 262144:  return 2, 5
+        return 1, 2
+
+    def rx(a, b):
+        return f"{b/a:6.1f}x" if (a == a and b == b and a > 0) else "   -  "
+
+    # (label, B, H, D, m, [N], FA feasibility cap)
+    configs = [
+        ("HIGH BH (B=4, H=16, D=128, m=64)",
+         4, 16, 128, 64, [4096, 16384, 65536, 131072], 131072),
+        ("LONG CONTEXT (B=1, H=4, D=64, m=32)",
+         1, 4, 64, 32, [16384, 65536, 131072, 262144, 524288, 1048576, 2097152],
+         1048576),
+    ]
+    hdr = (f"{'B,H':>6} {'N':>8} | {'FN tot':>8} {'FA2 tot':>9} {'FA3 tot':>9} | "
+           f"{'FA2/FN':>7} {'FA3/FN':>7}")
+    for (label, B, H, D, m, Ns, fa_cap) in configs:
+        print(f"\n### {label}  (fwd+bwd ms; FA2/FA3 = exact O(N^2))")
+        print(hdr); print("-" * len(hdr))
+        for N in Ns:
+            if B * H * N * D > 2**31 - 1:
+                print(f"{B},{H:>3} {N:>8} | FN exceeds int32 element cap; skipped")
+                continue
+            g = lambda: torch.randn(B, H, N, D, dtype=dtype, device=dev)
+            q, k, v, dout = g(), g(), g(), g()
+            w, r = reps_for(N)
+            fnt = cuda_time(fn_fwdbwd(q, k, v, dout, m), w, r)
+            fa2t = (cuda_time(fa_fwdbwd(fa2, q, k, v, dout), w, r)
+                    if (fa2 and N <= fa_cap) else float("nan"))
+            fa3t = (cuda_time(fa_fwdbwd(fa3, q, k, v, dout), w, r)
+                    if (fa3 and N <= fa_cap) else float("nan"))
+            print(f"{B},{H:>3} {N:>8} | {fnt:8.2f} {fa2t:9.2f} {fa3t:9.2f} | "
+                  f"{rx(fnt, fa2t):>7} {rx(fnt, fa3t):>7}")
+            del q, k, v, dout
+            torch.cuda.empty_cache()
+
+    print("\nFA2/FA3 are exact O(N^2) attention; FN is approximate O(m*N). "
+          "FA2/FN and FA3/FN = FA_total / FN_total; >1 means FN is faster. "
+          "'-' = FA past its compute-feasible N (O(N^2) wall); FN keeps scaling.")
 
 
 @app.local_entrypoint()
