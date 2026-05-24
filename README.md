@@ -169,6 +169,40 @@ Reading the tables:
 
 Reproduce with `modal run tools/modal_a100.py::bench_gaps` (A100) or `::bench_gaps_h100` (H100). Requires a Modal account and a one-time `modal setup`.
 
+## FlashAttention-2 / FlashAttention-3 (exact attention), H100
+
+The tables above compare FlashNystrom to the *same* Nyström algorithm in cuBLAS. This one compares it to the alternative people actually reach for: **exact** attention via FlashAttention. FA2 and FA3 compute exact O(N²) attention (FA3 is the Hopper-native current SOTA); FlashNystrom computes approximate O(m·N) Nyström. They are not the same computation, so this is a speed comparison that only matters where the Nyström approximation is acceptable (it is for the CIFAR-10 ViT, which matches the exact-attention baseline accuracy). H100-80GB, FP16, fwd+bwd, newton_iter=6. `FA2/FN` and `FA3/FN` are FA_total / FN_total; > 1 means FlashNystrom is faster. FA3 was built with its cluster and hdim-64/128 kernels intact (only genuinely unused variants trimmed), so these are its best kernels for these shapes.
+
+High batch×head (B=4, H=16, head_dim=128, m=64):
+
+| N      | FN tot | FA2 tot | FA3 tot | FA2/FN | FA3/FN |
+|-------:|-------:|--------:|--------:|-------:|-------:|
+|   4096 |   3.69 |    5.89 |    3.38 |  1.6x  |  0.9x  |
+|  16384 |   8.75 |   93.1  |   51.6  | 10.6x  |  5.9x  |
+|  65536 |  28.1  | 1477    |  837    | 52.5x  | 29.8x  |
+| 131072 |  54.2  | 5901    | 3380    |  109x  | 62.4x  |
+
+Long context, few heads (B=1, H=4, head_dim=64, m=32):
+
+| N       | FN tot | FA2 tot | FA3 tot | FA2/FN | FA3/FN |
+|--------:|-------:|--------:|--------:|-------:|-------:|
+|   16384 |   1.39 |    3.09 |    1.78 |  2.2x  |  1.3x  |
+|   65536 |   3.27 |   49.3  |   32.2  | 15.1x  |  9.9x  |
+|  131072 |   5.95 |  203    |  123    | 34.1x  | 20.6x  |
+|  262144 |  10.5  |  808    |  483    |   77x  |   46x  |
+|  524288 |  21.4  | 3319    | 1966    |  155x  | 91.7x  |
+| 1048576 |  39.5  | 13408   | 7904    |  340x  |  200x  |
+| 2097152 |  76.8  | n/r     | n/r     |   -    |   -    |
+
+Reading the tables:
+
+- **At short N, use exact attention.** At N=4096 (high batch×head) FA3 is slightly faster than FN (0.9x), and the two are close in long context at N=16384 (1.3x). Exact attention is cheap when N² is small and carries no approximation error. The crossover is roughly N=4K to 16K.
+- **Past the crossover the O(N²) wall takes over.** FlashNystrom's O(m·N) cost grows linearly while exact attention grows quadratically, so the gap widens fast: 5.9x at 16K, 30x at 65K, 62x at 131K (high batch×head); and in long context from 20x at 131K up to **200x at 1M tokens** versus FA3.
+- **Exact attention eventually stops being practical.** At N=1M, FA2 is already 13 s per fwd+bwd call (FA3 ~8 s) and climbing quadratically; at 2M tokens (`n/r`) we no longer run it, while FlashNystrom finishes the full fwd+bwd in 77 ms.
+- **FA3 is ~1.7x faster than FA2** here (Hopper-native kernels), so it is the right exact-attention baseline. FlashNystrom still pulls away from FA3 at long N.
+
+Built and measured with `modal run tools/modal_a100.py::bench_fa_h100` (installs FA2 plus a trimmed FA3 Hopper build, then benchmarks).
+
 ## SMEM sizing and occupancy
 
 The kernels are sized for the consumer SMEM envelope (~100 KB/SM on Ampere
