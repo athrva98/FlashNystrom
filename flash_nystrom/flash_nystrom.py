@@ -123,6 +123,49 @@ class FlashNystromFunction(torch.autograd.Function):
         return dQ, dK, dV, None, None, None
 
 
+# Landmark range gating constants. The custom CUDA kernels only handle m <= 64
+# (kernel tile-size limit). For m > 64 we currently dispatch to the pure-PyTorch
+# reference, which materializes the (N, m) softmax intermediates — see the
+# comment in flash_nystrom_attention below for the trade-off and the memory
+# guard. The plan is to replace this reference dispatch with custom kernels,
+# kernel-by-kernel, as each m-agnostic implementation lands and is verified.
+_M_CUSTOM_KERNEL_MAX = 64
+
+# Hard ceiling on the bytes the reference path is allowed to materialize for
+# its two (N, m) softmax intermediates in FP16/BF16. 8 GiB is a defensible
+# default that fits comfortably on consumer GPUs. Tunable via the env var
+# FLASH_NYSTROM_REFERENCE_MAX_BYTES (in bytes).
+_DEFAULT_REFERENCE_BYTE_BUDGET = 8 * (1024 ** 3)
+
+
+def _reference_softmax_bytes(q_shape, num_landmarks):
+    # Two (B, H, N, m) FP16/BF16 matrices: softmax(Q@Kt^T) for kernel1 and
+    # softmax(Qt@K^T) for kernel3. Both live concurrently in the autograd
+    # graph for the duration of the backward pass.
+    B, H, N, _ = q_shape
+    return 2 * 2 * B * H * N * int(num_landmarks)
+
+
+def _check_reference_budget(q, num_landmarks):
+    import os
+    budget = int(os.environ.get("FLASH_NYSTROM_REFERENCE_MAX_BYTES",
+                                _DEFAULT_REFERENCE_BYTE_BUDGET))
+    need = _reference_softmax_bytes(q.shape, num_landmarks)
+    if need > budget:
+        raise RuntimeError(
+            f"flash_nystrom_attention at num_landmarks={num_landmarks} routes to "
+            f"the pure-PyTorch reference (custom kernels currently support "
+            f"num_landmarks <= {_M_CUSTOM_KERNEL_MAX} only). The reference "
+            f"materializes ~{need / (1024**3):.2f} GiB of softmax intermediates "
+            f"for shape B={q.shape[0]} H={q.shape[1]} N={q.shape[2]} "
+            f"m={num_landmarks}, which exceeds the "
+            f"FLASH_NYSTROM_REFERENCE_MAX_BYTES budget of "
+            f"~{budget / (1024**3):.2f} GiB. Drop num_landmarks <= "
+            f"{_M_CUSTOM_KERNEL_MAX} for the custom path, drop N or BH, or "
+            f"raise the budget via the env var if you have the memory."
+        )
+
+
 def flash_nystrom_attention(
     q, k, v, num_landmarks=64, newton_iter=6, conv_weight=None, conv_kernel_size=0,
     fast_dk2inv=True,
@@ -135,14 +178,39 @@ def flash_nystrom_attention(
     (dconv_residual.cuh / dconv_residual_bwd.cuh) have been removed; only
     the cuDNN path exists now.
 
+    `num_landmarks` (m) range:
+      * m <= 64: custom CUDA forward + backward. Memory is O(B*H*(N+m)*D) —
+        no (N, m) softmax materialization. This is the FlashNystrom fast
+        path the library exists for.
+      * m > 64:  dispatched to the pure-PyTorch reference
+        (nystrom_attention_reference). Each matmul lowers to cuBLAS via the
+        `@` operator and PyTorch autograd handles the backward. The reference
+        materializes (N, m) softmax matrices — see _check_reference_budget
+        for the OOM guard. The intent is to gradually replace this dispatch
+        with custom kernels (kernel-by-kernel, with tests per kernel) as each
+        m-agnostic implementation lands.
+
     `fast_dk2inv` controls the `compute_dk2inv` path in the backward (FP16/BF16
     only). Default True uses the tensor-core kernel (4-6x faster on the full
     bwd). Set False to use the FP32 scalar fallback, which is bit-for-bit
     consistent with the autograd reference. The TC path converts the softmax
     output P from FP32 to FP16/BF16 before GEMM2, trimming P to a 10-bit
     mantissa — small accuracy cost, typically below FP16 training noise.
+    `fast_dk2inv` is ignored when num_landmarks > 64 (the reference path
+    doesn't use the custom dk2inv kernel).
     """
     if HAS_CUDA and q.is_cuda:
+        if num_landmarks > _M_CUSTOM_KERNEL_MAX:
+            # m > 64 -> reference. Memory check first so the user sees a
+            # clear Python error before any allocation, not a CUDA OOM.
+            _check_reference_budget(q, num_landmarks)
+            from flash_nystrom.reference import nystrom_attention_reference
+            return nystrom_attention_reference(
+                q, k, v, num_landmarks, newton_iter,
+                conv_weight, conv_kernel_size,
+            )
+
+        # m <= 64 -> custom CUDA path.
         # Pure attention via the fused kernels. The C extension knows nothing
         # about conv — that is added below at the Python level via cuDNN.
         out = FlashNystromFunction.apply(
