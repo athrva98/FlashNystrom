@@ -30,7 +30,7 @@ The kernels borrow the FA2-era CUTLASS SM80 mma atom and the tiled-softmax with 
 | Pure-PyTorch Nystromformer      |    66.3% |
 | FlashNystrom (this repo)        |    66.7% |
 
-84 tests cover forward, backward, kernel-level isolation, the production cuBLAS + CUDA-graph NS backward path, and per-kernel regression against autograd-derived references.
+95 tests cover forward, backward, kernel-level isolation, the production cuBLAS + CUDA-graph NS backward path, per-kernel regression against autograd-derived references, and the `m > 64` reference-dispatch path.
 
 ## Install
 
@@ -336,7 +336,7 @@ for x, y in loader:
 
 | Field              | Default | Notes |
 |--------------------|--------:|-------|
-| `num_landmarks`    |      64 | Capped at 64 by kernel tile size. |
+| `num_landmarks`    |      64 | Custom kernels handle `m <= 64`; `m > 64` falls back to a pure-PyTorch reference (see Limitations). |
 | `newton_iter`      |       6 | NS iterations for the pseudoinverse. Backward correctness is independent of convergence. |
 | `conv_kernel_size` |       3 | Depthwise conv1d residual on V. Set to 0 to disable. |
 | `use_conv_residual`|    True | Master switch for the conv residual. |
@@ -345,7 +345,9 @@ for x, y in loader:
 ## Limitations
 
 * `head_dim` is restricted to 64 or 128.
-* `num_landmarks` is capped at 64.
+* `num_landmarks` (m):
+  * `m <= 64` runs on the custom CUDA kernels (forward + backward). This is the FlashNystrom fast path and the regime the latency tables above were measured in.
+  * `m > 64` is supported but **dispatches to the pure-PyTorch reference** (`flash_nystrom.reference.nystrom_attention_reference`). The reference is mathematically the same algorithm, dispatches each matmul to cuBLAS via `@`, and gets the backward for free from autograd. It is **5-10x slower than the custom path would be at the same shape** and it **materializes `(B, H, N, m)` softmax intermediates** that the custom path avoids — so at large `m * N * BH` it can run out of memory. A peak-memory guard in the Python wrapper raises a clear `RuntimeError` before allocation when those intermediates would exceed an 8 GiB default budget; raise the budget with `FLASH_NYSTROM_REFERENCE_MAX_BYTES` if you have the memory, or drop `num_landmarks`, `N`, or `BH`. The `m > 64` path will be progressively replaced by custom kernels as each m-agnostic implementation lands.
 * FP32 backward at `head_dim=128` is not supported (SMEM overflow). Use FP16 or BF16.
 * Sequence length must be at least `num_landmarks`.
 * Compute capability 8.0 or newer.
@@ -359,7 +361,7 @@ csrc/                          CUDA source
   kernels/                     forward kernels
   kernels/backward/            backward kernels and isolation hooks
 flash_nystrom/                 Python package (autograd Function, config, reference)
-tests/                         84 pytest tests
+tests/                         95 pytest tests
 benchmarks/                    latency and CIFAR-10 training scripts
 examples/                      end-to-end usage examples
 notebooks/                     Colab quickstart
