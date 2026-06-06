@@ -230,9 +230,9 @@ Long context (B=1, H=4, head_dim=64, m=32):
 
 (At high batch×head the same division applies: the measured 62x vs FA3 at N=131072 becomes ~28x vs FA4.)
 
-**Read this with the asterisk it deserves.** It is *derived, not measured*: we divided our wall-clock FN-vs-FA3 ratios by a ratio of two papers' peak forward throughputs on two different GPUs. And it *handicaps us on purpose*. FN runs on H100, FA4 on its native B200, and the 2.2x factor hands FA4 the entire B200-plus-next-gen-kernel improvement, so these are a **floor** on FN's advantage, not a ceiling; on equal hardware FN would look better, not worse. The throughput proxy is only fair in the large-N, compute-bound regime where FN's win lives (at small N exact attention wins and is the right choice anyway), and it is forward-throughput-based while the table is fwd+bwd.
+These numbers are *derived from published throughput, not measured.* They also handicap FlashNystrom on purpose: FN runs on H100, FA4 on its native B200, and the 2.2x bridge hands FA4 the entire B200-plus-next-gen-kernel improvement, so these ratios are a **floor** on FN's advantage. On equal hardware FN would look better, not worse. The throughput proxy is fair in the long-N compute-bound regime where this comparison matters (at short N exact attention wins anyway and is the right choice), and it uses forward throughput while the table is fwd+bwd.
 
-The point survives the caveats: at long context FN's O(m·N) is far enough ahead that even a ~2.2x-faster exact kernel on a newer GPU is still tens of times slower at N ≥ 128K. FA4 moves the crossover out (to roughly N = 16 to 32K here); it does not remove it.
+The point holds: at long context FN's O(m·N) is far enough ahead that a ~2.2x faster exact kernel on a newer GPU is still tens of times slower at N ≥ 128K. FA4 moves the crossover out (roughly to N = 16K to 32K); it does not remove it.
 
 Sources: FlashAttention-4 (Colfax Research / Together AI, arXiv:2603.05451); FlashAttention-3 (Shah et al., 2024).
 
@@ -346,8 +346,8 @@ for x, y in loader:
 
 * `head_dim` is restricted to 64 or 128.
 * `num_landmarks` (m):
-  * `m <= 64` runs on the custom CUDA kernels (forward + backward). This is the FlashNystrom fast path and the regime the latency tables above were measured in.
-  * `m > 64` is supported but **dispatches to the pure-PyTorch reference** (`flash_nystrom.reference.nystrom_attention_reference`). The reference is mathematically the same algorithm, dispatches each matmul to cuBLAS via `@`, and gets the backward for free from autograd. It is **5-10x slower than the custom path would be at the same shape** and it **materializes `(B, H, N, m)` softmax intermediates** that the custom path avoids — so at large `m * N * BH` it can run out of memory. A peak-memory guard in the Python wrapper raises a clear `RuntimeError` before allocation when those intermediates would exceed an 8 GiB default budget; raise the budget with `FLASH_NYSTROM_REFERENCE_MAX_BYTES` if you have the memory, or drop `num_landmarks`, `N`, or `BH`. The `m > 64` path will be progressively replaced by custom kernels as each m-agnostic implementation lands.
+  * `m <= 64` runs on the custom CUDA kernels (forward + backward). This is the regime the latency tables above were measured in.
+  * `m > 64` is supported via dispatch to the pure-PyTorch reference (`flash_nystrom.reference.nystrom_attention_reference`) — mathematically the same algorithm, each matmul lowering to cuBLAS via `@`, with autograd handling the backward. The reference materializes the two `(B, H, N, m)` softmax matrices and runs slower than the custom path; the Python wrapper raises a clear `RuntimeError` before allocation when those matrices would exceed the memory budget (8 GiB default, configurable via `FLASH_NYSTROM_REFERENCE_MAX_BYTES`). Custom `m > 64` kernels are being added one at a time; this dispatch shrinks as each lands.
 * FP32 backward at `head_dim=128` is not supported (SMEM overflow). Use FP16 or BF16.
 * Sequence length must be at least `num_landmarks`.
 * Compute capability 8.0 or newer.
