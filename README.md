@@ -18,7 +18,7 @@ where Qt and Kt are landmarks formed by segmented mean pooling of Q and K. The p
 
 FlashNystrom is not a FlashAttention competitor. FlashAttention (v1/v2/v3/v4) implements *exact* O(N²) attention with IO-aware tiling. Its version bumps are hardware-targeted rewrites of the same algorithm: FA2 for Ampere and Ada, FA3 for Hopper WGMMA and TMA, FA4 for Blackwell TMEM. FlashNystrom implements a *different* attention math: the Nyström low-rank factorization, which is O(m·N·D + m³) with m landmarks. The relevant comparison is FlashNystrom against SDPA (using any FA generation under the hood) at long sequence length, where O(N²) starts to dominate and the approximation becomes worthwhile. At short N (under ~1–2K), exact attention is faster and you should use it.
 
-The kernels borrow the FA2-era CUTLASS SM80 mma atom and the tiled-softmax with running-LSE pattern, but apply them to the three Nyström softmaxes rather than to one big QK^T. They are written in pre-Hopper idioms: no WGMMA, no TMA, no warp specialization, no TMEM. They run on Hopper and Blackwell (the build covers `sm_80;86;89;90`) and benefit from the higher SMEM and register counts on those parts via occupancy, but a Hopper-native rewrite would extract more peak throughput. See [the SMEM sizing discussion](#smem-sizing-and-occupancy) below.
+The kernels borrow the FA2-era CUTLASS SM80 mma atom and the tiled-softmax with running-LSE pattern, but apply them to the three Nyström softmaxes rather than to one big QK^T. They use the SM80 idioms deliberately: no WGMMA, no TMA, no warp specialization, no TMEM. That choice keeps a **single binary that runs on every Ampere through Blackwell card** (the build covers `sm_80;86;89;90`) — Ampere consumer and datacenter, Ada, Hopper, and Blackwell consumer. WGMMA and TMA are Hopper-only, and TMEM is Blackwell-only, so adopting them would fragment the codebase into per-arch builds; the FA3/FA4 codebases pay that complexity to extract Hopper- and Blackwell-native peak throughput. FlashNystrom keeps the one-binary contract and benefits from the larger SMEM and register files on Hopper and Blackwell via occupancy. See [the SMEM sizing discussion](#smem-sizing-and-occupancy) below.
 
 ## Status
 
@@ -50,7 +50,7 @@ Requirements:
 
 * PyTorch 2.0+ with CUDA support
 * CUDA toolkit 12.2+
-* Compute capability 8.0+ (Ampere, Ada, Hopper, Blackwell). The kernels use the SM80 16x8x16 mma atom and opt into up to ~96 KB of dynamic shared memory per CTA. They run on Hopper and Blackwell but are not Hopper-native (no WGMMA/TMA). SM75 and earlier are not supported.
+* Compute capability 8.0+ (Ampere, Ada, Hopper, Blackwell). The kernels deliberately use SM80 idioms (16x8x16 mma atom, `cp.async`, up to ~96 KB of dynamic shared memory per CTA) so a single binary covers every arch from Ampere through Blackwell. WGMMA and TMA are Hopper-only and TMEM is Blackwell-only; those would require per-arch kernel families. SM75 and earlier are not supported.
 
 ## Quickstart
 
@@ -385,9 +385,12 @@ pytest tests/
 * Colfax Research / Together AI. *FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling*. arXiv:2603.05451, 2026. (Used only for the indirect FA4 throughput estimate; see the latency section.)
 
 The kernel layouts, the tiled-softmax running-LSE state machine, and the
-CUTE SmemLayoutAtomQ/KV patterns are adapted from FlashAttention-2. We do
-not implement FA3-style asynchrony (WGMMA + TMA + warp specialization);
-those are Hopper-specific and would be a separate kernel family.
+CUTE SmemLayoutAtomQ/KV patterns are adapted from FlashAttention-2. We
+intentionally stay on the FA2-era SM80 instruction set rather than
+adopting FA3-style asynchrony (WGMMA + TMA + warp specialization): those
+primitives are Hopper-only and would force a per-arch kernel split, and
+FlashNystrom's sm_80 through sm_90 single-binary contract is worth more
+to its users than the Hopper-only peak-throughput uplift would be.
 FlashAttention solves exact O(N²) attention; FlashNystrom uses these
 techniques to implement the Nyström low-rank factorization instead.
 
