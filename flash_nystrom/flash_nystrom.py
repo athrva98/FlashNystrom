@@ -72,8 +72,8 @@ class FlashNystromFunction(torch.autograd.Function):
         results = _C.forward(q, k, v, num_landmarks, newton_iter)
         # results: [output, q_s, k_s, q_tilde, k_tilde, k2inv, step2,
         #           lse1, lse2, lse3, ns_iterates, k2_softmax, b_saved]
-        # b_saved = softmax(Q_tilde @ K^T) @ V is reused in the backward so
-        # compute_dk2inv skips an O(m*N*D) recomputation pass.
+        # b_saved = softmax(Q_tilde @ K_s^T) @ V (K_s = scaled K) is reused in
+        # the backward so compute_dk2inv skips an O(m*N*D) recomputation pass.
         output = results[0]
 
         saved = list(results[1:])  # q_s, k_s, qt, kt, k2inv, step2, lse1, lse2, lse3, ns_iter, k2sm, b_saved

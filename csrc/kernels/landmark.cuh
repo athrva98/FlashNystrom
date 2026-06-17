@@ -16,10 +16,13 @@ namespace flash_nystrom {
 //   Q_tilde[b,h,l,:] = mean(Q[b,h,segment,:]) * scale
 //   K_tilde[b,h,l,:] = mean(K[b,h,segment,:]) * scale
 //
-// Grid:  (B*H, m)     — one CTA per (batch-head, landmark)
-// Block: (256)         — threads stride over D dimension
+// Grid:  (B*H, m)        — one CTA per (batch-head, landmark)
+// Block: (tpd * D)       — tpd = 1024/D threads cooperate per output column d
+//                          (so each landmark's segment is reduced by tpd*D
+//                           threads, not one thread per d serially; see below)
 //
-// SMEM: none (pure register accumulation, D <= 256 so each thread handles <=1 elem)
+// SMEM: 2 * tpd * D floats — scratch to reduce the tpd per-column partials
+//                            (Q half then K half)
 
 // Each landmark is the scaled segment-mean of Q (and K). The reduction over a
 // segment of N/m rows is split across `tpd = blockDim.x / D` threads per output

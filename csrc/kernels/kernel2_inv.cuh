@@ -16,11 +16,12 @@ namespace flash_nystrom {
 //     Z_{j+1} = (1/4) * Z_j * (13*I - M_j*(15*I - M_j*(7*I - M_j)))
 //             = (1/4) * Z_j * (13*I - 15*M_j + 7*M_j^2 - M_j^3)
 //
-// Initialization: Z_0 = K2^T / ||K2||_1.
+// Initialization: Z_0 = K2^T / (||K2||_1 * ||K2||_inf).
 //
-// To enable the unrolled backward, ALL iterates Z_0, Z_1, ..., Z_{N} are
-// written to ns_iterates_out (BH, N+1, m, m). The forward output K2_inv = Z_N
-// is also written to kernel2_inv_out separately for kernel3.
+// To enable the unrolled backward, ALL iterates Z_0, Z_1, ..., Z_J are
+// written to ns_iterates_out (BH, J+1, m, m), where J = newton_iter. The
+// forward output K2_inv = Z_J is also written to kernel2_inv_out separately
+// for kernel3.
 //
 // Iteration count is `newton_iter` (default 6, capped at 20 by binding).
 // For row-stochastic K2 with spread eigenvalues, 6 iters has residual O(1).
@@ -31,9 +32,9 @@ template <typename scalar_t>
 __global__ void kernel2_inv_kernel(
     const scalar_t* __restrict__ q_tilde,    // (B*H, m, D)
     const scalar_t* __restrict__ k_tilde,    // (B*H, m, D)
-    float* __restrict__ kernel2_inv_out,      // (B*H, m, m) FP32 — final K2_inv = Z_N
+    float* __restrict__ kernel2_inv_out,      // (B*H, m, m) FP32 — final K2_inv = Z_J
     float* __restrict__ softmax_lse_out,      // (B*H, m)
-    float* __restrict__ ns_iterates_out,      // (B*H, newton_iter+1, m, m) FP32 — Z_0..Z_N
+    float* __restrict__ ns_iterates_out,      // (B*H, newton_iter+1, m, m) FP32 — Z_0..Z_J
     float* __restrict__ k2_softmax_out,       // (B*H, m, m) FP32 — the softmax K2 (for backward)
     int D, int m, int newton_iter
 ) {
@@ -219,7 +220,7 @@ __global__ void kernel2_inv_kernel(
         }
     }
 
-    // Step 5: Write final K2_inv (= Z_N) for kernel3
+    // Step 5: Write final K2_inv (= Z_J) for kernel3
     float* out = kernel2_inv_out + bh * mm;
     for (int idx = tid; idx < mm; idx += nthreads) {
         out[idx] = Z[idx];

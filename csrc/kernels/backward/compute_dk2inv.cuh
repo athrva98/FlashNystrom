@@ -17,7 +17,7 @@ namespace flash_nystrom {
 using namespace cute;
 
 // =============================================================================
-// dK2_inv = ∂L/∂Z_N    AND    D3[i] = sum_n A3[i, n] * (dO3[i, :] · V[n, :])
+// dK2_inv = ∂L/∂Z_J  (J = newton_iter)  AND  D3[i] = sum_n A3[i, n] * (dO3[i, :] · V[n, :])
 //
 // Both outputs share B = softmax(Q_tilde @ K_s^T) @ V (the kernel3 inner
 // product before the K2_inv multiply). The kernel walks N once, accumulates

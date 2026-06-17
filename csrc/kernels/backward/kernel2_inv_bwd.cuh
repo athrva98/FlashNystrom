@@ -45,8 +45,8 @@ __global__ void ns_bwd_final_kernel(
 //
 // Inputs:
 //   q_tilde, k_tilde   (BH, m, D)               — input dtype
-//   dK2_inv_in         (BH, m, m)  FP32         — incoming gradient dZ_N
-//   ns_iterates        (BH, newton_iter+1, m, m) FP32 — Z_0 .. Z_N from forward
+//   dK2_inv_in         (BH, m, m)  FP32         — incoming gradient dZ_J (J = newton_iter)
+//   ns_iterates        (BH, newton_iter+1, m, m) FP32 — Z_0 .. Z_J from forward
 //   K2_softmax         (BH, m, m) FP32          — softmax(QK^T) output
 // Outputs (accumulated; caller-allocated, copied in then back out):
 //   dQ_tilde, dK_tilde (BH, m, D) FP32

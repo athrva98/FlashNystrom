@@ -469,12 +469,16 @@ kernel3_fused_tc(
 //
 //   Phase A  kernel3_partial_tc  grid(num_splits, BH)
 //       Each CTA processes a contiguous slice of N tiles, producing per-row
-//       partial online-softmax state: max, sum, and the UNNORMALIZED
-//       weighted-V accumulator, all in that split's local max frame. Written
-//       to scratch GMEM.
+//       partial online-softmax state: max m_s, sum l_s, and the weighted-V
+//       accumulator NORMALIZED by l_s before storing (so the stored partial
+//       sits at softmax-output magnitude ~|V|, well-scaled for the FP32
+//       round-trip rather than growing with tiles-per-split). Written to
+//       scratch GMEM in FP32.
 //   Phase B  kernel3_combine     grid(BH)
-//       Reads all splits' partials, does the flash cross-split merge
-//       (M = max_s m_s; L = sum_s e^{m_s-M} l_s; O = sum_s e^{m_s-M} O_s / L),
+//       Reads all splits' partials, does the flash cross-split merge. Because
+//       O_s is the NORMALIZED partial (O_s_unnorm = l_s * O_s), each split is
+//       re-weighted by w_s = e^{m_s-M} * l_s:
+//       (M = max_s m_s; L = sum_s e^{m_s-M} l_s; O = sum_s w_s O_s / L),
 //       writes B and LSE, then the K2_inv @ O -> step2 tail.
 // ===========================================================================
 
