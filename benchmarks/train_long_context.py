@@ -4,8 +4,8 @@
 # Long-context comparison: patch_size=2 -> N=257 tokens.
 # At this N with m=64, m/N=1/4 — closer to Nyströmformer's working regime.
 # Tests whether FN matches Nystrom-Ref accuracy when the approximation is meaningful.
-import sys, time, json
-sys.path.insert(0, "C:/Users/athrv/Documents/FlashNystrom/benchmarks")
+import os, sys, time, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # .../benchmarks
 from train_three_way import SDPAAttention, NystromRefAttention, TinyViT, train_one
 from flash_nystrom import FlashNystromAttention, NystromConfig
 

@@ -8,8 +8,12 @@
 #
 # This isolates: (a) is the gap caused by Nyström approximation itself, or
 # (b) by something specific to our kernels (e.g. FP16 backward noise)?
-import sys, time, json
-sys.path.insert(0, "C:/Users/athrv/Documents/FlashNystrom/benchmarks")
+import os, sys, time, json
+_HERE = os.path.dirname(os.path.abspath(__file__))   # .../benchmarks
+_REPO = os.path.dirname(_HERE)                        # repo root
+sys.path.insert(0, _REPO)
+sys.path.insert(0, _HERE)
+_DATA = os.environ.get("FN_DATA_DIR", os.path.join(_REPO, "data"))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,16 +105,39 @@ class TinyViT(nn.Module):
 
 
 def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
-              patch_size=4, dim=256, heads=4):
+              patch_size=4, dim=256, heads=4, grad_clip=1.0,
+              autobatch=False, autobatch_cap=2048):
+    if autobatch and torch.cuda.is_available():
+        from autobatch import search_and_profile
+
+        def _trial(bs):
+            m = TinyViT(attn_factory, dim=dim, depth=4, heads=heads,
+                        patch_size=patch_size).cuda()
+            o = torch.optim.AdamW(m.parameters(), lr=lr)
+            x = torch.randn(bs, 3, 32, 32, device="cuda")
+            yb = torch.randint(0, 10, (bs,), device="cuda")
+
+            def run():
+                o.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    loss = F.cross_entropy(m(x), yb)
+                loss.backward()
+                o.step()
+
+            return run
+
+        res = search_and_profile(_trial, lo=64, cap=autobatch_cap, warmup=2, iters=3)
+        if res:
+            batch_size = res["batch"]
+        print(f"  autobatch: batch_size={batch_size}")
+
     transform = T.Compose([T.RandomHorizontalFlip(), T.RandomCrop(32, padding=4),
                            T.ToTensor(), T.Normalize((0.5,)*3, (0.5,)*3)])
     transform_test = T.Compose([T.ToTensor(), T.Normalize((0.5,)*3, (0.5,)*3)])
     trainset = torchvision.datasets.CIFAR10(
-        root="C:/Users/athrv/Documents/FlashNystrom/data",
-        train=True, download=False, transform=transform)
+        root=_DATA, train=True, download=True, transform=transform)
     testset = torchvision.datasets.CIFAR10(
-        root="C:/Users/athrv/Documents/FlashNystrom/data",
-        train=False, download=False, transform=transform_test)
+        root=_DATA, train=False, download=True, transform=transform_test)
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=batch_size, shuffle=True, num_workers=0,
         pin_memory=True, drop_last=True)
@@ -128,6 +155,7 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
     n_tokens = (32 // patch_size) ** 2 + 1
     print(f"\n{label}: {nparams/1e6:.2f}M params, N={n_tokens} tokens")
 
+    torch.cuda.reset_peak_memory_stats()
     times = []
     for epoch in range(epochs):
         model.train()
@@ -140,6 +168,8 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
                 loss = criterion(logits, labels)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             total_loss += loss.item() * imgs.size(0)
             correct += (logits.argmax(1) == labels).sum().item()
@@ -160,35 +190,62 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
             correct += (logits.argmax(1) == labels).sum().item()
             total += imgs.size(0)
     test_acc = 100 * correct / total
-    avg_time = sum(times) / len(times)
-    print(f"  Final test_acc={test_acc:.1f}%  avg_epoch={avg_time:.1f}s")
-    return {"label": label, "test_acc": test_acc, "avg_epoch": avg_time, "params_M": nparams/1e6}
+    timed = times[1:] if len(times) > 1 else times  # drop warmup epoch if possible
+    avg_time = sum(timed) / max(len(timed), 1)
+    peak_gib = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    n_train = len(trainloader) * batch_size
+    samp_s = n_train / avg_time if avg_time > 0 else 0.0
+    print(f"  Final test_acc={test_acc:.1f}%  avg_epoch={avg_time:.1f}s  "
+          f"batch={batch_size}  samp/s={samp_s:.0f}  peak_GiB={peak_gib:.2f}")
+    return {"label": label, "test_acc": test_acc, "avg_epoch": avg_time,
+            "params_M": nparams / 1e6, "batch": batch_size,
+            "samples_per_s": samp_s, "peak_gib": peak_gib, "N_tokens": n_tokens}
 
 
 def main():
-    print("="*70)
-    print("Three-way training comparison on CIFAR-10")
-    print("="*70)
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Three-way CIFAR-10 training: sdpa vs nystrom-ref vs flash_nystrom")
+    ap.add_argument("--patch_size", type=int, default=4,
+                    help="1 = pixel-level tokens (1025-token long context); 4 = 65 tokens")
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--num_landmarks", type=int, default=64)
+    ap.add_argument("--newton_iter", type=int, default=6)
+    ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--autobatch", action="store_true")
+    ap.add_argument("--autobatch_cap", type=int, default=2048)
+    ap.add_argument("--backends", nargs="+",
+                    default=["sdpa", "nystrom_reference", "flash_nystrom"])
+    a = ap.parse_args()
+    m, ni = a.num_landmarks, a.newton_iter
+    kw = dict(epochs=a.epochs, patch_size=a.patch_size, grad_clip=a.grad_clip,
+              autobatch=a.autobatch, autobatch_cap=a.autobatch_cap)
+
+    factories = {
+        "sdpa": ("SDPA", lambda d, h: SDPAAttention(d, h)),
+        "nystrom_reference": ("Nystrom-Ref",
+            lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni, conv_kernel_size=0)),
+        "flash_nystrom": ("FlashNystrom",
+            lambda d, h: FlashNystromAttention(
+                d, h, NystromConfig(num_landmarks=m, newton_iter=ni,
+                                    conv_kernel_size=0, use_conv_residual=False))),
+    }
+    print("=" * 70)
+    print(f"CIFAR-10  patch_size={a.patch_size}  m={m}  grad_clip={a.grad_clip}  "
+          f"autobatch={a.autobatch}")
+    print("=" * 70)
     results = []
+    for backend in a.backends:
+        label, fac = factories[backend]
+        print(f"\n--- {label} ---")
+        results.append(train_one(label, fac, **kw))
 
-    print("\n--- 1. SDPA (PyTorch FA-2 backend, exact attention) ---")
-    results.append(train_one("SDPA", lambda d, h: SDPAAttention(d, h)))
-
-    print("\n--- 2. Nystrom reference (pure PyTorch, no custom kernels) ---")
-    results.append(train_one("Nystrom-Ref",
-        lambda d, h: NystromRefAttention(d, h, num_landmarks=32, newton_iter=6, conv_kernel_size=0)))
-
-    print("\n--- 3. FlashNystrom CUDA (our fused kernels) ---")
-    cfg = NystromConfig(num_landmarks=32, conv_kernel_size=0, use_conv_residual=False)
-    results.append(train_one("FlashNystrom",
-        lambda d, h: FlashNystromAttention(d, h, cfg)))
-
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("Summary:")
     for r in results:
-        print(f"  {r['label']:>14}: test_acc={r['test_acc']:.1f}%  "
-              f"avg_epoch={r['avg_epoch']:.1f}s  params={r['params_M']:.2f}M")
-
+        print(f"  {r['label']:>14}: test_acc={r['test_acc']:.1f}%  N={r.get('N_tokens','?')}  "
+              f"batch={r.get('batch','?')}  samp/s={r.get('samples_per_s',0):.0f}  "
+              f"peak_GiB={r.get('peak_gib',0):.2f}")
     with open("three_way_results.json", "w") as f:
         json.dump(results, f, indent=2)
     print("Saved to three_way_results.json")

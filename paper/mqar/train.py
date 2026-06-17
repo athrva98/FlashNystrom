@@ -1,0 +1,264 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
+"""Train and evaluate a small transformer on MQAR.
+
+Recall accuracy is the fraction of query positions where the argmax prediction
+equals the bound value. Example:
+
+    python -m paper.mqar.train --backend flash_nystrom --num_landmarks 64
+    python -m paper.mqar.train --backend sdpa
+
+To run the m-sweep that the paper uses (fidelity vs capacity), vary
+``--num_landmarks`` and hold everything else fixed.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import time
+
+import torch
+import torch.nn.functional as F
+
+from .data import generate_mqar
+from .model import MQARModel
+
+
+def _autocast_ctx(device: str, dtype: torch.dtype):
+    if device == "cuda":
+        return torch.autocast(device_type="cuda", dtype=dtype)
+    # CPU: run in fp32 (FlashNystrom falls back to its pure-PyTorch reference).
+    return torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=False)
+
+
+@torch.no_grad()
+def evaluate(model, inputs, labels, batch_size, device, dtype):
+    model.eval()
+    correct = total = 0
+    for i in range(0, inputs.size(0), batch_size):
+        xb = inputs[i : i + batch_size].to(device)
+        yb = labels[i : i + batch_size].to(device)
+        mask = yb != -100
+        if not bool(mask.any()):
+            continue
+        with _autocast_ctx(device, dtype):
+            h = model.encode(xb)
+            logits_q = model.head(h[mask])  # head only at query positions
+        pred = logits_q.float().argmax(dim=-1)
+        correct += (pred == yb[mask]).sum().item()
+        total += int(mask.sum().item())
+    return correct / max(total, 1)
+
+
+def _autobatch_config(args, train_x, train_y, device, dtype):
+    """Find the largest batch one real MQAR train step fits (gathered head, so
+    the memory matches training), then scale epochs to preserve the total
+    optimizer-step budget of the batch-256 recipe. Returns (batch, epochs,
+    eval_every) where eval_every keeps the number of evaluations ~constant."""
+    from benchmarks.autobatch import search_and_profile
+
+    num_train = train_x.size(0)
+
+    def make_trial(bs):
+        m = MQARModel(
+            vocab_size=args.vocab_size, max_seq_len=args.seq_len, dim=args.dim,
+            depth=args.depth, heads=args.heads, backend=args.backend, init=args.init,
+            num_landmarks=args.num_landmarks, newton_iter=args.newton_iter,
+            use_conv_residual=args.conv,
+        ).to(device)
+        opt = torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        xb, yb = train_x[:bs].to(device), train_y[:bs].to(device)
+        mask = yb != -100
+
+        def run():
+            opt.zero_grad(set_to_none=True)
+            with _autocast_ctx(device, dtype):
+                loss = F.cross_entropy(m.head(m.encode(xb)[mask]).float(), yb[mask])
+            loss.backward()
+            opt.step()
+
+        return run
+
+    cap = min(args.autobatch_cap, num_train)
+    res = search_and_profile(make_trial, lo=8, cap=cap, warmup=2, iters=3)
+    bs = res["batch"] if res else args.batch_size
+    # Preserve total optimizer steps vs the validated batch-256 recipe; the
+    # per-config LR sweep absorbs the LR<->batch coupling.
+    target_steps = math.ceil(num_train / 256) * args.epochs
+    epochs = max(1, round(target_steps / math.ceil(num_train / bs)))
+    eval_every = max(1, epochs // 64)
+    return bs, epochs, eval_every
+
+
+def train(args):
+    torch.manual_seed(args.seed)
+    device = args.device
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
+
+    common = dict(
+        vocab_size=args.vocab_size,
+        seq_len=args.seq_len,
+        num_kv_pairs=args.num_kv_pairs,
+        power_a=args.power_a,
+    )
+    # Fresh synthetic data each epoch (standard MQAR practice): the model can
+    # never overfit a fixed train set, which makes the phase transition far more
+    # reliable. With --no-fresh_data a single fixed train set is reused.
+    def make_train(epoch):
+        s = args.seed * 1000 + epoch if args.fresh_data else args.seed
+        return generate_mqar(num_examples=args.num_train, seed=s, **common)
+
+    train_x, train_y = make_train(0)
+    # Disjoint seed for the test set so we measure generalization, not memorization.
+    test_x, test_y = generate_mqar(num_examples=args.num_test, seed=args.seed + 500_000, **common)
+
+    eval_every = 1
+    if args.autobatch and device == "cuda":
+        args.batch_size, args.epochs, eval_every = _autobatch_config(
+            args, train_x, train_y, device, dtype)
+        print(f"autobatch: batch_size={args.batch_size} epochs={args.epochs} "
+              f"eval_every={eval_every}")
+
+    model = MQARModel(
+        vocab_size=args.vocab_size,
+        max_seq_len=args.seq_len,
+        dim=args.dim,
+        depth=args.depth,
+        heads=args.heads,
+        backend=args.backend,
+        init=args.init,
+        num_landmarks=args.num_landmarks,
+        newton_iter=args.newton_iter,
+        use_conv_residual=args.conv,
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    arch = (
+        f"backend={args.backend} dim={args.dim} depth={args.depth} "
+        f"heads={args.heads} head_dim={args.dim // args.heads} init={args.init}"
+    )
+    if args.backend in ("flash_nystrom", "nystrom_reference"):
+        arch += f" m={args.num_landmarks} newton_iter={args.newton_iter}"
+        if args.conv:
+            arch += " conv=on"
+    arch += f" params={n_params / 1e6:.2f}M"
+    print(arch)
+    print(
+        f"data: vocab={args.vocab_size} seq_len={args.seq_len} kv_pairs={args.num_kv_pairs} "
+        f"train={args.num_train} test={args.num_test}"
+    )
+
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    steps_per_epoch = math.ceil(args.num_train / args.batch_size)
+    # Zoology's MQAR recipe: cosine-anneal from the full LR over all epochs,
+    # stepped once PER EPOCH with NO warmup. MQAR's phase transition fires late
+    # and needs the LR held high early; OneCycle's warmup + per-step anneal drives
+    # the LR toward zero before the transition can complete, which strands the
+    # model on the ~22% pre-transition plateau.
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=0.0)
+    # GradScaler is only needed for fp16; bf16 has fp32 dynamic range.
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda" and dtype == torch.float16))
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    epoch_times = []
+    best_acc = 0.0
+    for epoch in range(args.epochs):
+        if args.fresh_data and epoch > 0:
+            train_x, train_y = make_train(epoch)
+        model.train()
+        perm = torch.randperm(train_x.size(0))
+        running = 0.0
+        if device == "cuda":
+            torch.cuda.synchronize()
+        ep_start = time.perf_counter()
+        for i in range(0, train_x.size(0), args.batch_size):
+            idx = perm[i : i + args.batch_size]
+            xb = train_x[idx].to(device)
+            yb = train_y[idx].to(device)
+            opt.zero_grad(set_to_none=True)
+            mask = yb != -100  # only query positions carry a label
+            with _autocast_ctx(device, dtype):
+                h = model.encode(xb)
+                logits_q = model.head(h[mask])  # (num_queries, vocab)
+                # Mean-reduced CE over query positions only: identical to
+                # cross_entropy(full_logits, yb, ignore_index=-100) but it skips
+                # the (B, N, vocab) head matmul over the ~94% ignored positions.
+                loss = F.cross_entropy(logits_q.float(), yb[mask])
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(opt)
+            scaler.update()
+            running += loss.item()
+        if device == "cuda":
+            torch.cuda.synchronize()
+        if epoch > 0:  # skip first epoch (warmup / lazy init)
+            epoch_times.append(time.perf_counter() - ep_start)
+        sched.step()  # per-epoch cosine step (Zoology recipe)
+        if (epoch + 1) % eval_every == 0 or epoch == args.epochs - 1:
+            acc = evaluate(model, test_x, test_y, args.batch_size, device, dtype)
+            best_acc = max(best_acc, acc)
+            print(
+                f"epoch {epoch+1:4d}/{args.epochs}  loss {running/steps_per_epoch:.4f}  "
+                f"test recall {acc*100:.2f}%"
+            )
+
+    print(f"best test recall: {best_acc*100:.2f}%")
+    # Training throughput + peak memory (median epoch after warmup).
+    if epoch_times:
+        med = sorted(epoch_times)[len(epoch_times) // 2]
+        peak = torch.cuda.max_memory_allocated() / (1024 ** 3) if device == "cuda" else 0.0
+        print(f"train profile: batch={args.batch_size} "
+              f"step_ms={med / steps_per_epoch * 1000:.2f} "
+              f"samples_per_s={args.num_train / med:.1f} peak_GiB={peak:.2f}")
+    return best_acc
+
+
+def build_parser():
+    p = argparse.ArgumentParser(description="MQAR training for FlashNystrom vs full attention")
+    # data
+    p.add_argument("--vocab_size", type=int, default=8192)
+    p.add_argument("--seq_len", type=int, default=256)
+    p.add_argument("--num_kv_pairs", type=int, default=16)
+    p.add_argument("--power_a", type=float, default=0.01)
+    p.add_argument("--num_train", type=int, default=20000)
+    p.add_argument("--num_test", type=int, default=2000)
+    # model
+    p.add_argument(
+        "--backend",
+        choices=["sdpa", "flash_nystrom", "nystrom_reference"],
+        default="sdpa",
+    )
+    p.add_argument("--dim", type=int, default=128)
+    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--heads", type=int, default=2, help="dim/heads must be 64 or 128 for flash_nystrom")
+    p.add_argument("--num_landmarks", type=int, default=64)
+    p.add_argument("--newton_iter", type=int, default=6)
+    p.add_argument("--init", choices=["normal", "orthogonal"], default="normal",
+                   help="weight init for Linear layers (orthogonal = head-independence ablation)")
+    p.add_argument("--conv", action="store_true", help="enable the Nystromformer depthwise-conv residual")
+    # optim
+    p.add_argument("--epochs", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--autobatch", action="store_true",
+                   help="auto-select the largest batch that fits and scale epochs "
+                        "to preserve the batch-256 optimizer-step budget")
+    p.add_argument("--autobatch_cap", type=int, default=8192,
+                   help="upper bound on the auto-selected batch size")
+    p.add_argument("--lr", type=float, default=1e-2)
+    p.add_argument("--weight_decay", type=float, default=0.1)
+    p.add_argument("--grad_clip", type=float, default=0.0,
+                   help="max grad norm (0 disables); stabilizes the MQAR phase transition")
+    p.add_argument("--fresh_data", action=argparse.BooleanOptionalAction, default=False,
+                   help="regenerate train data each epoch (standard MQAR; --no-fresh_data reuses a fixed set)")
+    # run
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
+    return p
+
+
+if __name__ == "__main__":
+    train(build_parser().parse_args())

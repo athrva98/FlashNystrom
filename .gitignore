@@ -23,11 +23,30 @@ data/
 # Technical reference is kept locally, not in the public repo
 docs/
 .claude/
+# Separate rank-lifting work (its own paper): kept local, not in the public repo
+rank_lifting/
+# Paper: TRACK the experiment code (.py) for reproducibility, but NOT the
+# document sources/build artifacts (manuscript + LaTeX output).
+paper/**/*.tex
+paper/**/*.pdf
+paper/**/*.md
+paper/**/*.bib
+paper/**/*.sty
+paper/**/*.bst
+paper/**/*.aux
+paper/**/*.bbl
+paper/**/*.blg
+paper/**/*.log
+paper/**/*.out
+paper/**/*.toc
+paper/**/*.synctex.gz
+paper/**/*.fls
+paper/**/*.fdb_latexmk
 *.pyd
 *.so
-# Benchmark output artifacts (regenerated each run)
+# Benchmark / experiment output artifacts (regenerated each run), any directory
 benchmarks/*.txt
-benchmarks/*_results.json
+*_results.json
 # Local notes, not for the public repo
 ROADMAP.md
 TODO.md
