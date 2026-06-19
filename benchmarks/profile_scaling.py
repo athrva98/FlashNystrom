@@ -97,6 +97,8 @@ def main():
     ap.add_argument("--cap", type=int, default=8192)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--json", dest="json_out", default=None,
+                    help="write results to this JSON path (for make_figures.py)")
     # worker mode
     ap.add_argument("--worker", action="store_true")
     ap.add_argument("--backend")
@@ -113,6 +115,7 @@ def main():
     print(f"{'N':>6} {'backend':>18} {'maxbatch':>9} {'step_ms':>9} "
           f"{'samp/s':>10} {'ktok/s':>10} {'peak_GiB':>9}")
     print("-" * 80)
+    rows = []
     for N in a.Ns:
         for backend in a.backends:
             cmd = [sys.executable, __file__, "--worker", "--backend", backend,
@@ -127,11 +130,19 @@ def main():
             if not res:
                 tail = (proc.stderr.strip().splitlines() or ["(no batch fit)"])[-1][:60]
                 print(f"{N:>6} {backend:>18} {'OOM':>9}   {tail}")
+                rows.append({"N": N, "backend": backend, "oom": True})
                 continue
             ktok = res["samples_per_s"] * N / 1000.0
             print(f"{N:>6} {backend:>18} {res['batch']:>9} {res['step_ms']:>9.2f} "
                   f"{res['samples_per_s']:>10.1f} {ktok:>10.1f} {res['peak_gib']:>9.2f}",
                   flush=True)
+            rows.append({"N": N, "backend": backend, "oom": False, **res,
+                         "ktokens_per_s": ktok})
+    if a.json_out:
+        with open(a.json_out, "w") as f:
+            json.dump({"device": name, "dim": a.dim, "heads": a.heads, "m": a.m,
+                       "rows": rows}, f, indent=2)
+        print(f"wrote {a.json_out}")
 
 
 if __name__ == "__main__":

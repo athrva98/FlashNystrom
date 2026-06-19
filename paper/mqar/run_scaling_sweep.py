@@ -22,6 +22,7 @@ OOM at long N doesn't kill the sweep). Example:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -32,10 +33,13 @@ _PROF = re.compile(r"train profile: batch=(\d+) step_ms=([\d.]+) "
 
 
 def run_one(backend, seq_len, kv, lr, passthrough):
+    # Accuracy runs use the VALIDATED fixed-batch recipe (train.py default
+    # batch 256) + grad clipping -- NOT autobatch, whose recall is unverified.
+    # The training profile (step_ms/peak_gib) is reported at that fixed batch.
     cmd = [
         sys.executable, "-m", "paper.mqar.train",
         "--backend", backend, "--seq_len", str(seq_len), "--num_kv_pairs", str(kv),
-        "--lr", str(lr), "--autobatch", "--grad_clip", "1.0",
+        "--lr", str(lr), "--grad_clip", "1.0",
     ] + passthrough
     proc = subprocess.run(cmd, capture_output=True, text=True)
     m = _BEST.search(proc.stdout)
@@ -59,6 +63,8 @@ def main():
     ap.add_argument("--seq_len", type=int, default=1024, help="fixed for --mode capacity")
     ap.add_argument("--kv_pairs", nargs="+", type=int, default=[16, 32, 64, 128, 256])
     ap.add_argument("--lrs", nargs="+", type=float, default=[1e-3, 3.16e-3, 1e-2, 3.16e-2])
+    ap.add_argument("--json", dest="json_out", default=None,
+                    help="write results to this JSON path (for make_figures.py)")
     args, passthrough = ap.parse_known_args()
 
     if args.mode == "length":
@@ -72,6 +78,7 @@ def main():
     print(f"{'backend':>18} {axis_name:>9} {'recall%':>8} {'batch':>7} "
           f"{'step_ms':>8} {'samp/s':>9} {'peak_GiB':>9} {'bestLR':>8}")
     print("-" * 84)
+    results = []
     for backend in args.backends:
         for seq_len, kv in axis:
             best = None
@@ -82,11 +89,19 @@ def main():
             ax = seq_len if args.mode == "length" else kv
             if best is None:
                 print(f"{backend:>18} {ax:>9} {'FAIL/OOM':>8}")
+                results.append({"backend": backend, "axis": axis_name,
+                                "axis_val": ax, "oom": True})
                 continue
             print(f"{backend:>18} {ax:>9} {best['recall']:>8.2f} "
                   f"{best.get('batch', 0):>7} {best.get('step_ms', 0):>8.1f} "
                   f"{best.get('samp_s', 0):>9.0f} {best.get('peak_gib', 0):>9.2f} "
                   f"{best['lr']:>8g}")
+            results.append({"backend": backend, "axis": axis_name, "axis_val": ax,
+                            "oom": False, **best})
+    if args.json_out:
+        with open(args.json_out, "w") as f:
+            json.dump({"mode": args.mode, "results": results}, f, indent=2)
+        print(f"wrote {args.json_out}")
 
 
 if __name__ == "__main__":
