@@ -76,10 +76,10 @@ class NystromRefAttention(nn.Module):
 
 class TinyViT(nn.Module):
     def __init__(self, attn_module_factory, dim=256, depth=4, heads=4,
-                 patch_size=4, num_classes=10):
+                 patch_size=4, num_classes=10, img_size=32):
         super().__init__()
         self.patch_embed = nn.Conv2d(3, dim, patch_size, patch_size)
-        n_patches = (32 // patch_size) ** 2
+        n_patches = (img_size // patch_size) ** 2
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
         self.pos_embed = nn.Parameter(torch.randn(1, n_patches + 1, dim) * 0.02)
         self.blocks = nn.ModuleList([
@@ -106,15 +106,15 @@ class TinyViT(nn.Module):
 
 def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
               patch_size=4, dim=256, heads=4, grad_clip=1.0,
-              autobatch=False, autobatch_cap=2048):
+              autobatch=False, autobatch_cap=2048, dataset="cifar10", img_size=32):
     if autobatch and torch.cuda.is_available():
         from autobatch import search_and_profile
 
         def _trial(bs):
             m = TinyViT(attn_factory, dim=dim, depth=4, heads=heads,
-                        patch_size=patch_size).cuda()
+                        patch_size=patch_size, img_size=img_size).cuda()
             o = torch.optim.AdamW(m.parameters(), lr=lr)
-            x = torch.randn(bs, 3, 32, 32, device="cuda")
+            x = torch.randn(bs, 3, img_size, img_size, device="cuda")
             yb = torch.randint(0, 10, (bs,), device="cuda")
 
             def run():
@@ -131,13 +131,22 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
             batch_size = res["batch"]
         print(f"  autobatch: batch_size={batch_size}")
 
-    transform = T.Compose([T.RandomHorizontalFlip(), T.RandomCrop(32, padding=4),
-                           T.ToTensor(), T.Normalize((0.5,)*3, (0.5,)*3)])
-    transform_test = T.Compose([T.ToTensor(), T.Normalize((0.5,)*3, (0.5,)*3)])
-    trainset = torchvision.datasets.CIFAR10(
-        root=_DATA, train=True, download=True, transform=transform)
-    testset = torchvision.datasets.CIFAR10(
-        root=_DATA, train=False, download=True, transform=transform_test)
+    norm = T.Normalize((0.5,) * 3, (0.5,) * 3)
+    transform = T.Compose([T.RandomHorizontalFlip(),
+                           T.RandomCrop(img_size, padding=img_size // 8),
+                           T.ToTensor(), norm])
+    transform_test = T.Compose([T.ToTensor(), norm])
+    if dataset == "stl10":
+        # 96x96 native real images, 10 classes, 5000 labeled train -> cheap, large N.
+        trainset = torchvision.datasets.STL10(
+            root=_DATA, split="train", download=True, transform=transform)
+        testset = torchvision.datasets.STL10(
+            root=_DATA, split="test", download=True, transform=transform_test)
+    else:
+        trainset = torchvision.datasets.CIFAR10(
+            root=_DATA, train=True, download=True, transform=transform)
+        testset = torchvision.datasets.CIFAR10(
+            root=_DATA, train=False, download=True, transform=transform_test)
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=batch_size, shuffle=True, num_workers=0,
         pin_memory=True, drop_last=True)
@@ -146,13 +155,14 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
         pin_memory=True, drop_last=True)
 
     torch.manual_seed(42)
-    model = TinyViT(attn_factory, dim=dim, depth=4, heads=heads, patch_size=patch_size).cuda()
+    model = TinyViT(attn_factory, dim=dim, depth=4, heads=heads,
+                    patch_size=patch_size, img_size=img_size).cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
 
     nparams = sum(p.numel() for p in model.parameters())
-    n_tokens = (32 // patch_size) ** 2 + 1
+    n_tokens = (img_size // patch_size) ** 2 + 1
     print(f"\n{label}: {nparams/1e6:.2f}M params, N={n_tokens} tokens")
 
     torch.cuda.reset_peak_memory_stats()
@@ -205,9 +215,11 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
 def main():
     import argparse
     ap = argparse.ArgumentParser(
-        description="Three-way CIFAR-10 training: sdpa vs nystrom-ref vs flash_nystrom")
+        description="Three-way vision training: sdpa vs nystrom-ref vs flash_nystrom")
+    ap.add_argument("--dataset", choices=["cifar10", "stl10"], default="cifar10",
+                    help="cifar10 (32x32) or stl10 (96x96 native -> larger N, cheap)")
     ap.add_argument("--patch_size", type=int, default=4,
-                    help="1 = pixel-level tokens (1025-token long context); 4 = 65 tokens")
+                    help="tokens = (img_size/patch_size)^2 + 1; patch_size=1 = pixel tokens")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--num_landmarks", type=int, default=64)
     ap.add_argument("--newton_iter", type=int, default=6)
@@ -218,8 +230,10 @@ def main():
                     default=["sdpa", "nystrom_reference", "flash_nystrom"])
     a = ap.parse_args()
     m, ni = a.num_landmarks, a.newton_iter
+    img_size = 96 if a.dataset == "stl10" else 32
     kw = dict(epochs=a.epochs, patch_size=a.patch_size, grad_clip=a.grad_clip,
-              autobatch=a.autobatch, autobatch_cap=a.autobatch_cap)
+              autobatch=a.autobatch, autobatch_cap=a.autobatch_cap,
+              dataset=a.dataset, img_size=img_size)
 
     factories = {
         "sdpa": ("SDPA", lambda d, h: SDPAAttention(d, h)),
@@ -230,9 +244,10 @@ def main():
                 d, h, NystromConfig(num_landmarks=m, newton_iter=ni,
                                     conv_kernel_size=0, use_conv_residual=False))),
     }
+    n_tokens = (img_size // a.patch_size) ** 2 + 1
     print("=" * 70)
-    print(f"CIFAR-10  patch_size={a.patch_size}  m={m}  grad_clip={a.grad_clip}  "
-          f"autobatch={a.autobatch}")
+    print(f"{a.dataset}  img_size={img_size}  patch_size={a.patch_size}  "
+          f"N={n_tokens} tokens  m={m}  grad_clip={a.grad_clip}  autobatch={a.autobatch}")
     print("=" * 70)
     results = []
     for backend in a.backends:
