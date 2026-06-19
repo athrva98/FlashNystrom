@@ -39,6 +39,15 @@ def _backends(rows, key="backend"):
     return list(dict.fromkeys(r[key] for r in rows))
 
 
+def _save(fig, outdir, stem):
+    """Save vector PDF (for the paper) + PNG (for quick Drive preview)."""
+    pdf = os.path.join(outdir, stem + ".pdf")
+    fig.savefig(pdf, bbox_inches="tight")
+    fig.savefig(os.path.join(outdir, stem + ".png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return pdf
+
+
 def fig_scaling(data, outdir):
     rows = [r for r in data["rows"] if not r.get("oom")]
     if not rows:
@@ -63,13 +72,10 @@ def fig_scaling(data, outdir):
     fig.suptitle(f"Scaling on {data.get('device', 'GPU')} "
                  f"(d={data.get('dim')}, m={data.get('m')})", fontsize=10)
     fig.tight_layout()
-    p = os.path.join(outdir, "scaling.pdf")
-    fig.savefig(p, bbox_inches="tight")
-    plt.close(fig)
-    return p
+    return _save(fig, outdir, "scaling")
 
 
-def fig_mqar(data, outdir, fname, xlabel, title):
+def fig_mqar(data, outdir, stem, xlabel, title):
     rows = [r for r in data["results"] if not r.get("oom")]
     if not rows:
         return None
@@ -86,10 +92,7 @@ def fig_mqar(data, outdir, fname, xlabel, title):
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    p = os.path.join(outdir, fname)
-    fig.savefig(p, bbox_inches="tight")
-    plt.close(fig)
-    return p
+    return _save(fig, outdir, stem)
 
 
 def fig_cifar(rows, outdir):
@@ -108,10 +111,7 @@ def fig_cifar(rows, outdir):
     for ax in (ax1, ax2):
         ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-    p = os.path.join(outdir, "cifar.pdf")
-    fig.savefig(p, bbox_inches="tight")
-    plt.close(fig)
-    return p
+    return _save(fig, outdir, "cifar")
 
 
 def main():
@@ -128,10 +128,10 @@ def main():
     if (d := _load(a.scaling)):
         made.append(fig_scaling(d, a.outdir))
     if (d := _load(a.mqar_length)):
-        made.append(fig_mqar(d, a.outdir, "mqar_length.pdf", "sequence length $N$",
+        made.append(fig_mqar(d, a.outdir, "mqar_length", "sequence length $N$",
                              "MQAR recall vs context length"))
     if (d := _load(a.mqar_capacity)):
-        made.append(fig_mqar(d, a.outdir, "mqar_capacity.pdf", "key-value pairs",
+        made.append(fig_mqar(d, a.outdir, "mqar_capacity", "key-value pairs",
                              "MQAR recall vs capacity (rank limit)"))
     if (d := _load(a.cifar)):
         made.append(fig_cifar(d, a.outdir))
