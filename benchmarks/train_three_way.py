@@ -224,12 +224,15 @@ def main():
     ap.add_argument("--num_landmarks", type=int, default=64)
     ap.add_argument("--newton_iter", type=int, default=6)
     ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--no-fast-dk2inv", dest="fast_dk2inv", action="store_false",
+                    help="use the FP32 reference-consistent dk2inv backward "
+                         "(default: FP16 tensor-core fast path)")
     ap.add_argument("--autobatch", action="store_true")
     ap.add_argument("--autobatch_cap", type=int, default=2048)
     ap.add_argument("--backends", nargs="+",
                     default=["sdpa", "nystrom_reference", "flash_nystrom"])
     a = ap.parse_args()
-    m, ni = a.num_landmarks, a.newton_iter
+    m, ni, fdk = a.num_landmarks, a.newton_iter, a.fast_dk2inv
     img_size = 96 if a.dataset == "stl10" else 32
     kw = dict(epochs=a.epochs, patch_size=a.patch_size, grad_clip=a.grad_clip,
               autobatch=a.autobatch, autobatch_cap=a.autobatch_cap,
@@ -241,13 +244,14 @@ def main():
             lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni, conv_kernel_size=0)),
         "flash_nystrom": ("FlashNystrom",
             lambda d, h: FlashNystromAttention(
-                d, h, NystromConfig(num_landmarks=m, newton_iter=ni,
+                d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
                                     conv_kernel_size=0, use_conv_residual=False))),
     }
     n_tokens = (img_size // a.patch_size) ** 2 + 1
     print("=" * 70)
     print(f"{a.dataset}  img_size={img_size}  patch_size={a.patch_size}  "
-          f"N={n_tokens} tokens  m={m}  grad_clip={a.grad_clip}  autobatch={a.autobatch}")
+          f"N={n_tokens} tokens  m={m}  grad_clip={a.grad_clip}  "
+          f"fast_dk2inv={fdk}  autobatch={a.autobatch}")
     print("=" * 70)
     results = []
     for backend in a.backends:
