@@ -226,8 +226,19 @@ std::vector<torch::Tensor> nystrom_bwd(
     // range, so the bf16->fp16 cast is safe (and lossless — fp16 has strictly
     // more mantissa bits than bf16). Grads are cast back to BF16 at return.
     const bool bf16_to_fp16 = (dtype == at::ScalarType::BFloat16);
+    torch::Tensor grad_scale;
     if (bf16_to_fp16) {
-        dO      = dO.to(at::kHalf);
+        // Gradient scaling for the FP16 backward. FP16's smallest normal
+        // (~6e-5) is far above BF16's (~1e-38), so the small gradient
+        // intermediates that appear in training underflow to zero in FP16 and
+        // the signal dies (training collapses). The backward is *linear* in dO,
+        // so we scale dO up into FP16's sweet spot and divide the same factor
+        // back out of the grads -- exact, no bias. Activations (q_s, q_tilde,
+        // step2, ... bounded ~O(1)) sit comfortably in FP16 range and are not
+        // scaled. The scale is dynamic per call: bring max|dO| to ~64.
+        auto amax = dO.abs().max().to(at::kFloat).clamp_min(1e-20f);
+        grad_scale = 64.0 / amax;
+        dO      = (dO.to(at::kFloat) * grad_scale).to(at::kHalf);
         q_s     = q_s.to(at::kHalf);
         k_s     = k_s.to(at::kHalf);
         v       = v.to(at::kHalf);
@@ -317,8 +328,11 @@ std::vector<torch::Tensor> nystrom_bwd(
     }
 
     if (bf16_to_fp16) {
-        // Hand back BF16 grads to match the BF16 model parameters.
-        return {dQ.to(at::kBFloat16), dK.to(at::kBFloat16), dV.to(at::kBFloat16)};
+        // Undo the gradient scaling (in FP32 to avoid re-underflowing) and hand
+        // back BF16 grads to match the BF16 model parameters.
+        return {(dQ.to(at::kFloat) / grad_scale).to(at::kBFloat16),
+                (dK.to(at::kFloat) / grad_scale).to(at::kBFloat16),
+                (dV.to(at::kFloat) / grad_scale).to(at::kBFloat16)};
     }
     return {dQ, dK, dV};
 }
