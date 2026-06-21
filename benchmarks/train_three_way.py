@@ -279,9 +279,9 @@ def main():
     ap.add_argument("--autobatch_cap", type=int, default=2048)
     ap.add_argument("--backends", nargs="+",
                     default=["sdpa", "nystrom_reference", "flash_nystrom"])
-    ap.add_argument("--instrument", action="store_true",
-                    help="per-step/per-layer collapse diagnostics to stderr "
-                         "(dO underflow, NaN origin, collapse onset)")
+    ap.add_argument("--no-instrument", dest="instrument", action="store_false",
+                    help="disable the per-step collapse diagnostics (ON by default): "
+                         "per-layer dO underflow, NaN origin, collapse onset")
     a = ap.parse_args()
     m, ni, fdk = a.num_landmarks, a.newton_iter, a.fast_dk2inv
     img_size = 96 if a.dataset == "stl10" else 32
