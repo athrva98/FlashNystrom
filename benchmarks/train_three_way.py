@@ -106,7 +106,8 @@ class TinyViT(nn.Module):
 
 def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
               patch_size=4, dim=256, heads=4, grad_clip=1.0,
-              autobatch=False, autobatch_cap=2048, dataset="cifar10", img_size=32):
+              autobatch=False, autobatch_cap=2048, dataset="cifar10", img_size=32,
+              instrument=False):
     if autobatch and torch.cuda.is_available():
         from autobatch import search_and_profile
 
@@ -161,6 +162,28 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
 
+    # Per-step / per-attention-layer instrumentation on the SAME run that
+    # produces the result (enable with --instrument). Captures dO (grad wrt
+    # attention output) max + fraction under the fp16 floor + non-finite count,
+    # the first non-finite parameter grad (NaN origin), and a collapse detector.
+    _ins = {"bw": [], "ema": None, "first_nf": None, "collapse": None, "gstep": 0}
+    if instrument:
+        _layers = [blk["attn"] for blk in model.blocks]
+        _ins["bw"] = [None] * len(_layers)
+        def _mk_hook(i):
+            def h(mod, gin, gout):
+                g = gout[0]
+                if g is None:
+                    _ins["bw"][i] = None; return
+                af = g.detach().float().abs()
+                _ins["bw"][i] = (af.max().item(),
+                                 (af < 6.104e-5).float().mean().item(),
+                                 int((~torch.isfinite(g)).sum().item()))
+            return h
+        for _i, _L in enumerate(_layers):
+            _L.register_full_backward_hook(_mk_hook(_i))
+        print(f"  [instrument] hooks on {len(_layers)} attention layers", file=sys.stderr, flush=True)
+
     nparams = sum(p.numel() for p in model.parameters())
     n_tokens = (img_size // patch_size) ** 2 + 1
     print(f"\n{label}: {nparams/1e6:.2f}M params, N={n_tokens} tokens")
@@ -178,9 +201,34 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
                 loss = criterion(logits, labels)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if instrument and _ins["first_nf"] is None:
+                for _pn, _p in model.named_parameters():
+                    if _p.grad is not None and not torch.isfinite(_p.grad).all():
+                        _ins["first_nf"] = (_ins["gstep"], _pn)
+                        print(f"  !! first non-finite grad step {_ins['gstep']}: {_pn}",
+                              file=sys.stderr, flush=True)
+                        break
+            gn = None
             if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if instrument:
+                _l = loss.item()
+                _ins["ema"] = _l if _ins["ema"] is None else 0.98 * _ins["ema"] + 0.02 * _l
+                if _l > _ins["ema"] * 1.30 and _ins["gstep"] > 30 and _ins["collapse"] is None:
+                    _ins["collapse"] = _ins["gstep"]
+                    print(f"  ** COLLAPSE onset step {_ins['gstep']}: loss {_l:.3f} "
+                          f"(ema {_ins['ema']:.3f})", file=sys.stderr, flush=True)
+                if _ins["gstep"] % 50 == 0:
+                    _bw = [b for b in _ins["bw"] if b]
+                    _dO = max((b[0] for b in _bw), default=0.0)
+                    _uf = max((b[1] for b in _bw), default=0.0)
+                    _nfc = sum((b[2] for b in _bw), 0)
+                    _gnv = (gn.item() if gn is not None and torch.isfinite(gn) else -1.0)
+                    print(f"  [instr] step {_ins['gstep']} ep{epoch} loss={_l:.3f} "
+                          f"grad_norm={_gnv:.2e} dO_max={_dO:.2e} max_uflow_frac={_uf:.3f} "
+                          f"dO_nonfinite={_nfc}", file=sys.stderr, flush=True)
+                _ins["gstep"] += 1
             total_loss += loss.item() * imgs.size(0)
             correct += (logits.argmax(1) == labels).sum().item()
             total += imgs.size(0)
@@ -231,12 +279,15 @@ def main():
     ap.add_argument("--autobatch_cap", type=int, default=2048)
     ap.add_argument("--backends", nargs="+",
                     default=["sdpa", "nystrom_reference", "flash_nystrom"])
+    ap.add_argument("--instrument", action="store_true",
+                    help="per-step/per-layer collapse diagnostics to stderr "
+                         "(dO underflow, NaN origin, collapse onset)")
     a = ap.parse_args()
     m, ni, fdk = a.num_landmarks, a.newton_iter, a.fast_dk2inv
     img_size = 96 if a.dataset == "stl10" else 32
     kw = dict(epochs=a.epochs, patch_size=a.patch_size, grad_clip=a.grad_clip,
               autobatch=a.autobatch, autobatch_cap=a.autobatch_cap,
-              dataset=a.dataset, img_size=img_size)
+              dataset=a.dataset, img_size=img_size, instrument=a.instrument)
 
     factories = {
         "sdpa": ("SDPA", lambda d, h: SDPAAttention(d, h)),
