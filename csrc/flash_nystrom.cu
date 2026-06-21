@@ -327,6 +327,25 @@ std::vector<torch::Tensor> nystrom_bwd(
         run_nystrom_bwd(params);
     }
 
+    // Env-gated kernel-boundary instrumentation (set FN_BWD_DEBUG=1). Logs the
+    // dynamic grad-scale, max|dO|, and finiteness/abs-max of the kernel's own
+    // outputs and intermediates -- visibility Python hooks cannot get. The
+    // .item() calls force syncs, so this is only for diagnosis, never the hot
+    // path. Use to locate where (which quantity) a collapse first goes bad.
+    if (std::getenv("FN_BWD_DEBUG")) {
+        auto fin = [](const torch::Tensor& t) { return torch::isfinite(t).all().item<bool>(); };
+        auto amx = [](const torch::Tensor& t) { return t.abs().max().item<double>(); };
+        const double gs = bf16_to_fp16 ? grad_scale.item<double>() : 1.0;
+        fprintf(stderr,
+            "[fn_bwd] N=%lld m=%lld grad_scale=%.3e max|dO|=%.3e | "
+            "dQ{fin=%d max=%.3e} dV{fin=%d max=%.3e} dO3{fin=%d max=%.3e} "
+            "dstep2{fin=%d max=%.3e} dQt{fin=%d max=%.3e} dK2inv{fin=%d max=%.3e}\n",
+            (long long)N, (long long)m, gs, bf16_to_fp16 ? 64.0 / gs : amx(dO),
+            (int)fin(dQ), amx(dQ), (int)fin(dV), amx(dV),
+            (int)fin(dO3), amx(dO3), (int)fin(dstep2), amx(dstep2),
+            (int)fin(dQ_tilde), amx(dQ_tilde), (int)fin(dK2_inv), amx(dK2_inv));
+    }
+
     if (bf16_to_fp16) {
         // Undo the gradient scaling (in FP32 to avoid re-underflowing) and hand
         // back BF16 grads to match the BF16 model parameters.
