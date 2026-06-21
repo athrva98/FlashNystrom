@@ -188,6 +188,13 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
     n_tokens = (img_size // patch_size) ** 2 + 1
     print(f"\n{label}: {nparams/1e6:.2f}M params, N={n_tokens} tokens")
 
+    # FP16 loss scaling. Without it, the backward gradients (dO ~ 1e-3 and
+    # everything downstream) sit below the FP16 normal floor (6.1e-5) and the
+    # FP16 gradient stores flush to zero; see measure_bwd_ranges.py. The
+    # dynamic scaler grows S until a gradient nears the FP16 overflow ceiling,
+    # i.e. it uses the largest representable range. Applies to all three models.
+    scaler = torch.amp.GradScaler("cuda")
+
     torch.cuda.reset_peak_memory_stats()
     times = []
     for epoch in range(epochs):
@@ -200,7 +207,11 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
                 logits = model(imgs)
                 loss = criterion(logits, labels)
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
+            # Unscale before clip/instrumentation so grads are at their true
+            # magnitude. (A dynamic scaler may occasionally produce inf here and
+            # skip the step on backoff; that is expected, not a collapse.)
+            scaler.unscale_(optimizer)
             if instrument and _ins["first_nf"] is None:
                 for _pn, _p in model.named_parameters():
                     if _p.grad is not None and not torch.isfinite(_p.grad).all():
@@ -211,7 +222,8 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
             gn = None
             if grad_clip > 0:
                 gn = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             if instrument:
                 _l = loss.item()
                 _ins["ema"] = _l if _ins["ema"] is None else 0.98 * _ins["ema"] + 0.02 * _l
