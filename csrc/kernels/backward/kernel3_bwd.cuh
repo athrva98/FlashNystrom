@@ -396,7 +396,10 @@ kernel3_bwd_tc(
     for (int mi = 0; mi < nrow; mi++) {
         #pragma unroll
         for (int ni = 0; ni < size<1>(dP_rc); ni++) {
-            float p_val = static_cast<float>(rP_rc(mi, ni));
+            // FP32 P (scores), not the eagerly-downcast fp16 rP -- the
+            // softmax-Jacobian cancellation needs full-precision P (see
+            // kernel1_bwd). dS is still downcast for the GEMM (TC unchanged).
+            float p_val = scores(mi, ni);
             dP_rc(mi, ni) = p_val * (dP_rc(mi, ni) - D3(mi));
         }
     }

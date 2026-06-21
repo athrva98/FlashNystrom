@@ -242,7 +242,11 @@ kernel1_bwd_tc(
         float d1v = (pr < tile_rows) ? d1[pr] : 0.0f;
         #pragma unroll
         for (int ni = 0; ni < size<1>(dP_rc); ni++) {
-            float p_val = static_cast<float>(rP_rc(mi, ni));
+            // Use the FP32 P (acc_s/scores), NOT the eagerly-downcast fp16 rP:
+            // the softmax-Jacobian cancellation (dP - D) needs full-precision P
+            // or a small systematic bias compounds over depth and collapses
+            // training. dS is still downcast for the GEMM below (TC unchanged).
+            float p_val = scores(mi, ni);
             dP_rc(mi, ni) = p_val * (dP_rc(mi, ni) - d1v);
         }
     }
