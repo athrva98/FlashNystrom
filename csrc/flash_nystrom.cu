@@ -225,31 +225,28 @@ std::vector<torch::Tensor> nystrom_bwd(
     // runs in FP16. Activations and grads are O(1), comfortably inside FP16's
     // range, so the bf16->fp16 cast is safe (and lossless — fp16 has strictly
     // more mantissa bits than bf16). Grads are cast back to BF16 at return.
-    const bool bf16_to_fp16 = (dtype == at::ScalarType::BFloat16);
-    torch::Tensor grad_scale;
-    if (bf16_to_fp16) {
-        // Gradient scaling for the FP16 backward. FP16's smallest normal
-        // (~6e-5) is far above BF16's (~1e-38), so the small gradient
-        // intermediates that appear in training underflow to zero in FP16 and
-        // the signal dies (training collapses). The backward is *linear* in dO,
-        // so we scale dO up into FP16's sweet spot and divide the same factor
-        // back out of the grads -- exact, no bias. Activations (q_s, q_tilde,
-        // step2, ... bounded ~O(1)) sit comfortably in FP16 range and are not
-        // scaled. The scale is dynamic per call: bring max|dO| to ~64.
-        auto amax = dO.abs().max().to(at::kFloat).clamp_min(1e-20f);
-        grad_scale = 64.0 / amax;
-        dO      = (dO.to(at::kFloat) * grad_scale).to(at::kHalf);
-        q_s     = q_s.to(at::kHalf);
-        k_s     = k_s.to(at::kHalf);
-        v       = v.to(at::kHalf);
-        q_tilde = q_tilde.to(at::kHalf);
-        k_tilde = k_tilde.to(at::kHalf);
-        step2   = step2.to(at::kHalf);
-        b_saved = b_saved.to(at::kHalf);
-        output  = output.to(at::kHalf);
+    // DIAGNOSTIC (FN_FP32_BWD=1): route the 16-bit backward through FP32 to
+    // test whether the STL collapse is a precision effect. FP32 is exact vs the
+    // reference AND still uses the same nondeterministic atomicAdd accumulation,
+    // so: if this stops the collapse -> precision (bf16 softmax backwards) is
+    // the cause; if it still collapses -> precision is exonerated and it's the
+    // nondeterminism. bf16/fp16 -> fp32 is lossless. NOT a shipping path (the
+    // fp32 scalar backward is slow); this only isolates the mechanism. D=64
+    // only (the fp32 backward does not support D=128).
+    const bool to_fp32 = std::getenv("FN_FP32_BWD") && (dtype != at::ScalarType::Float) && (D == 64);
+    if (to_fp32) {
+        dO      = dO.to(at::kFloat);
+        q_s     = q_s.to(at::kFloat);
+        k_s     = k_s.to(at::kFloat);
+        v       = v.to(at::kFloat);
+        q_tilde = q_tilde.to(at::kFloat);
+        k_tilde = k_tilde.to(at::kFloat);
+        step2   = step2.to(at::kFloat);
+        b_saved = b_saved.to(at::kFloat);
+        output  = output.to(at::kFloat);
     }
 
-    auto opts = dO.options();  // FP16 when bf16_to_fp16, else original dtype
+    auto opts = dO.options();  // FP32 when to_fp32, else original dtype
     auto opts_f32 = opts.dtype(torch::kFloat32);
 
     // Gradient outputs (zero-initialized)
@@ -286,8 +283,7 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.head_dim = static_cast<int>(D);
     params.num_landmarks = static_cast<int>(m);
     params.newton_iter = static_cast<int>(newton_iter);
-    // After the bf16->fp16 recast the backward runs the FP16 (half) path.
-    params.is_bf16 = false;
+    params.is_bf16 = (dtype == at::ScalarType::BFloat16);
     params.fast_dk2inv = fast_dk2inv;
 
     params.q_s_ptr = q_s.data_ptr();
@@ -321,7 +317,7 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.dO3_ptr = dO3.data_ptr();
     params.stream = stream;
 
-    if (dtype == at::ScalarType::Float) {
+    if (dtype == at::ScalarType::Float || to_fp32) {
         run_nystrom_bwd_fp32(params);
     } else {
         run_nystrom_bwd(params);
@@ -335,23 +331,19 @@ std::vector<torch::Tensor> nystrom_bwd(
     if (std::getenv("FN_BWD_DEBUG")) {
         auto fin = [](const torch::Tensor& t) { return torch::isfinite(t).all().item<bool>(); };
         auto amx = [](const torch::Tensor& t) { return t.abs().max().item<double>(); };
-        const double gs = bf16_to_fp16 ? grad_scale.item<double>() : 1.0;
         fprintf(stderr,
-            "[fn_bwd] N=%lld m=%lld grad_scale=%.3e max|dO|=%.3e | "
+            "[fn_bwd] N=%lld m=%lld to_fp32=%d max|dO|=%.3e | "
             "dQ{fin=%d max=%.3e} dV{fin=%d max=%.3e} dO3{fin=%d max=%.3e} "
             "dstep2{fin=%d max=%.3e} dQt{fin=%d max=%.3e} dK2inv{fin=%d max=%.3e}\n",
-            (long long)N, (long long)m, gs, bf16_to_fp16 ? 64.0 / gs : amx(dO),
+            (long long)N, (long long)m, (int)to_fp32, amx(dO),
             (int)fin(dQ), amx(dQ), (int)fin(dV), amx(dV),
             (int)fin(dO3), amx(dO3), (int)fin(dstep2), amx(dstep2),
             (int)fin(dQ_tilde), amx(dQ_tilde), (int)fin(dK2_inv), amx(dK2_inv));
     }
 
-    if (bf16_to_fp16) {
-        // Undo the gradient scaling (in FP32 to avoid re-underflowing) and hand
-        // back BF16 grads to match the BF16 model parameters.
-        return {(dQ.to(at::kFloat) / grad_scale).to(at::kBFloat16),
-                (dK.to(at::kFloat) / grad_scale).to(at::kBFloat16),
-                (dV.to(at::kFloat) / grad_scale).to(at::kBFloat16)};
+    if (to_fp32) {
+        // Hand back grads in the model's original dtype (fp16/bf16).
+        return {dQ.to(dtype), dK.to(dtype), dV.to(dtype)};
     }
     return {dQ, dK, dV};
 }
