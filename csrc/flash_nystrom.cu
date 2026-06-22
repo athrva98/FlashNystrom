@@ -14,6 +14,7 @@
 #include "flash_nystrom.h"
 #include "kernels/backward/kernel2_inv_bwd.cuh"  // for debug hooks
 #include "kernels/backward/compute_dk2inv.cuh"   // for debug hooks
+#include "kernels/k2inv_gemm_tc.cuh"             // for the TC GEMM debug hook
 #include "occupancy_probe.h"                      // for occupancy reporting
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
@@ -389,6 +390,22 @@ std::vector<torch::Tensor> debug_ns_bwd_step(
     return {dZ_out, dK2_acc};
 }
 
+// CP1 debug hook: batched tf32 tensor-core GEMM C = A @ B (m x m x m).
+torch::Tensor debug_k2inv_gemm_nn(torch::Tensor A, torch::Tensor B) {
+    CHECK_DEVICE(A); CHECK_DEVICE(B);
+    CHECK_CONTIGUOUS(A); CHECK_CONTIGUOUS(B);
+    TORCH_CHECK(A.dtype() == torch::kFloat32 && B.dtype() == torch::kFloat32, "A,B must be FP32");
+    TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "A,B must be (BH, m, m)");
+    TORCH_CHECK(A.sizes() == B.sizes() && A.size(1) == A.size(2), "A,B must be (BH,m,m) square");
+    const int BH = static_cast<int>(A.size(0)), m = static_cast<int>(A.size(1));
+    const at::cuda::CUDAGuard device_guard(A.device());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    auto C = torch::empty({BH, m, m}, A.options());
+    flash_nystrom::launch_k2inv_gemm_nn(A.data_ptr<float>(), B.data_ptr<float>(),
+                                        C.data_ptr<float>(), BH, m, stream);
+    return C;
+}
+
 std::vector<torch::Tensor> debug_ns_bwd_final(
     torch::Tensor q_tilde,   // (BH, m, D) FP32
     torch::Tensor k_tilde,   // (BH, m, D) FP32
@@ -564,6 +581,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("v"), py::arg("output"),
           py::arg("num_landmarks"), py::arg("newton_iter"),
           py::arg("fast_dk2inv") = true);
+    m.def("debug_k2inv_gemm_nn", &flash_nystrom::debug_k2inv_gemm_nn,
+          "Debug: batched tf32 tensor-core GEMM C = A @ B (m x m x m).",
+          py::arg("A"), py::arg("B"));
     m.def("debug_ns_bwd_step", &flash_nystrom::debug_ns_bwd_step,
           "Debug: single NS backward iteration (returns dZ_j, dK2_contrib).",
           py::arg("K2"), py::arg("Z_j"), py::arg("dZ_in"));
