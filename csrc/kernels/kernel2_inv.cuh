@@ -28,7 +28,7 @@ namespace flash_nystrom {
 // The backward consistency does NOT require convergence — autograd-through-NS
 // gives correct gradients of the actual approximation regardless.
 
-template <typename scalar_t>
+template <typename scalar_t, bool kSetupOnly = false>
 __global__ void kernel2_inv_kernel(
     const scalar_t* __restrict__ q_tilde,    // (B*H, m, D)
     const scalar_t* __restrict__ k_tilde,    // (B*H, m, D)
@@ -51,6 +51,9 @@ __global__ void kernel2_inv_kernel(
     float* T1      = smem + 3 * mm;
     float* T2      = smem + 4 * mm;
     float* scratch = smem + 5 * mm;
+    // Zold/T2 are only touched by the in-kernel NS loop, which is compiled out in
+    // setup-only mode; reference them so -Werror does not flag them as unused.
+    (void)Zold; (void)T2;
 
     const scalar_t* qt = q_tilde + bh * m * D;
     const scalar_t* kt = k_tilde + bh * m * D;
@@ -181,6 +184,12 @@ __global__ void kernel2_inv_kernel(
         __syncthreads();
     }
 
+    // Setup-only mode (TC pinv path): K2 (k2_softmax) and Z_0 (ns_iterates[0]) are
+    // now in GMEM; the Newton-Schulz iterations run as external tensor-core GEMMs.
+    // Compile the in-kernel scalar NS + final write out entirely (an early return
+    // would make the loop statically unreachable, which -Werror rejects).
+    if constexpr (!kSetupOnly) {
+
     // Step 4: Newton-Schulz iterations (third order Higham)
     // Z_{j+1} = 0.25 * Z_j * (13I - K2*Z_j * (15I - K2*Z_j * (7I - K2*Z_j)))
     //
@@ -273,6 +282,7 @@ __global__ void kernel2_inv_kernel(
     } else {
         for (int idx = tid; idx < mm; idx += nthreads) out[idx] = Z[idx];
     }
+    }  // if constexpr (!kSetupOnly)
 }
 
 template <typename scalar_t>
@@ -304,6 +314,32 @@ void launch_kernel2_inv(
 
     kernel2_inv_kernel<scalar_t><<<grid, block, smem_bytes, stream>>>(
         q_tilde, k_tilde, kernel2_inv, softmax_lse, ns_iterates, k2_softmax,
+        D, m, newton_iter, kappa_star);
+    FN_CUDA_KERNEL_CHECK();
+}
+
+// Setup-only launch for the TC pinv path: computes softmax K2 (-> k2_softmax),
+// the Z_0 init (-> ns_iterates[0]), and the LSE, then returns. The Newton-Schulz
+// iterations run as external tensor-core GEMMs (see run_kernel2_inv_tc). Does not
+// touch kernel2_inv_out.
+template <typename scalar_t>
+void launch_kernel2_inv_setup(
+    const scalar_t* q_tilde, const scalar_t* k_tilde,
+    float* softmax_lse, float* ns_iterates, float* k2_softmax,
+    int BH, int D, int m, int newton_iter, cudaStream_t stream, float kappa_star
+) {
+    FN_CHECK(m > 0 && m <= kMaxLandmarks, "launch_kernel2_inv_setup: m out of range");
+    dim3 grid(BH), block(256);
+    size_t smem_bytes = (5 * m * m + 8) * sizeof(float);
+    if (smem_bytes > 48 * 1024) {
+        FN_CHECK(smem_bytes <= get_max_smem_per_block(),
+                 "kernel2_inv_setup: m too large for available shared memory");
+        FN_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel2_inv_kernel<scalar_t, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+    }
+    kernel2_inv_kernel<scalar_t, true><<<grid, block, smem_bytes, stream>>>(
+        q_tilde, k_tilde, nullptr, softmax_lse, ns_iterates, k2_softmax,
         D, m, newton_iter, kappa_star);
     FN_CUDA_KERNEL_CHECK();
 }

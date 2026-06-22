@@ -39,13 +39,17 @@ struct K2GemmTraits {
     static constexpr int kSmemBytes = kSmemElems * static_cast<int>(sizeof(cutlass::tfloat32_t));
 };
 
-// C[bh] = A[bh] @ B[bh], A:(M,K) B:(K,N) C:(M,N), all FP32 row-major, one CTA per bh.
+// C[bh] = A[bh] @ B[bh], A:(M,K) B:(K,N) C:(M,N), all FP32 row-major, one CTA per
+// bh. Per-operand bh strides let callers point at sub-tensors (e.g. one iterate
+// slice of an (BH, J+1, m, m) buffer) without copying. Pass strideX = M*K etc.
+// for the contiguous case.
 template <typename Traits>
 __global__ void __launch_bounds__(Traits::kNThreads)
 k2inv_gemm_nn_kernel(
-    const float* __restrict__ A,   // (BH, M, K)
-    const float* __restrict__ B,   // (BH, K, N)
-    float* __restrict__ C          // (BH, M, N)
+    const float* __restrict__ A,   // base of (.., M, K)
+    const float* __restrict__ B,   // base of (.., K, N)
+    float* __restrict__ C,         // base of (.., M, N)
+    long long strideA, long long strideB, long long strideC
 ) {
     using TF = cutlass::tfloat32_t;
     constexpr int kM = Traits::kM, kN = Traits::kN, kK = Traits::kK;
@@ -55,8 +59,8 @@ k2inv_gemm_nn_kernel(
     TF* sA_ = smem_tf;
     TF* sB_ = smem_tf + kM * kK;
 
-    const float* Abh = A + bh * kM * kK;
-    const float* Bbh = B + bh * kK * kN;       // B stored (K,N) row-major in GMEM
+    const float* Abh = A + bh * strideA;
+    const float* Bbh = B + bh * strideB;       // B stored (K,N) row-major in GMEM
     for (int i = tid; i < kM * kK; i += Traits::kNThreads) sA_[i] = TF(Abh[i]);
     // Transpose B into smem: sB(n,k) = B(k,n).
     for (int i = tid; i < kN * kK; i += Traits::kNThreads) {
@@ -89,32 +93,32 @@ k2inv_gemm_nn_kernel(
     cute::copy(copy_B, tCsB, thr_copy_B.retile_D(tCrB));
     cute::gemm(tiled_mma, tCrA, tCrB, acc);   // full K contraction
 
-    Tensor mC = make_tensor(make_gmem_ptr(C + bh * kM * kN),
+    Tensor mC = make_tensor(make_gmem_ptr(C + bh * strideC),
                             make_layout(Shape<Int<kM>, Int<kN>>{}, GenRowMajor{}));
     Tensor tCgC = thr_mma.partition_C(mC);
     cute::copy(acc, tCgC);
 }
 
-// Launcher for the square m x m x m case used by the NS chain.
+// Launcher for the square m x m x m case used by the NS chain. strideX default to
+// the contiguous m*m; pass explicit strides to index iterate slices in place.
 inline void launch_k2inv_gemm_nn(
-    const float* A, const float* B, float* C, int BH, int m, cudaStream_t stream
+    const float* A, const float* B, float* C, int BH, int m, cudaStream_t stream,
+    long long strideA = -1, long long strideB = -1, long long strideC = -1
 ) {
-    FN_CHECK(m > 0 && m <= 64, "k2inv_gemm_nn: m must be in (0,64]");
-    auto run = [&](auto MTag) {
-        constexpr int kM = decltype(MTag)::value;
-        using Traits = K2GemmTraits<kM, kM, kM, 4>;
-        size_t smem = Traits::kSmemBytes;
-        if (smem > 48 * 1024) {
-            FN_CHECK(smem <= get_max_smem_per_block(), "k2inv_gemm_nn: insufficient SMEM");
-            FN_CUDA_CHECK(cudaFuncSetAttribute(k2inv_gemm_nn_kernel<Traits>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-        }
-        k2inv_gemm_nn_kernel<Traits><<<dim3(BH), dim3(Traits::kNThreads), smem, stream>>>(A, B, C);
-    };
-    // Only m == 64 is exercised by the production pinv (landmarks fixed at 64);
-    // pad/handle smaller m later. Assert for now.
-    FN_CHECK(m == 64, "k2inv_gemm_nn: CP1 supports m == 64");
-    run(Int<64>{});
+    FN_CHECK(m == 64, "k2inv_gemm_nn: supports m == 64 (landmarks fixed at 64)");
+    const long long mm = (long long)m * m;
+    if (strideA < 0) strideA = mm;
+    if (strideB < 0) strideB = mm;
+    if (strideC < 0) strideC = mm;
+    using Traits = K2GemmTraits<64, 64, 64, 4>;
+    size_t smem = Traits::kSmemBytes;
+    if (smem > 48 * 1024) {
+        FN_CHECK(smem <= get_max_smem_per_block(), "k2inv_gemm_nn: insufficient SMEM");
+        FN_CUDA_CHECK(cudaFuncSetAttribute(k2inv_gemm_nn_kernel<Traits>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+    }
+    k2inv_gemm_nn_kernel<Traits><<<dim3(BH), dim3(Traits::kNThreads), smem, stream>>>(
+        A, B, C, strideA, strideB, strideC);
     FN_CUDA_KERNEL_CHECK();
 }
 

@@ -11,6 +11,11 @@
 #include "static_switch.h"
 #include "kernels/landmark.cuh"
 #include "kernels/kernel2_inv.cuh"
+#include "kernels/k2inv_gemm_tc.cuh"          // tf32 TC GEMM primitive (forward NS)
+#include "cublas_helpers.cuh"                 // launch_affine_with_identity
+#include <ATen/ops/empty.h>
+#include <ATen/Tensor.h>
+#include <c10/core/TensorOptions.h>
 #include "kernels/kernel3_output_fused.cuh"  // Tensor-core version (FP16/BF16)
 #include "kernels/kernel3_scalar.cuh"        // Scalar fallback (FP32)
 #include "kernels/kernel1_output_fused.cuh"  // Tensor-core version (FP16/BF16)
@@ -26,6 +31,53 @@
 #include "kernels/backward/landmark_bwd.cuh"
 
 namespace flash_nystrom {
+
+// Tensor-core forward pseudoinverse (no-ridge). Setup kernel emits K2 + Z_0, then
+// the Newton-Schulz chain runs as tf32 TC GEMMs on contiguous workspaces; each
+// iterate is copied (strided) into ns_iterates for the backward. Mirrors
+// iterative_pinverse: Z' = 0.25 Z (13I - KZ(15I - KZ(7I - KZ))), KZ = K2 Z.
+template <typename elem_type>
+static void run_kernel2_inv_tc(const elem_type* qt, const elem_type* kt, NystromParams &p) {
+    const int BH = p.BH, m = p.num_landmarks, D = p.head_dim, J = p.newton_iter;
+    const long long mm = (long long)m * m;
+    const long long zstr = (long long)(J + 1) * mm;
+    cudaStream_t stream = p.stream;
+
+    // K2 (-> k2_softmax), Z_0 (-> ns_iterates[0]), LSE. No ridge (kappa_star=0).
+    launch_kernel2_inv_setup<elem_type>(qt, kt, p.softmax2_lse_ptr, p.ns_iterates_ptr,
+        p.k2_softmax_ptr, BH, D, m, J, stream, 0.0f);
+
+    auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA);
+    at::Tensor wKZ = at::empty({BH, m, m}, opts), wA = at::empty({BH, m, m}, opts),
+               wB = at::empty({BH, m, m}, opts), wZ = at::empty({BH, m, m}, opts),
+               wZn = at::empty({BH, m, m}, opts);
+    float* KZ = wKZ.data_ptr<float>(); float* A = wA.data_ptr<float>();
+    float* B = wB.data_ptr<float>();  float* Z = wZ.data_ptr<float>(); float* Zn = wZn.data_ptr<float>();
+    float* K2 = p.k2_softmax_ptr;     float* IT = p.ns_iterates_ptr;
+    const size_t rowB = mm * sizeof(float);
+
+    // Z_0 (strided in ns_iterates) -> contiguous Z workspace.
+    FN_CUDA_CHECK(cudaMemcpy2DAsync(Z, rowB, IT, zstr * sizeof(float), rowB, BH,
+        cudaMemcpyDeviceToDevice, stream));
+    for (int j = 0; j < J; j++) {
+        launch_k2inv_gemm_nn(K2, Z, KZ, BH, m, stream);                                // KZ = K2 @ Z
+        launch_affine_with_identity(A, KZ, nullptr, 7.f, -1.f, 0.f, BH, m, stream);    // inner = 7I-KZ
+        launch_k2inv_gemm_nn(KZ, A, B, BH, m, stream);                                 // P = KZ@inner
+        launch_affine_with_identity(A, B, nullptr, 15.f, -1.f, 0.f, BH, m, stream);    // mid = 15I-P
+        launch_k2inv_gemm_nn(KZ, A, B, BH, m, stream);                                 // Q = KZ@mid
+        launch_affine_with_identity(A, B, nullptr, 13.f, -1.f, 0.f, BH, m, stream);    // outer = 13I-Q
+        launch_k2inv_gemm_nn(Z, A, B, BH, m, stream);                                  // R = Z@outer
+        launch_affine_with_identity(Zn, B, nullptr, 0.f, 0.25f, 0.f, BH, m, stream);   // Z' = 0.25R
+        // contiguous Z' -> ns_iterates[j+1] (strided), for the backward.
+        FN_CUDA_CHECK(cudaMemcpy2DAsync(IT + (long long)(j + 1) * mm, zstr * sizeof(float),
+            Zn, rowB, rowB, BH, cudaMemcpyDeviceToDevice, stream));
+        float* tmp = Z; Z = Zn; Zn = tmp;
+    }
+    // kernel2_inv_out = Z_J (contiguous).
+    FN_CUDA_CHECK(cudaMemcpyAsync(p.kernel2_inv_ptr, Z, (size_t)BH * mm * sizeof(float),
+        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_KERNEL_CHECK();
+}
 
 // FP16/BF16 path: uses tensor-core kernel1
 template <typename elem_type>
@@ -59,10 +111,19 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     // lambda*I (non-normality-proof). FN_KAPPA_STAR is the knob; unset/0 = off.
     const char* ks_env = std::getenv("FN_KAPPA_STAR");
     float kappa_star = ks_env ? static_cast<float>(atof(ks_env)) : 0.0f;
+    // FN_K2INV_TC=1 routes the pinv through the tf32 tensor-core NS chain. CP2
+    // covers the no-ridge path only; with the ridge on we still use the scalar
+    // kernel until the TC ridge lands (CP5).
+    const char* tc_env = std::getenv("FN_K2INV_TC");
+    bool use_tc = (tc_env && atoi(tc_env) != 0) && (kappa_star == 0.0f);
     prof.run("kernel2_inv", [&] {
-        launch_kernel2_inv<elem_type>(qt, kt,
-            p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
-            p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream, kappa_star);
+        if (use_tc) {
+            run_kernel2_inv_tc<elem_type>(qt, kt, p);
+        } else {
+            launch_kernel2_inv<elem_type>(qt, kt,
+                p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
+                p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream, kappa_star);
+        }
     });
     prof.run("kernel3_output_fused", [&] {
         launch_kernel3_output_fused<elem_type>(qt, k_m, v,
