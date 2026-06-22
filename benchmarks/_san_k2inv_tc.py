@@ -9,7 +9,8 @@ N = 1025
 q = fix["q0"][:, :, :N].contiguous().to(dev)
 k = fix["k0"][:, :, :N].contiguous().to(dev)
 v = fix["v0"][:, :, :N].contiguous().to(dev)
-r = _C.forward(q, k, v, m, nw)
+_C.forward(q, k, v, m, nw)        # graph capture
+r = _C.forward(q, k, v, m, nw)    # graph replay
 torch.cuda.synchronize()
 print(f"SAN_K2INV_TC done k2inv_finite={torch.isfinite(r[5]).all().item()}", flush=True)
 sys.stdout.flush(); sys.stderr.flush()

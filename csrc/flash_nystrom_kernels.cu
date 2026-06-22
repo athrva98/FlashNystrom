@@ -16,6 +16,7 @@
 #include <ATen/ops/empty.h>
 #include <ATen/Tensor.h>
 #include <c10/core/TensorOptions.h>
+#include <c10/cuda/CUDAStream.h>
 #include "kernels/kernel3_output_fused.cuh"  // Tensor-core version (FP16/BF16)
 #include "kernels/kernel3_scalar.cuh"        // Scalar fallback (FP32)
 #include "kernels/kernel1_output_fused.cuh"  // Tensor-core version (FP16/BF16)
@@ -32,50 +33,102 @@
 
 namespace flash_nystrom {
 
-// Tensor-core forward pseudoinverse (no-ridge). Setup kernel emits K2 + Z_0, then
-// the Newton-Schulz chain runs as tf32 TC GEMMs on contiguous workspaces; each
-// iterate is copied (strided) into ns_iterates for the backward. Mirrors
-// iterative_pinverse: Z' = 0.25 Z (13I - KZ(15I - KZ(7I - KZ))), KZ = K2 Z.
+// Persistent workspace + cached CUDA graph for the tf32 TC forward NS chain. The
+// ~9 GEMM/affine/copy launches per iteration are captured once per shape and
+// replayed with a single cudaGraphLaunch; setup (reads q,k) stays outside.
+struct K2InvTcGraph {
+    int BH = -1, m = -1, niter = -1;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    at::Tensor K2, iter, k2inv, wKZ, wA, wB, wZ, wZn;
+
+    bool matches(int bh, int m_, int n) const { return BH == bh && m == m_ && niter == n; }
+    void invalidate() {
+        if (exec)  { cudaGraphExecDestroy(exec); exec = nullptr; }
+        if (graph) { cudaGraphDestroy(graph);    graph = nullptr; }
+    }
+    void allocate(int bh, int m_, int n) {
+        BH = bh; m = m_; niter = n; invalidate();
+        auto o = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA);
+        K2 = at::empty({bh, m_, m_}, o);  iter = at::empty({bh, n + 1, m_, m_}, o);
+        k2inv = at::empty({bh, m_, m_}, o);
+        wKZ = at::empty({bh, m_, m_}, o); wA = at::empty({bh, m_, m_}, o);
+        wB = at::empty({bh, m_, m_}, o);  wZ = at::empty({bh, m_, m_}, o);
+        wZn = at::empty({bh, m_, m_}, o);
+    }
+    ~K2InvTcGraph() {
+        if (exec)  (void)cudaGraphExecDestroy(exec);
+        if (graph) (void)cudaGraphDestroy(graph);
+    }
+};
+
+static K2InvTcGraph& k2inv_tc_graph() { static thread_local K2InvTcGraph s; return s; }
+
+// Record the NS chain on persistent buffers (K2 and iter[0]=Z_0 must be populated
+// before launch). Fills iter[1..J] and k2inv (=Z_J). Capturable: only kernel
+// launches + memcpys, no synchronizing calls. Mirrors iterative_pinverse:
+//   KZ = K2 Z;  Z' = 0.25 Z (13I - KZ(15I - KZ(7I - KZ))).
+static void record_k2inv_tc_ns(K2InvTcGraph &s, cudaStream_t stream) {
+    const int BH = s.BH, m = s.m, J = s.niter;
+    const long long mm = (long long)m * m, zstr = (long long)(J + 1) * mm;
+    const size_t rowB = mm * sizeof(float);
+    float* K2 = s.K2.data_ptr<float>(); float* IT = s.iter.data_ptr<float>();
+    float* KZ = s.wKZ.data_ptr<float>(); float* A = s.wA.data_ptr<float>();
+    float* B = s.wB.data_ptr<float>();  float* Z = s.wZ.data_ptr<float>(); float* Zn = s.wZn.data_ptr<float>();
+    FN_CUDA_CHECK(cudaMemcpy2DAsync(Z, rowB, IT, zstr * sizeof(float), rowB, BH,
+        cudaMemcpyDeviceToDevice, stream));                                       // Z_0
+    for (int j = 0; j < J; j++) {
+        launch_k2inv_gemm_nn(K2, Z, KZ, BH, m, stream);                              // KZ = K2 Z
+        launch_affine_with_identity(A, KZ, nullptr, 7.f, -1.f, 0.f, BH, m, stream);  // 7I-KZ
+        launch_k2inv_gemm_nn(KZ, A, B, BH, m, stream);
+        launch_affine_with_identity(A, B, nullptr, 15.f, -1.f, 0.f, BH, m, stream);  // 15I-KZ(.)
+        launch_k2inv_gemm_nn(KZ, A, B, BH, m, stream);
+        launch_affine_with_identity(A, B, nullptr, 13.f, -1.f, 0.f, BH, m, stream);  // 13I-KZ(.)
+        launch_k2inv_gemm_nn(Z, A, B, BH, m, stream);
+        launch_affine_with_identity(Zn, B, nullptr, 0.f, 0.25f, 0.f, BH, m, stream); // 0.25 Z(.)
+        FN_CUDA_CHECK(cudaMemcpy2DAsync(IT + (long long)(j + 1) * mm, zstr * sizeof(float),
+            Zn, rowB, rowB, BH, cudaMemcpyDeviceToDevice, stream));                  // -> iter[j+1]
+        float* tmp = Z; Z = Zn; Zn = tmp;
+    }
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.k2inv.data_ptr<float>(), Z,
+        (size_t)BH * mm * sizeof(float), cudaMemcpyDeviceToDevice, stream));         // k2inv = Z_J
+}
+
+// Tensor-core forward pseudoinverse (no-ridge), graph-captured per shape.
 template <typename elem_type>
 static void run_kernel2_inv_tc(const elem_type* qt, const elem_type* kt, NystromParams &p) {
     const int BH = p.BH, m = p.num_landmarks, D = p.head_dim, J = p.newton_iter;
-    const long long mm = (long long)m * m;
-    const long long zstr = (long long)(J + 1) * mm;
+    const long long mm = (long long)m * m, zstr = (long long)(J + 1) * mm;
     cudaStream_t stream = p.stream;
 
-    // K2 (-> k2_softmax), Z_0 (-> ns_iterates[0]), LSE. No ridge (kappa_star=0).
     launch_kernel2_inv_setup<elem_type>(qt, kt, p.softmax2_lse_ptr, p.ns_iterates_ptr,
         p.k2_softmax_ptr, BH, D, m, J, stream, 0.0f);
 
-    auto opts = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA);
-    at::Tensor wKZ = at::empty({BH, m, m}, opts), wA = at::empty({BH, m, m}, opts),
-               wB = at::empty({BH, m, m}, opts), wZ = at::empty({BH, m, m}, opts),
-               wZn = at::empty({BH, m, m}, opts);
-    float* KZ = wKZ.data_ptr<float>(); float* A = wA.data_ptr<float>();
-    float* B = wB.data_ptr<float>();  float* Z = wZ.data_ptr<float>(); float* Zn = wZn.data_ptr<float>();
-    float* K2 = p.k2_softmax_ptr;     float* IT = p.ns_iterates_ptr;
-    const size_t rowB = mm * sizeof(float);
+    auto &s = k2inv_tc_graph();
+    if (!s.matches(BH, m, J)) s.allocate(BH, m, J);
 
-    // Z_0 (strided in ns_iterates) -> contiguous Z workspace.
-    FN_CUDA_CHECK(cudaMemcpy2DAsync(Z, rowB, IT, zstr * sizeof(float), rowB, BH,
+    // Setup outputs -> persistent buffers: K2 (contiguous) and Z_0 (iter[*,0]).
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.K2.data_ptr<float>(), p.k2_softmax_ptr,
+        (size_t)BH * mm * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemcpy2DAsync(s.iter.data_ptr<float>(), zstr * sizeof(float),
+        p.ns_iterates_ptr, zstr * sizeof(float), mm * sizeof(float), BH,
         cudaMemcpyDeviceToDevice, stream));
-    for (int j = 0; j < J; j++) {
-        launch_k2inv_gemm_nn(K2, Z, KZ, BH, m, stream);                                // KZ = K2 @ Z
-        launch_affine_with_identity(A, KZ, nullptr, 7.f, -1.f, 0.f, BH, m, stream);    // inner = 7I-KZ
-        launch_k2inv_gemm_nn(KZ, A, B, BH, m, stream);                                 // P = KZ@inner
-        launch_affine_with_identity(A, B, nullptr, 15.f, -1.f, 0.f, BH, m, stream);    // mid = 15I-P
-        launch_k2inv_gemm_nn(KZ, A, B, BH, m, stream);                                 // Q = KZ@mid
-        launch_affine_with_identity(A, B, nullptr, 13.f, -1.f, 0.f, BH, m, stream);    // outer = 13I-Q
-        launch_k2inv_gemm_nn(Z, A, B, BH, m, stream);                                  // R = Z@outer
-        launch_affine_with_identity(Zn, B, nullptr, 0.f, 0.25f, 0.f, BH, m, stream);   // Z' = 0.25R
-        // contiguous Z' -> ns_iterates[j+1] (strided), for the backward.
-        FN_CUDA_CHECK(cudaMemcpy2DAsync(IT + (long long)(j + 1) * mm, zstr * sizeof(float),
-            Zn, rowB, rowB, BH, cudaMemcpyDeviceToDevice, stream));
-        float* tmp = Z; Z = Zn; Zn = tmp;
+
+    if (s.exec == nullptr) {
+        auto side = c10::cuda::getStreamFromPool(/*isHighPriority=*/false);
+        cudaStream_t cap = side.stream();
+        FN_CUDA_CHECK(cudaStreamBeginCapture(cap, cudaStreamCaptureModeThreadLocal));
+        record_k2inv_tc_ns(s, cap);
+        FN_CUDA_CHECK(cudaStreamEndCapture(cap, &s.graph));
+        FN_CUDA_CHECK(cudaGraphInstantiate(&s.exec, s.graph, nullptr, nullptr, 0));
     }
-    // kernel2_inv_out = Z_J (contiguous).
-    FN_CUDA_CHECK(cudaMemcpyAsync(p.kernel2_inv_ptr, Z, (size_t)BH * mm * sizeof(float),
-        cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaGraphLaunch(s.exec, stream));
+
+    // Persistent results -> caller buffers.
+    FN_CUDA_CHECK(cudaMemcpyAsync(p.ns_iterates_ptr, s.iter.data_ptr<float>(),
+        (size_t)BH * (J + 1) * mm * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    FN_CUDA_CHECK(cudaMemcpyAsync(p.kernel2_inv_ptr, s.k2inv.data_ptr<float>(),
+        (size_t)BH * mm * sizeof(float), cudaMemcpyDeviceToDevice, stream));
     FN_CUDA_KERNEL_CHECK();
 }
 
