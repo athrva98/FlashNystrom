@@ -11,7 +11,8 @@
 
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_types.h>
-#include "nystrom_utils.h"   // convert_type, get_max_smem_per_block, FN_* checks
+#include <cstdlib>
+#include "nystrom_utils.h"   // get_sm_count, FN_* checks
 
 namespace flash_nystrom {
 
@@ -39,33 +40,36 @@ struct K2GemmTraits {
     static constexpr int kSmemBytes = kSmemElems * static_cast<int>(sizeof(cutlass::tfloat32_t));
 };
 
-// C[bh] = A[bh] @ B[bh], A:(M,K) B:(K,N) C:(M,N), all FP32 row-major, one CTA per
-// bh. Per-operand bh strides let callers point at sub-tensors (e.g. one iterate
-// slice of an (BH, J+1, m, m) buffer) without copying. Pass strideX = M*K etc.
-// for the contiguous case.
+// C[bh] = A[bh] @ B[bh] for the square m x m case (m = kM = kK = 64). Tiled over
+// output columns: grid is (BH, m/kN), CTA (bh, ct) computes the kN-wide column
+// slab C[bh][:, ct*kN : ct*kN+kN]. Column tiling multiplies the CTA count by m/kN
+// to fill the GPU at low BH while keeping the 4-warps-along-M MMA layout. Loads
+// the full A and the kN-column B slab. Per-operand bh strides let callers index
+// iterate slices of an (BH, J+1, m, m) buffer in place.
 template <typename Traits>
 __global__ void __launch_bounds__(Traits::kNThreads)
 k2inv_gemm_nn_kernel(
     const float* __restrict__ A,   // base of (.., M, K)
-    const float* __restrict__ B,   // base of (.., K, N)
-    float* __restrict__ C,         // base of (.., M, N)
+    const float* __restrict__ B,   // base of (.., K, M) row-major, full width M
+    float* __restrict__ C,         // base of (.., M, M)
     long long strideA, long long strideB, long long strideC
 ) {
     using TF = cutlass::tfloat32_t;
-    constexpr int kM = Traits::kM, kN = Traits::kN, kK = Traits::kK;
-    const int bh = blockIdx.x, tid = threadIdx.x;
+    constexpr int kM = Traits::kM, kN = Traits::kN, kK = Traits::kK;  // kN = column tile
+    const int bh = blockIdx.x, ct = blockIdx.y, tid = threadIdx.x;
+    const int col_off = ct * kN;     // this CTA writes C[:, col_off : col_off+kN]
 
     extern __shared__ TF smem_tf[];
-    TF* sA_ = smem_tf;
-    TF* sB_ = smem_tf + kM * kK;
+    TF* sA_ = smem_tf;             // (kM, kK) full A
+    TF* sB_ = smem_tf + kM * kK;   // (kN, kK) = B^T column slab
 
     const float* Abh = A + bh * strideA;
-    const float* Bbh = B + bh * strideB;       // B stored (K,N) row-major in GMEM
+    const float* Bbh = B + bh * strideB;       // (kK, kM) row-major, full width kM
     for (int i = tid; i < kM * kK; i += Traits::kNThreads) sA_[i] = TF(Abh[i]);
-    // Transpose B into smem: sB(n,k) = B(k,n).
+    // Transpose the kN-column slab of B into smem: sB(n,k) = B(k, col_off+n).
     for (int i = tid; i < kN * kK; i += Traits::kNThreads) {
         int n = i / kK, k = i % kK;
-        sB_[i] = TF(Bbh[k * kN + n]);
+        sB_[i] = TF(Bbh[k * kM + col_off + n]);
     }
     __syncthreads();
 
@@ -93,14 +97,23 @@ k2inv_gemm_nn_kernel(
     cute::copy(copy_B, tCsB, thr_copy_B.retile_D(tCrB));
     cute::gemm(tiled_mma, tCrA, tCrB, acc);   // full K contraction
 
-    Tensor mC = make_tensor(make_gmem_ptr(C + bh * strideC),
-                            make_layout(Shape<Int<kM>, Int<kN>>{}, GenRowMajor{}));
+    // Write the (kM, kN) slab into C[:, col_off:col_off+kN] (row stride = full m = kM).
+    Tensor mC = make_tensor(make_gmem_ptr(C + bh * strideC + col_off),
+                            make_layout(Shape<Int<kM>, Int<kN>>{}, Stride<Int<kM>, _1>{}));
     Tensor tCgC = thr_mma.partition_C(mC);
     cute::copy(acc, tCgC);
 }
 
-// Launcher for the square m x m x m case used by the NS chain. strideX default to
-// the contiguous m*m; pass explicit strides to index iterate slices in place.
+// Column-tile count: fill ~2 waves of CTAs (BH * tiles ~ 2*#SMs) at low BH, 1 at
+// high BH. tileN = 64/tiles in {64,32,16}. FN_K2INV_SPLITS (1/2/4) forces it.
+inline int k2inv_choose_col_tiles(int BH) {
+    const char* env = std::getenv("FN_K2INV_SPLITS");
+    if (env && env[0]) { int f = std::atoi(env); if (f == 1 || f == 2 || f == 4) return f; }
+    int raw = (2 * get_sm_count() + BH - 1) / BH;
+    return raw <= 1 ? 1 : (raw <= 2 ? 2 : 4);
+}
+
+// Launcher for the square m x m x m case. strideX default to the contiguous m*m.
 inline void launch_k2inv_gemm_nn(
     const float* A, const float* B, float* C, int BH, int m, cudaStream_t stream,
     long long strideA = -1, long long strideB = -1, long long strideC = -1
@@ -110,15 +123,16 @@ inline void launch_k2inv_gemm_nn(
     if (strideA < 0) strideA = mm;
     if (strideB < 0) strideB = mm;
     if (strideC < 0) strideC = mm;
-    using Traits = K2GemmTraits<64, 64, 64, 4>;
-    size_t smem = Traits::kSmemBytes;
-    if (smem > 48 * 1024) {
-        FN_CHECK(smem <= get_max_smem_per_block(), "k2inv_gemm_nn: insufficient SMEM");
-        FN_CUDA_CHECK(cudaFuncSetAttribute(k2inv_gemm_nn_kernel<Traits>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-    }
-    k2inv_gemm_nn_kernel<Traits><<<dim3(BH), dim3(Traits::kNThreads), smem, stream>>>(
-        A, B, C, strideA, strideB, strideC);
+    const int tiles = k2inv_choose_col_tiles(BH);
+    auto run = [&](auto TN) {
+        constexpr int tileN = decltype(TN)::value;
+        using Traits = K2GemmTraits<64, tileN, 64, 4>;   // smem <= 32KB, no opt-in
+        k2inv_gemm_nn_kernel<Traits><<<dim3(BH, 64 / tileN), dim3(Traits::kNThreads),
+            Traits::kSmemBytes, stream>>>(A, B, C, strideA, strideB, strideC);
+    };
+    if (tiles == 1)      run(cute::Int<64>{});
+    else if (tiles == 2) run(cute::Int<32>{});
+    else                 run(cute::Int<16>{});
     FN_CUDA_KERNEL_CHECK();
 }
 

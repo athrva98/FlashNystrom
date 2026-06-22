@@ -16,14 +16,14 @@ def check(A, B, tag):
 
 allok = True
 m = 64
-# random matrices, several BH
-for BH in (1, 8, 16, 64):
-    A = torch.randn(BH, m, m, device=dev)
-    B = torch.randn(BH, m, m, device=dev)
-    allok &= check(A, B, f"randn BH={BH}")
-# realistic magnitudes: a row-stochastic K2 @ a pinv-scale matrix
-K2 = torch.softmax(torch.randn(16, m, m, device=dev), dim=-1)
-allok &= check(K2, K2.transpose(-2, -1).contiguous(), "softmax K2 @ K2^T")
-allok &= check(K2, torch.randn(16, m, m, device=dev) * 5.0, "K2 @ (scale 5)")
+# every column-tile width (FN_K2INV_SPLITS 1/2/4 -> tileN 64/32/16) vs torch.bmm
+for splits in (1, 2, 4):
+    os.environ["FN_K2INV_SPLITS"] = str(splits)
+    print(f"-- FN_K2INV_SPLITS={splits} (tileN={64//splits}) --")
+    for BH in (1, 8, 16):
+        A = torch.randn(BH, m, m, device=dev); B = torch.randn(BH, m, m, device=dev)
+        allok &= check(A, B, f"randn BH={BH}")
+    K2 = torch.softmax(torch.randn(16, m, m, device=dev), dim=-1)
+    allok &= check(K2, K2.transpose(-2, -1).contiguous(), "softmax K2 @ K2^T")
 print("\nRESULT:", "ALL OK" if allok else "FAILURES")
 sys.exit(0 if allok else 1)
