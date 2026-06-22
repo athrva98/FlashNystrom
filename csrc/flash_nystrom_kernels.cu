@@ -54,10 +54,15 @@ static void run_nystrom_fwd_half(NystromParams &p) {
         launch_scaled_copy<elem_type>(q_in, q_m, total, p.scale, p.stream);
         launch_scaled_copy<elem_type>(k_in, k_m, total, p.scale, p.stream);
     });
+    // Tikhonov ridge target condition number; the kernel computes lambda =
+    // (||K2||_1 ||K2||_inf)/kappa_star internally and inverts M = K2^T K2 +
+    // lambda*I (non-normality-proof). FN_KAPPA_STAR is the knob; unset/0 = off.
+    const char* ks_env = std::getenv("FN_KAPPA_STAR");
+    float kappa_star = ks_env ? static_cast<float>(atof(ks_env)) : 0.0f;
     prof.run("kernel2_inv", [&] {
         launch_kernel2_inv<elem_type>(qt, kt,
             p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
-            p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream);
+            p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream, kappa_star);
     });
     prof.run("kernel3_output_fused", [&] {
         launch_kernel3_output_fused<elem_type>(qt, k_m, v,
@@ -94,9 +99,11 @@ static void run_nystrom_fwd_fp32_impl(NystromParams &p) {
     launch_scaled_copy<T>(q_in, q_m, total, p.scale, p.stream);
     launch_scaled_copy<T>(k_in, k_m, total, p.scale, p.stream);
 
+    const char* ks_env = std::getenv("FN_KAPPA_STAR");
+    float kappa_star = ks_env ? static_cast<float>(atof(ks_env)) : 0.0f;
     launch_kernel2_inv<T>(qt, kt,
         p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
-        p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream);
+        p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream, kappa_star);
 
     launch_kernel3_scalar<T>(qt, k_m, v,
         p.kernel2_inv_ptr, s2, b, p.softmax3_lse_ptr,
@@ -176,12 +183,17 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
             p.dQ_tilde_split_ptr, p.num_splits,
             BH, N, D, m, p.stream);
     });
+    // Tikhonov ridge: pass kappa_star through; the backward computes the
+    // per-bh lambda and the M = K2^T K2 + lambda*I wrap internally, matching
+    // the forward. FN_KAPPA_STAR is the knob; unset/0 = no ridge.
+    const char* ks_env_b = std::getenv("FN_KAPPA_STAR");
+    float kappa_star_b = ks_env_b ? static_cast<float>(atof(ks_env_b)) : 0.0f;
     prof.run("kernel2_inv_bwd", [&] {
         launch_kernel2_inv_bwd<elem_type>(q_tilde, k_tilde,
             p.dK2_inv_ptr,
             p.ns_iterates_ptr, p.k2_softmax_ptr,
             p.dQ_tilde_ptr, p.dK_tilde_ptr,
-            BH, D, m, p.newton_iter, p.stream);
+            BH, D, m, p.newton_iter, p.stream, kappa_star_b);
     });
     prof.run("landmark_bwd", [&] {
         launch_landmark_bwd<elem_type>(p.dQ_tilde_ptr, p.dK_tilde_ptr, dQ, dK,

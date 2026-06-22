@@ -35,8 +35,9 @@ __global__ void kernel2_inv_kernel(
     float* __restrict__ kernel2_inv_out,      // (B*H, m, m) FP32 — final K2_inv = Z_J
     float* __restrict__ softmax_lse_out,      // (B*H, m)
     float* __restrict__ ns_iterates_out,      // (B*H, newton_iter+1, m, m) FP32 — Z_0..Z_J
-    float* __restrict__ k2_softmax_out,       // (B*H, m, m) FP32 — the softmax K2 (for backward)
-    int D, int m, int newton_iter
+    float* __restrict__ k2_softmax_out,       // (B*H, m, m) FP32 — the un-ridged softmax K2 (for backward)
+    int D, int m, int newton_iter,
+    float kappa_star                          // Tikhonov target condition number (0 = no ridge)
 ) {
     const int bh = blockIdx.x;
     const int tid = threadIdx.x;
@@ -96,11 +97,45 @@ __global__ void kernel2_inv_kernel(
     }
     __syncthreads();
 
-    // Step 2.5: write softmax K2 to GMEM for the backward kernel.
-    // The SMEM K2 will be overwritten by Z_0 below; preserve a copy.
+    // Step 2.5: save the UN-ridged softmax K2 to GMEM (the backward needs it,
+    // and the Tikhonov path reloads it for the final M^-1 K2^T multiply).
     if (k2_softmax_out != nullptr) {
         float* k2sm_bh = k2_softmax_out + bh * mm;
         for (int idx = tid; idx < mm; idx += nthreads) k2sm_bh[idx] = K2[idx];
+        __syncthreads();
+    }
+
+    // Tikhonov ridge (non-normality-proof). K2 is non-normal in general, so
+    // K2 + lambda*I does NOT shift its singular values / bound cond(K2). Instead
+    // invert the SYMMETRIC PSD normal-equations matrix M = K2^T K2 + lambda*I and
+    // return K2^+ = M^-1 K2^T. With lambda = (||K2||_1 ||K2||_inf)/kappa_star
+    // (>= sigma_max^2/kappa_star) we get cond(M) <= kappa_star regardless of
+    // non-normality. We overwrite the K2 SMEM slot with M so the unchanged NS
+    // loop below inverts M (its Z_0 init then uses M's own norms); the un-ridged
+    // K2 is reloaded from GMEM for the final multiply (Step 5).
+    if (kappa_star > 0.0f) {
+        float lcs = -FLT_MAX;
+        for (int j = tid; j < m; j += nthreads) {
+            float cs = 0.0f; for (int i = 0; i < m; i++) cs += K2[i * m + j];
+            lcs = fmaxf(lcs, cs);
+        }
+        float n1 = block_reduce_max(lcs, scratch);          // ||K2||_1 (max col sum)
+        float lrs = -FLT_MAX;
+        for (int i = tid; i < m; i += nthreads) {
+            float rs = 0.0f; for (int j = 0; j < m; j++) rs += K2[i * m + j];
+            lrs = fmaxf(lrs, rs);
+        }
+        float ninf = block_reduce_max(lrs, scratch);        // ||K2||_inf (max row sum)
+        float lam = (n1 * ninf) / kappa_star;
+        // M = K2^T K2 + lambda*I  (build in Z, then move into the K2 slot)
+        for (int idx = tid; idx < mm; idx += nthreads) {
+            int i = idx / m, j = idx % m;
+            float acc = 0.0f;
+            for (int k = 0; k < m; k++) acc += K2[k * m + i] * K2[k * m + j];
+            Z[idx] = acc + ((i == j) ? lam : 0.0f);
+        }
+        __syncthreads();
+        for (int idx = tid; idx < mm; idx += nthreads) K2[idx] = Z[idx];
         __syncthreads();
     }
 
@@ -220,10 +255,23 @@ __global__ void kernel2_inv_kernel(
         }
     }
 
-    // Step 5: Write final K2_inv (= Z_J) for kernel3
+    // Step 5: Write final K2_inv for kernel3.
+    //  - no ridge:  K2_inv = Z_J            (Z_J = K2^-1 from NS on K2)
+    //  - Tikhonov:  K2_inv = M^-1 K2^T = Z_J K2^T  (Z_J = M^-1; reload un-ridged
+    //               K2 from GMEM since the K2 SMEM slot held M during NS)
     float* out = kernel2_inv_out + bh * mm;
-    for (int idx = tid; idx < mm; idx += nthreads) {
-        out[idx] = Z[idx];
+    if (kappa_star > 0.0f && k2_softmax_out != nullptr) {
+        const float* k2sm_bh = k2_softmax_out + bh * mm;
+        for (int idx = tid; idx < mm; idx += nthreads) K2[idx] = k2sm_bh[idx];  // K2 slot <- un-ridged K2
+        __syncthreads();
+        for (int idx = tid; idx < mm; idx += nthreads) {
+            int i = idx / m, j = idx % m;
+            float acc = 0.0f;
+            for (int k = 0; k < m; k++) acc += Z[i * m + k] * K2[j * m + k];  // (Z_J K2^T)[i,j]
+            out[idx] = acc;
+        }
+    } else {
+        for (int idx = tid; idx < mm; idx += nthreads) out[idx] = Z[idx];
     }
 }
 
@@ -232,9 +280,10 @@ void launch_kernel2_inv(
     const scalar_t* q_tilde, const scalar_t* k_tilde,
     float* kernel2_inv, float* softmax_lse,
     float* ns_iterates,        // (BH, newton_iter+1, m, m) — REQUIRED for backward
-    float* k2_softmax,         // (BH, m, m) — the softmax K2 (REQUIRED for backward)
+    float* k2_softmax,         // (BH, m, m) — the (ridged) K2 (REQUIRED for backward)
     int BH, int D, int m, int newton_iter,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float kappa_star = 0.0f
 ) {
     FN_CHECK(m > 0 && m <= kMaxLandmarks, "launch_kernel2_inv: m out of range");
 
@@ -255,7 +304,7 @@ void launch_kernel2_inv(
 
     kernel2_inv_kernel<scalar_t><<<grid, block, smem_bytes, stream>>>(
         q_tilde, k_tilde, kernel2_inv, softmax_lse, ns_iterates, k2_softmax,
-        D, m, newton_iter);
+        D, m, newton_iter, kappa_star);
     FN_CUDA_KERNEL_CHECK();
 }
 

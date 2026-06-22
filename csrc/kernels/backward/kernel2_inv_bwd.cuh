@@ -57,7 +57,8 @@ void launch_kernel2_inv_bwd(
     const float* ns_iterates,
     const float* K2_softmax,
     float* dQ_tilde, float* dK_tilde,
-    int BH, int D, int m, int newton_iter, cudaStream_t stream);
+    int BH, int D, int m, int newton_iter, cudaStream_t stream,
+    float kappa_star = 0.0f);
 
 // -- Test-only standalone launchers (used by debug pybind hooks) --
 //

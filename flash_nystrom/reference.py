@@ -54,6 +54,7 @@ def nystrom_attention_reference(  # noqa: C901
     newton_iter: int = 6,
     conv_weight: Optional[torch.Tensor] = None,
     conv_kernel_size: int = 0,
+    kappa_star: float = 0.0,
 ) -> torch.Tensor:
     """Reference nystrom attention — the one that actually does math correctly.
 
@@ -101,7 +102,40 @@ def nystrom_attention_reference(  # noqa: C901
 
     # Pseudoinverse via Newton-Schulz iteration (always FP32).
     kernel_2_f32 = kernel_2.float()
-    kernel_2_inv = iterative_pinverse(kernel_2_f32, n_iter=newton_iter).to(q.dtype)
+    # Rigorous (non-normality-proof) Tikhonov ridge via the normal equations.
+    # K2 is non-normal in general (real trained K2 has ||[K,K^T]||/||K||^2 up to
+    # ~0.8 in early layers), so K2 + lambda*I does NOT shift its singular values
+    # and cannot reliably bound cond(K2). Instead regularize the SYMMETRIC PSD
+    # M = K2^T K2 + lambda*I: its singular values equal its eigenvalues, so
+    # +lambda*I shifts them exactly, and
+    #   cond(M) = (sigma_max^2 + lambda)/(sigma_min^2 + lambda) ~ sigma_max^2/lambda,
+    # bounded by kappa_star with  lambda = sigma_max^2 / kappa_star,  regardless of
+    # how non-normal K2 is. The regularized pseudoinverse is the Tikhonov
+    # least-squares solution
+    #   K2^+_reg = (K2^T K2 + lambda*I)^{-1} K2^T.
+    # cond(K2) = sigma_max/sigma_min grows ~linearly with N (landmarks regress to
+    # the global mean as each pools N/m tokens), so the ridge is what keeps the
+    # Newton-Schulz pinv and its unrolled backward convergent/stable. kappa_star
+    # is the single knob (target cond of M): ~5 for J=6 iterations; larger ridges
+    # less (preserves more directions) at the cost of NS convergence.
+    if kappa_star > 0.0:
+        m = kernel_2_f32.shape[-1]
+        eye = torch.eye(m, device=kernel_2_f32.device, dtype=kernel_2_f32.dtype)
+        # lambda is a detached regularization SCALE (a data-derived
+        # hyperparameter, not differentiated). sigma_max^2 is estimated by the
+        # cheap spectral-norm bound ||K2||_1 * ||K2||_inf >= sigma_max^2, so
+        # cond(M) <= kappa_star is still guaranteed. The kernel computes the
+        # SAME bound (the NS init already needs both norms), so reference and
+        # kernel use an identical lambda with no power-iteration drift.
+        Kd = kernel_2_f32.detach()
+        norm1 = Kd.abs().sum(-2).amax(-1)      # max column sum  = ||K2||_1
+        norm_inf = Kd.abs().sum(-1).amax(-1)   # max row sum     = ||K2||_inf (=1 for row-stochastic)
+        lam = (norm1 * norm_inf / kappa_star)[..., None, None]
+        M = kernel_2_f32.transpose(-2, -1) @ kernel_2_f32 + lam * eye  # symmetric PSD
+        M_inv = iterative_pinverse(M, n_iter=newton_iter)
+        kernel_2_inv = (M_inv @ kernel_2_f32.transpose(-2, -1)).to(q.dtype)
+    else:
+        kernel_2_inv = iterative_pinverse(kernel_2_f32, n_iter=newton_iter).to(q.dtype)
 
     # Output (right-to-left for O(n*m) complexity)
     step1 = kernel_3 @ v  # (B, H, m, D)

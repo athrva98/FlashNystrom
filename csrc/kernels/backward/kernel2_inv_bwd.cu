@@ -387,7 +387,8 @@ __global__ void ns_bwd_final_pre_kernel(
     const float*    __restrict__ dZ0_in,   // (BH, m, m)
     float*          __restrict__ dK2_acc,  // (BH, m, m) FP32, updated in place
     scalar_t*       __restrict__ dS2_out,  // (BH, m, m) elem_type, written
-    int m
+    int m,
+    float ridge_lambda                     // lambda*I added to K2 post-softmax in the forward
 ) {
     const int bh = blockIdx.x;
     const int tid = threadIdx.x;
@@ -465,6 +466,10 @@ __global__ void ns_bwd_final_pre_kernel(
         int r = idx / m, c = idx % m;
         sdK2[idx] += dZ0_bh[c * m + r] * inv_c;
     }
+    // The column/row corrections below read-modify-write cells this loop also
+    // wrote (column jc1, row ir_inf), under a different thread->index mapping.
+    // The three += passes must be serialized or they race on the shared cells.
+    __syncthreads();
 
     // dK2[*, jc1] += -S * norm_inf / c^2
     {
@@ -473,6 +478,7 @@ __global__ void ns_bwd_final_pre_kernel(
             sdK2[r * m + jc1] += col_term;
         }
     }
+    __syncthreads();  // cell (ir_inf, jc1) is RMW by this pass and the next
 
     // dK2[ir_inf, *] += -S * norm_1 / c^2
     {
@@ -483,12 +489,20 @@ __global__ void ns_bwd_final_pre_kernel(
     }
     __syncthreads();
 
-    // dS2 = K2 * (dK2 - rowsum(dK2 * K2))
+    // dS2 = K2_sm * (dK2 - rowsum(dK2 * K2_sm)), the softmax-Jacobian VJP.
+    // K2_sm is the UN-ridged softmax K2: the forward added lambda*I AFTER the
+    // softmax (for pinv conditioning) and saved the ridged K2, so subtract
+    // lambda back off the diagonal here. The NS chain-rule and norm-gradient
+    // pieces above intentionally keep the ridged K2 (the NS inverted that).
     for (int i = tid; i < m; i += nthreads) {
         float D_i = 0.0f;
-        for (int j = 0; j < m; j++) D_i += sdK2[i * m + j] * sK2[i * m + j];
         for (int j = 0; j < m; j++) {
-            sdS2[i * m + j] = sK2[i * m + j] * (sdK2[i * m + j] - D_i);
+            float k2 = sK2[i * m + j] - ((i == j) ? ridge_lambda : 0.0f);
+            D_i += sdK2[i * m + j] * k2;
+        }
+        for (int j = 0; j < m; j++) {
+            float k2 = sK2[i * m + j] - ((i == j) ? ridge_lambda : 0.0f);
+            sdS2[i * m + j] = k2 * (sdK2[i * m + j] - D_i);
         }
     }
     __syncthreads();
@@ -499,6 +513,124 @@ __global__ void ns_bwd_final_pre_kernel(
     for (int idx = tid; idx < mm; idx += nthreads) {
         dS2_bh[idx] = from_float<scalar_t>(sdS2[idx]);
     }
+}
+
+// =========================================================================
+// Tikhonov-ridge backward helpers (kappa_star > 0). The forward inverts the
+// symmetric PSD M = K2^T K2 + lambda*I and returns K2^+ = Z_J K2^T (Z_J =
+// M^-1). The NS chain-rule machinery above is reused unchanged on M; these
+// three kernels handle the M <-> K2 wrapping at the two ends.
+// =========================================================================
+
+// Re-add the Tikhonov ridge to M's diagonal at reconstruct time:
+// lambda = (||K2||_1 * ||K2||_inf)/kappa_star per (b,h), identical to the
+// forward kernel's lambda. M arrives as K2^T K2 (from a cuBLAS gemm).
+__global__ void add_ridge_diag_kernel(
+    float* __restrict__ M,             // (BH, m, m), ridge added in place
+    const float* __restrict__ K2_in,   // (BH, m, m) un-ridged softmax K2 (>=0)
+    int m, float kappa_star
+) {
+    const int bh = blockIdx.x, tid = threadIdx.x, nthreads = blockDim.x;
+    const int mm = m * m;
+    const float* K2 = K2_in + bh * mm;
+    extern __shared__ float smem[];
+    float* col = smem;          // m
+    float* row = smem + m;      // m
+    float* sc  = smem + 2 * m;  // reduction scratch
+    for (int j = tid; j < m; j += nthreads) {
+        float s = 0.0f; for (int i = 0; i < m; i++) s += K2[i * m + j];
+        col[j] = s;
+    }
+    for (int i = tid; i < m; i += nthreads) {
+        float s = 0.0f; for (int j = 0; j < m; j++) s += K2[i * m + j];
+        row[i] = s;
+    }
+    __syncthreads();
+    float lc = -FLT_MAX; for (int j = tid; j < m; j += nthreads) lc = fmaxf(lc, col[j]);
+    float n1 = block_reduce_max(lc, sc);
+    float lr = -FLT_MAX; for (int i = tid; i < m; i += nthreads) lr = fmaxf(lr, row[i]);
+    float ninf = block_reduce_max(lr, sc);
+    float lam = (n1 * ninf) / kappa_star;
+    float* Mbh = M + bh * mm;
+    for (int i = tid; i < m; i += nthreads) Mbh[i * m + i] += lam;
+}
+
+// Z_0-init gradient, on M (symmetric, >= 0). Forward Z_0 = M^T/(||M||_1 ||M||_inf).
+// Same three dK2 contributions as ns_bwd_final_pre's first half, but the matrix
+// is M, the output accumulates into dM, and there is no softmax-Jacobian here
+// (that is applied later, on K2). dM_acc arrives holding the NS-loop's dM.
+__global__ void ns_bwd_z0grad_kernel(
+    const float* __restrict__ M_in,    // (BH, m, m) ridged M (>= 0)
+    const float* __restrict__ dZ0_in,  // (BH, m, m) dZ_0
+    float*       __restrict__ dM_acc,  // (BH, m, m) += Z_0-init grad
+    int m
+) {
+    const int bh = blockIdx.x, tid = threadIdx.x, nthreads = blockDim.x;
+    const int mm = m * m;
+    extern __shared__ float smem[];
+    float* sM      = smem;
+    float* sdM     = smem + mm;
+    float* tmp     = smem + 2 * mm;   // col/row sum vectors
+    float* scratch = smem + 3 * mm;
+    const float* M_bh   = M_in + bh * mm;
+    const float* dZ0_bh = dZ0_in + bh * mm;
+    float* dM_bh        = dM_acc + bh * mm;
+    for (int idx = tid; idx < mm; idx += nthreads) { sM[idx] = M_bh[idx]; sdM[idx] = dM_bh[idx]; }
+    __syncthreads();
+    float* col = tmp; float* rowv = tmp + m;
+    for (int j = tid; j < m; j += nthreads) { float s = 0.0f; for (int i = 0; i < m; i++) s += sM[i * m + j]; col[j] = s; }
+    for (int i = tid; i < m; i += nthreads) { float s = 0.0f; for (int j = 0; j < m; j++) s += sM[i * m + j]; rowv[i] = s; }
+    __syncthreads();
+    __shared__ float s_n1, s_ninf; __shared__ int s_jc1, s_ir;
+    if (tid == 0) {
+        float mv = -FLT_MAX; int mi = 0;
+        for (int j = 0; j < m; j++) if (col[j] > mv) { mv = col[j]; mi = j; }
+        s_n1 = mv; s_jc1 = mi;
+        mv = -FLT_MAX; mi = 0;
+        for (int i = 0; i < m; i++) if (rowv[i] > mv) { mv = rowv[i]; mi = i; }
+        s_ninf = mv; s_ir = mi;
+    }
+    __syncthreads();
+    const float n1 = s_n1, ninf = s_ninf; const int jc1 = s_jc1, ir = s_ir;
+    const float c = fmaxf(n1 * ninf, 1e-12f); const float ic = 1.0f / c; const float ic2 = ic * ic;
+    float lS = 0.0f;
+    for (int idx = tid; idx < mm; idx += nthreads) { int a = idx / m, b = idx % m; lS += dZ0_bh[a * m + b] * sM[b * m + a]; }
+    float S = block_reduce_sum(lS, scratch);
+    __syncthreads();
+    for (int idx = tid; idx < mm; idx += nthreads) { int r = idx / m, c2 = idx % m; sdM[idx] += dZ0_bh[c2 * m + r] * ic; }
+    __syncthreads();   // serialize the three RMW passes (cell (ir,jc1) is shared)
+    { float ct = -S * ninf * ic2; for (int r = tid; r < m; r += nthreads) sdM[r * m + jc1] += ct; }
+    __syncthreads();
+    { float rt = -S * n1 * ic2;  for (int j = tid; j < m; j += nthreads) sdM[ir * m + j] += rt; }
+    __syncthreads();
+    for (int idx = tid; idx < mm; idx += nthreads) dM_bh[idx] = sdM[idx];
+}
+
+// Softmax-Jacobian VJP, on the un-ridged K2: dS2 = K2 * (dK2 - rowsum(dK2*K2)).
+// dK2 is the assembled K2-gradient (dK2_a + K2(dM+dM^T)). Writes dS2 in elem_type
+// for the trailing cuBLAS GemmEx (dQ_tilde, dK_tilde), exactly as ns_bwd_final_pre.
+template <typename scalar_t>
+__global__ void ns_bwd_softmax_jac_kernel(
+    const float* __restrict__ K2_in,    // (BH, m, m) un-ridged softmax K2
+    const float* __restrict__ dK2_in,   // (BH, m, m) dK2_final
+    scalar_t*    __restrict__ dS2_out,  // (BH, m, m) elem_type
+    int m
+) {
+    const int bh = blockIdx.x, tid = threadIdx.x, nthreads = blockDim.x;
+    const int mm = m * m;
+    extern __shared__ float smem[];
+    float* sK2 = smem; float* sdK2 = smem + mm; float* sdS2 = smem + 2 * mm;
+    const float* K2_bh = K2_in + bh * mm; const float* dK2_bh = dK2_in + bh * mm;
+    for (int idx = tid; idx < mm; idx += nthreads) { sK2[idx] = K2_bh[idx]; sdK2[idx] = dK2_bh[idx]; }
+    __syncthreads();
+    for (int i = tid; i < m; i += nthreads) {
+        float Di = 0.0f;
+        for (int j = 0; j < m; j++) Di += sdK2[i * m + j] * sK2[i * m + j];
+        for (int j = 0; j < m; j++) sdS2[i * m + j] = sK2[i * m + j] * (sdK2[i * m + j] - Di);
+    }
+    __syncthreads();
+    scalar_t* dS2_bh = dS2_out + bh * mm;
+    for (int idx = tid; idx < mm; idx += nthreads) dS2_bh[idx] = from_float<scalar_t>(sdS2[idx]);
 }
 
 // Row-major batched GemmEx wrapper. Supports FP16/BF16/FP32 A, B with FP32
@@ -574,6 +706,7 @@ template <> struct ElemScalarType<cutlass::bfloat16_t>{ static constexpr c10::Sc
 template <typename scalar_t>
 struct NsBwdGraphState {
     int m = -1, BH = -1, niter = -1, D = -1;
+    float captured_kappa = -1.0f;  // kappa_star baked into the captured graph
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     // Persistent workspaces with stable addresses across calls.
@@ -629,7 +762,7 @@ struct NsBwdGraphState {
         dK2_buf      = at::empty({BH, m, m},          opts_f32);
         dQ_tilde_buf = at::empty({BH, m, D},          opts_f32);
         dK_tilde_buf = at::empty({BH, m, D},          opts_f32);
-        scratch_buf  = at::empty({11, BH, m, m},      opts_f32);
+        scratch_buf  = at::empty({13, BH, m, m},      opts_f32);
         dS2_buf      = at::empty({BH, m, m},          opts_elem);
     }
 
@@ -660,11 +793,12 @@ static NsBwdGraphState<scalar_t>& get_ns_bwd_graph_state() {
 // the graph; pointers are the persistent workspace pointers in `s`.
 template <typename scalar_t>
 static void record_ns_bwd_on_workspace(
-    NsBwdGraphState<scalar_t>& s, cudaStream_t stream
+    NsBwdGraphState<scalar_t>& s, cudaStream_t stream, float kappa_star
 ) {
     const int m = s.m, BH = s.BH, niter = s.niter, D = s.D;
     const int mm = m * m;
     const int Z_bh_stride = (niter + 1) * mm;
+    const bool ridge = (kappa_star > 0.0f);
 
     // Inside a function template, member templates on dependent objects
     // need the explicit `template` disambiguator. Each .template data_ptr<T>()
@@ -692,15 +826,44 @@ static void record_ns_bwd_on_workspace(
     float* ws_dU      = scratch + 8  * BH * mm;
     float* ws_dM      = scratch + 9  * BH * mm;
     float* ws_dZ_out  = scratch + 10 * BH * mm;
+    float* ws_Mmat    = scratch + 11 * BH * mm;   // reconstructed M = K2^T K2 + lam*I (ridge)
+    float* ws_dK2a    = scratch + 12 * BH * mm;   // dK2 accumulator: dK2_a then dK2_final (ridge)
 
     cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
     cublasSetStream(handle, stream);
+
+    // --- Tikhonov pre-loop wrap: NS runs on M, not K2 (see header note) ---
+    // dZ currently holds G = dL/dK2^+ where K2^+ = Z_J K2^T, Z_J = M^-1.
+    //   dK2_a = G^T @ Z_J   (gradient through the trailing K2^T)
+    //   dZ    = G  @ K2     (gradient into Z_J; becomes the NS-loop seed dZ_J)
+    //   M     = K2^T K2 + lambda*I  (the matrix the saved iterates invert)
+    const float* Z_J = ns_iter + niter * mm;
+    if (ridge) {
+        rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+            1.0f, dZ, mm, Z_J, Z_bh_stride,
+            0.0f, ws_dK2a, mm, BH);                 // ws_dK2a = G^T Z_J
+        rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
+            1.0f, dZ, mm, K2, mm,
+            0.0f, ws_M, mm, BH);                    // ws_M = G K2  (temp)
+        FN_CUDA_CHECK(cudaMemcpyAsync(dZ, ws_M, (size_t)BH * mm * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream));     // dZ = dZ_J
+        rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
+            1.0f, K2, mm, K2, mm,
+            0.0f, ws_Mmat, mm, BH);                 // ws_Mmat = K2^T K2
+        size_t smem_rd = (2 * m + 32) * sizeof(float);
+        add_ridge_diag_kernel<<<dim3(BH), dim3(256), smem_rd, stream>>>(
+            ws_Mmat, K2, m, kappa_star);            // ws_Mmat += lambda*I
+    }
+
+    // The matrix being inverted by NS: M (ridge) or K2 (no ridge). The loop
+    // accumulates dK2 (= dM under ridge) and rolls dZ from dZ_J down to dZ_0.
+    const float* mat = ridge ? ws_Mmat : K2;
 
     for (int j = niter - 1; j >= 0; j--) {
         const float* Z_j = ns_iter + j * mm;
 
         rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
-            1.0f, K2, mm, Z_j, Z_bh_stride,
+            1.0f, mat, mm, Z_j, Z_bh_stride,
             0.0f, ws_M, mm, BH);
 
         rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
@@ -751,40 +914,60 @@ static void record_ns_bwd_on_workspace(
             1.0f, dK2, mm, BH);
 
         rm_sgemm_strided_batched(handle, 'T', 'N', m, m, m,
-            1.0f, K2, mm, ws_dM, mm,
+            1.0f, mat, mm, ws_dM, mm,
             0.0f, dZ, mm, BH);
 
         launch_add_scaled_inplace(dZ, ws_dZ_out, 1.0f, BH, m, stream);
     }
 
-    // Final NS bwd: split into a pre-kernel (norms, dK2 init grad, dS2
-    // computation, persists dK2 to GMEM and writes dS2 in elem_type) plus
-    // two cuBLAS GemmEx calls for the trailing m x m x D matmuls. cuBLAS
-    // dispatches to tensor cores for FP16/BF16.
-    {
-        scalar_t* dS2 = reinterpret_cast<scalar_t*>(s.dS2_buf.data_ptr());
+    scalar_t* dS2 = reinterpret_cast<scalar_t*>(s.dS2_buf.data_ptr());
+    dim3 grid(BH), block(256);
+
+    if (ridge) {
+        // dK2 holds the NS-loop dM. Add the Z_0-init grad (on M) -> full dM.
+        size_t smem_z0 = (3 * mm + 8) * sizeof(float);
+        if (smem_z0 > 48 * 1024) {
+            FN_CHECK(smem_z0 <= get_max_smem_per_block(), "ns_bwd_z0grad: insufficient SMEM");
+            FN_CUDA_CHECK(cudaFuncSetAttribute(ns_bwd_z0grad_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_z0)));
+        }
+        ns_bwd_z0grad_kernel<<<grid, block, smem_z0, stream>>>(ws_Mmat, dZ, dK2, m);
+
+        // dK2_final = dK2_a + K2(dM + dM^T)  (accumulate into ws_dK2a).
+        rm_sgemm_strided_batched(handle, 'N', 'N', m, m, m,
+            1.0f, K2, mm, dK2, mm, 1.0f, ws_dK2a, mm, BH);   // += K2 dM
+        rm_sgemm_strided_batched(handle, 'N', 'T', m, m, m,
+            1.0f, K2, mm, dK2, mm, 1.0f, ws_dK2a, mm, BH);   // += K2 dM^T
+
+        // Softmax-Jacobian on the un-ridged K2 -> dS2.
+        size_t smem_sj = (3 * mm) * sizeof(float);
+        if (smem_sj > 48 * 1024) {
+            FN_CHECK(smem_sj <= get_max_smem_per_block(), "ns_bwd_softmax_jac: insufficient SMEM");
+            FN_CUDA_CHECK(cudaFuncSetAttribute(ns_bwd_softmax_jac_kernel<scalar_t>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_sj)));
+        }
+        ns_bwd_softmax_jac_kernel<scalar_t><<<grid, block, smem_sj, stream>>>(
+            K2, ws_dK2a, dS2, m);
+    } else {
+        // No-ridge: NS inverted K2 directly; the fused final pre-kernel does the
+        // Z_0-init grad and softmax-Jacobian together (ridge_lambda = 0).
         size_t smem = (3 * mm + 8) * sizeof(float);
-        dim3 grid(BH);
-        dim3 block(256);
         if (smem > 48 * 1024) {
-            FN_CHECK(smem <= get_max_smem_per_block(),
-                     "ns_bwd_final_pre: insufficient SMEM");
+            FN_CHECK(smem <= get_max_smem_per_block(), "ns_bwd_final_pre: insufficient SMEM");
             FN_CUDA_CHECK(cudaFuncSetAttribute(ns_bwd_final_pre_kernel<scalar_t>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
         }
         ns_bwd_final_pre_kernel<scalar_t><<<grid, block, smem, stream>>>(
-            K2, dZ, dK2, dS2, m);
-
-        // dQ_tilde += dS2 @ k_tilde   (alpha=1, beta=1; row-major)
-        rm_gemm_ex_strided_batched<scalar_t>(handle, 'N', 'N', m, D, m,
-            1.0f, dS2, mm, k_tilde, (long long)m * D,
-            1.0f, dQ_tilde, (long long)m * D, BH);
-
-        // dK_tilde += dS2^T @ q_tilde (alpha=1, beta=1; row-major)
-        rm_gemm_ex_strided_batched<scalar_t>(handle, 'T', 'N', m, D, m,
-            1.0f, dS2, mm, q_tilde, (long long)m * D,
-            1.0f, dK_tilde, (long long)m * D, BH);
+            K2, dZ, dK2, dS2, m, 0.0f);
     }
+
+    // Trailing m x m x D matmuls (TC for FP16/BF16), common to both paths.
+    rm_gemm_ex_strided_batched<scalar_t>(handle, 'N', 'N', m, D, m,
+        1.0f, dS2, mm, k_tilde, (long long)m * D,
+        1.0f, dQ_tilde, (long long)m * D, BH);     // dQ_tilde += dS2 @ k_tilde
+    rm_gemm_ex_strided_batched<scalar_t>(handle, 'T', 'N', m, D, m,
+        1.0f, dS2, mm, q_tilde, (long long)m * D,
+        1.0f, dK_tilde, (long long)m * D, BH);     // dK_tilde += dS2^T @ q_tilde
 }
 
 // =========================================================================
@@ -798,7 +981,8 @@ void launch_kernel2_inv_bwd(
     const float* ns_iterates,
     const float* K2_softmax,
     float* dQ_tilde, float* dK_tilde,
-    int BH, int D, int m, int newton_iter, cudaStream_t stream
+    int BH, int D, int m, int newton_iter, cudaStream_t stream,
+    float kappa_star
 ) {
     const int mm = m * m;
     const int mD = m * D;
@@ -839,6 +1023,13 @@ void launch_kernel2_inv_bwd(
     // (no kernels actually run during capture; the graph just records the
     // launch sequence) and then replay on the caller's stream, which both
     // executes the work and preserves the caller's stream ordering.
+    // kappa_star is baked into the captured graph (the ridge path's lambda is
+    // computed per-bh inside add_ridge_diag/z0grad from it). If it changed
+    // since capture, invalidate so we recapture with the new value.
+    if (s.exec != nullptr && s.captured_kappa != kappa_star) {
+        cudaGraphExecDestroy(s.exec); s.exec = nullptr;
+        cudaGraphDestroy(s.graph);    s.graph = nullptr;
+    }
     if (s.exec == nullptr) {
         // Pre-warm the cuBLAS handle outside capture. PyTorch creates the
         // handle lazily on first access; cublasCreate is not allowed during
@@ -849,9 +1040,10 @@ void launch_kernel2_inv_bwd(
         cudaStream_t side_stream = side.stream();
         FN_CUDA_CHECK(cudaStreamBeginCapture(side_stream,
             cudaStreamCaptureModeThreadLocal));
-        record_ns_bwd_on_workspace<scalar_t>(s, side_stream);
+        record_ns_bwd_on_workspace<scalar_t>(s, side_stream, kappa_star);
         FN_CUDA_CHECK(cudaStreamEndCapture(side_stream, &s.graph));
         FN_CUDA_CHECK(cudaGraphInstantiate(&s.exec, s.graph, nullptr, nullptr, 0));
+        s.captured_kappa = kappa_star;
     }
     FN_CUDA_CHECK(cudaGraphLaunch(s.exec, stream));
 
@@ -872,17 +1064,17 @@ template void launch_kernel2_inv_bwd<float>(
     const float*, const float*,
     const float*, const float*, const float*,
     float*, float*,
-    int, int, int, int, cudaStream_t);
+    int, int, int, int, cudaStream_t, float);
 template void launch_kernel2_inv_bwd<cutlass::half_t>(
     const cutlass::half_t*, const cutlass::half_t*,
     const float*, const float*, const float*,
     float*, float*,
-    int, int, int, int, cudaStream_t);
+    int, int, int, int, cudaStream_t, float);
 template void launch_kernel2_inv_bwd<cutlass::bfloat16_t>(
     const cutlass::bfloat16_t*, const cutlass::bfloat16_t*,
     const float*, const float*, const float*,
     float*, float*,
-    int, int, int, int, cudaStream_t);
+    int, int, int, int, cudaStream_t, float);
 
 template __global__ void ns_bwd_final_kernel<float>(
     const float* __restrict__, const float* __restrict__,
