@@ -254,7 +254,12 @@ kernel1_bwd_tc(
     // can die before GEMM5 (which allocates a 64-FP32-reg acc_ds2). rdS
     // (16 FP16 regs) is what survives across GEMM5 to the sPdS write below.
     Tensor rdS = convert_type<Element>(acc_dp);
-    // sS2 is FREE (step2 no longer needed after GEMM2)
+    // sS2 held step2 as GEMM2's B-operand. Without a barrier here a warp that
+    // finished GEMM2 races ahead and overwrites sS2 with P (the cute::copy
+    // below) while a lagging warp is still loading step2 fragments from sS2 in
+    // GEMM2's mainloop: a WAR hazard on sS2 that compute-sanitizer racecheck
+    // flags and that corrupts dstep2/dK_tilde at large N (multi-CTA occupancy).
+    __syncthreads();
 
     // ======== Write P (rP, already FP16) to sS2 for GEMM5 ========
     {
@@ -344,6 +349,12 @@ kernel1_bwd_tc(
               tiled_mma, smem_copy_A, smem_copy_Bt, thr_copy_A, thr_copy_Bt);
 
     // ======== Write dQ to GMEM via slot ========
+    // GEMM4 above reads Q from slot; the rdQ store below overwrites slot. With
+    // GEMM3 (which does not touch slot) the only thing in between, a warp that
+    // finishes GEMM4+GEMM3 races ahead and clobbers slot with dQ while a
+    // lagging warp is still loading Q in GEMM4's mainloop: a WAR on slot that
+    // compute-sanitizer racecheck flags (large-N multi-CTA occupancy).
+    __syncthreads();
     {
         auto rdQ = convert_type<Element>(acc_dq);
         auto sc = make_tiled_copy_C(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{}, tiled_mma);

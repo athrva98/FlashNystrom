@@ -443,6 +443,11 @@ kernel3_bwd_tc(
     }
 
     // ======== Phase 8: Write dS (rdS, already FP16 from eager convert) to sPdS ========
+    // GEMM_dV above reads P from sPdS; this store overwrites sPdS with dS.
+    // Without a barrier a fast warp clobbers P with dS while a lagging warp is
+    // still reading P in GEMM_dV's mainloop -- WAR on sPdS (racecheck). This is
+    // the kernel3 twin of the kernel1 GEMM2->P-write barrier.
+    __syncthreads();
     {
         auto sc = make_tiled_copy_C(typename Traits::SmemCopyAtomPdS{}, tiled_mma);
         auto tc = sc.get_thread_slice(tidx);
