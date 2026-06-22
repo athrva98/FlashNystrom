@@ -79,6 +79,19 @@ static void run_kernel2_inv_tc(const elem_type* qt, const elem_type* kt, Nystrom
     FN_CUDA_KERNEL_CHECK();
 }
 
+// Pinv dispatch: tensor-core NS chain (UseTC) or the scalar single-CTA kernel.
+template <typename elem_type, bool UseTC>
+static void run_kernel2_inv(const elem_type* qt, const elem_type* kt,
+                            NystromParams &p, float kappa_star) {
+    if constexpr (UseTC) {
+        run_kernel2_inv_tc<elem_type>(qt, kt, p);
+    } else {
+        launch_kernel2_inv<elem_type>(qt, kt,
+            p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
+            p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream, kappa_star);
+    }
+}
+
 // FP16/BF16 path: uses tensor-core kernel1
 template <typename elem_type>
 static void run_nystrom_fwd_half(NystromParams &p) {
@@ -117,13 +130,9 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     const char* tc_env = std::getenv("FN_K2INV_TC");
     bool use_tc = (tc_env && atoi(tc_env) != 0) && (kappa_star == 0.0f);
     prof.run("kernel2_inv", [&] {
-        if (use_tc) {
-            run_kernel2_inv_tc<elem_type>(qt, kt, p);
-        } else {
-            launch_kernel2_inv<elem_type>(qt, kt,
-                p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
-                p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream, kappa_star);
-        }
+        BOOL_SWITCH(use_tc, kUseTC, [&] {
+            run_kernel2_inv<elem_type, kUseTC>(qt, kt, p, kappa_star);
+        });
     });
     prof.run("kernel3_output_fused", [&] {
         launch_kernel3_output_fused<elem_type>(qt, k_m, v,

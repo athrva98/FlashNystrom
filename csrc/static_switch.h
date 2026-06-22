@@ -6,6 +6,17 @@
 
 // Adapted from FlashAttention's static_switch.h (Tri Dao, 2024)
 
+#define BOOL_SWITCH(COND, CONST_NAME, ...)      \
+  [&] {                                         \
+    if (COND) {                                 \
+      constexpr static bool CONST_NAME = true;  \
+      return __VA_ARGS__();                     \
+    } else {                                    \
+      constexpr static bool CONST_NAME = false; \
+      return __VA_ARGS__();                     \
+    }                                           \
+  }()
+
 #define FP16_SWITCH(COND, ...)               \
   [&] {                                      \
     if (COND) {                              \
