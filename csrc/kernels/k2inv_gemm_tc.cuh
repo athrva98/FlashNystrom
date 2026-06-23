@@ -46,11 +46,16 @@ struct K2GemmTraits {
 // to fill the GPU at low BH while keeping the 4-warps-along-M MMA layout. Loads
 // the full A and the kN-column B slab. Per-operand bh strides let callers index
 // iterate slices of an (BH, J+1, m, m) buffer in place.
-template <typename Traits>
+// kTransB selects what the kN-column slab of the B operand is:
+//   false (NN): C = A @ B   -> Bop(n,k) = B(k, col_off+n)   (transpose-on-load)
+//   true  (NT): C = A @ B^T -> Bop(n,k) = B(col_off+n, k)   (direct row slab)
+// The TN atom contracts the inner dim of both, so in NT mode it computes A @ B^T
+// with no transpose (used for the Tikhonov final multiply Z_J @ K2^T).
+template <typename Traits, bool kTransB = false>
 __global__ void __launch_bounds__(Traits::kNThreads)
 k2inv_gemm_nn_kernel(
     const float* __restrict__ A,   // base of (.., M, K)
-    const float* __restrict__ B,   // base of (.., K, M) row-major, full width M
+    const float* __restrict__ B,   // base of (.., K, M) NN  /  (.., M, K) NT
     float* __restrict__ C,         // base of (.., M, M)
     long long strideA, long long strideB, long long strideC
 ) {
@@ -61,15 +66,15 @@ k2inv_gemm_nn_kernel(
 
     extern __shared__ TF smem_tf[];
     TF* sA_ = smem_tf;             // (kM, kK) full A
-    TF* sB_ = smem_tf + kM * kK;   // (kN, kK) = B^T column slab
+    TF* sB_ = smem_tf + kM * kK;   // (kN, kK) Bop column slab
 
     const float* Abh = A + bh * strideA;
-    const float* Bbh = B + bh * strideB;       // (kK, kM) row-major, full width kM
+    const float* Bbh = B + bh * strideB;
     for (int i = tid; i < kM * kK; i += Traits::kNThreads) sA_[i] = TF(Abh[i]);
-    // Transpose the kN-column slab of B into smem: sB(n,k) = B(k, col_off+n).
     for (int i = tid; i < kN * kK; i += Traits::kNThreads) {
         int n = i / kK, k = i % kK;
-        sB_[i] = TF(Bbh[k * kM + col_off + n]);
+        if constexpr (kTransB) sB_[i] = TF(Bbh[(col_off + n) * kK + k]);  // B(col_off+n, k)
+        else                   sB_[i] = TF(Bbh[k * kM + col_off + n]);    // B(k, col_off+n)
     }
     __syncthreads();
 
@@ -114,11 +119,13 @@ inline int k2inv_choose_col_tiles(int BH) {
 }
 
 // Launcher for the square m x m x m case. strideX default to the contiguous m*m.
-inline void launch_k2inv_gemm_nn(
+// kTransB=false: C = A @ B.  kTransB=true: C = A @ B^T.
+template <bool kTransB>
+inline void launch_k2inv_gemm_impl(
     const float* A, const float* B, float* C, int BH, int m, cudaStream_t stream,
-    long long strideA = -1, long long strideB = -1, long long strideC = -1
+    long long strideA, long long strideB, long long strideC
 ) {
-    FN_CHECK(m == 64, "k2inv_gemm_nn: supports m == 64 (landmarks fixed at 64)");
+    FN_CHECK(m == 64, "k2inv_gemm: supports m == 64 (landmarks fixed at 64)");
     const long long mm = (long long)m * m;
     if (strideA < 0) strideA = mm;
     if (strideB < 0) strideB = mm;
@@ -127,13 +134,22 @@ inline void launch_k2inv_gemm_nn(
     auto run = [&](auto TN) {
         constexpr int tileN = decltype(TN)::value;
         using Traits = K2GemmTraits<64, tileN, 64, 4>;   // smem <= 32KB, no opt-in
-        k2inv_gemm_nn_kernel<Traits><<<dim3(BH, 64 / tileN), dim3(Traits::kNThreads),
+        k2inv_gemm_nn_kernel<Traits, kTransB><<<dim3(BH, 64 / tileN), dim3(Traits::kNThreads),
             Traits::kSmemBytes, stream>>>(A, B, C, strideA, strideB, strideC);
     };
     if (tiles == 1)      run(cute::Int<64>{});
     else if (tiles == 2) run(cute::Int<32>{});
     else                 run(cute::Int<16>{});
     FN_CUDA_KERNEL_CHECK();
+}
+
+inline void launch_k2inv_gemm_nn(const float* A, const float* B, float* C, int BH, int m,
+    cudaStream_t stream, long long sA = -1, long long sB = -1, long long sC = -1) {
+    launch_k2inv_gemm_impl<false>(A, B, C, BH, m, stream, sA, sB, sC);   // C = A @ B
+}
+inline void launch_k2inv_gemm_nt(const float* A, const float* B, float* C, int BH, int m,
+    cudaStream_t stream, long long sA = -1, long long sB = -1, long long sC = -1) {
+    launch_k2inv_gemm_impl<true>(A, B, C, BH, m, stream, sA, sB, sC);    // C = A @ B^T
 }
 
 } // namespace flash_nystrom

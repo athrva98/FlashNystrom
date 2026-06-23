@@ -94,21 +94,29 @@ static void record_k2inv_tc_ns(K2InvTcGraph &s, cudaStream_t stream) {
         (size_t)BH * mm * sizeof(float), cudaMemcpyDeviceToDevice, stream));         // k2inv = Z_J
 }
 
-// Tensor-core forward pseudoinverse (no-ridge), graph-captured per shape.
+// Tensor-core forward pseudoinverse, graph-captured per shape. No-ridge inverts
+// K2 directly (K2^+ = Z_J); Tikhonov inverts M = K2^T K2 + lambda*I and returns
+// K2^+ = Z_J K2^T. The NS graph is identical (it inverts whatever sits in s.K2);
+// the ridge differs only in setup (M exported to scratch) and the final multiply.
 template <typename elem_type>
-static void run_kernel2_inv_tc(const elem_type* qt, const elem_type* kt, NystromParams &p) {
+static void run_kernel2_inv_tc(const elem_type* qt, const elem_type* kt,
+                               NystromParams &p, float kappa_star) {
     const int BH = p.BH, m = p.num_landmarks, D = p.head_dim, J = p.newton_iter;
     const long long mm = (long long)m * m, zstr = (long long)(J + 1) * mm;
     cudaStream_t stream = p.stream;
+    const bool ridge = kappa_star > 0.0f;
 
+    // Setup: K2 -> k2_softmax, Z_0 -> ns_iterates[0]; ridge also writes M into the
+    // kernel2_inv buffer (used here as scratch, overwritten by the final multiply).
     launch_kernel2_inv_setup<elem_type>(qt, kt, p.softmax2_lse_ptr, p.ns_iterates_ptr,
-        p.k2_softmax_ptr, BH, D, m, J, stream, 0.0f);
+        p.k2_softmax_ptr, ridge ? p.kernel2_inv_ptr : nullptr, BH, D, m, J, stream, kappa_star);
 
     auto &s = k2inv_tc_graph();
     if (!s.matches(BH, m, J)) s.allocate(BH, m, J);
 
-    // Setup outputs -> persistent buffers: K2 (contiguous) and Z_0 (iter[*,0]).
-    FN_CUDA_CHECK(cudaMemcpyAsync(s.K2.data_ptr<float>(), p.k2_softmax_ptr,
+    // Matrix the NS inverts -> s.K2: M (ridge) or K2 (no-ridge). Z_0 -> iter[*,0].
+    FN_CUDA_CHECK(cudaMemcpyAsync(s.K2.data_ptr<float>(),
+        ridge ? p.kernel2_inv_ptr : p.k2_softmax_ptr,
         (size_t)BH * mm * sizeof(float), cudaMemcpyDeviceToDevice, stream));
     FN_CUDA_CHECK(cudaMemcpy2DAsync(s.iter.data_ptr<float>(), zstr * sizeof(float),
         p.ns_iterates_ptr, zstr * sizeof(float), mm * sizeof(float), BH,
@@ -124,11 +132,17 @@ static void run_kernel2_inv_tc(const elem_type* qt, const elem_type* kt, Nystrom
     }
     FN_CUDA_CHECK(cudaGraphLaunch(s.exec, stream));
 
-    // Persistent results -> caller buffers.
+    // Iterates (Z_0..Z_J) -> ns_iterates for the backward.
     FN_CUDA_CHECK(cudaMemcpyAsync(p.ns_iterates_ptr, s.iter.data_ptr<float>(),
         (size_t)BH * (J + 1) * mm * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-    FN_CUDA_CHECK(cudaMemcpyAsync(p.kernel2_inv_ptr, s.k2inv.data_ptr<float>(),
-        (size_t)BH * mm * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    // Final pinv: ridge -> K2^+ = Z_J K2^T (tensor-core A@B^T); no-ridge -> Z_J.
+    if (ridge) {
+        launch_k2inv_gemm_nt(s.k2inv.data_ptr<float>(), p.k2_softmax_ptr,
+                             p.kernel2_inv_ptr, BH, m, stream);
+    } else {
+        FN_CUDA_CHECK(cudaMemcpyAsync(p.kernel2_inv_ptr, s.k2inv.data_ptr<float>(),
+            (size_t)BH * mm * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    }
     FN_CUDA_KERNEL_CHECK();
 }
 
@@ -137,7 +151,7 @@ template <typename elem_type, bool UseTC>
 static void run_kernel2_inv(const elem_type* qt, const elem_type* kt,
                             NystromParams &p, float kappa_star) {
     if constexpr (UseTC) {
-        run_kernel2_inv_tc<elem_type>(qt, kt, p);
+        run_kernel2_inv_tc<elem_type>(qt, kt, p, kappa_star);
     } else {
         launch_kernel2_inv<elem_type>(qt, kt,
             p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
@@ -181,7 +195,7 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     // covers the no-ridge path only; with the ridge on we still use the scalar
     // kernel until the TC ridge lands (CP5).
     const char* tc_env = std::getenv("FN_K2INV_TC");
-    bool use_tc = (tc_env && atoi(tc_env) != 0) && (kappa_star == 0.0f);
+    bool use_tc = (tc_env && atoi(tc_env) != 0);   // TC path handles ridge + no-ridge
     prof.run("kernel2_inv", [&] {
         BOOL_SWITCH(use_tc, kUseTC, [&] {
             run_kernel2_inv<elem_type, kUseTC>(qt, kt, p, kappa_star);

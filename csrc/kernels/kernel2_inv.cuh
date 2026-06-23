@@ -186,6 +186,16 @@ __global__ void kernel2_inv_kernel(
 
     // Setup-only mode (TC pinv path): K2 (k2_softmax) and Z_0 (ns_iterates[0]) are
     // now in GMEM; the Newton-Schulz iterations run as external tensor-core GEMMs.
+    // For the Tikhonov ridge the matrix inverted by NS is M = K2^T K2 + lambda*I,
+    // which the ridge block above built into the K2 SMEM slot. Export it so the
+    // external NS can read it (no-ridge reads K2 directly from k2_softmax).
+    if constexpr (kSetupOnly) {
+        if (kappa_star > 0.0f && kernel2_inv_out != nullptr) {
+            float* mout = kernel2_inv_out + bh * mm;
+            for (int idx = tid; idx < mm; idx += nthreads) mout[idx] = K2[idx];
+        }
+    }
+
     // Compile the in-kernel scalar NS + final write out entirely (an early return
     // would make the loop statically unreachable, which -Werror rejects).
     if constexpr (!kSetupOnly) {
@@ -322,10 +332,12 @@ void launch_kernel2_inv(
 // the Z_0 init (-> ns_iterates[0]), and the LSE, then returns. The Newton-Schulz
 // iterations run as external tensor-core GEMMs (see run_kernel2_inv_tc). Does not
 // touch kernel2_inv_out.
+// m_out receives M = K2^T K2 + lambda*I when kappa_star > 0 (the matrix the
+// external NS inverts); pass nullptr for the no-ridge path (NS reads k2_softmax).
 template <typename scalar_t>
 void launch_kernel2_inv_setup(
     const scalar_t* q_tilde, const scalar_t* k_tilde,
-    float* softmax_lse, float* ns_iterates, float* k2_softmax,
+    float* softmax_lse, float* ns_iterates, float* k2_softmax, float* m_out,
     int BH, int D, int m, int newton_iter, cudaStream_t stream, float kappa_star
 ) {
     FN_CHECK(m > 0 && m <= kMaxLandmarks, "launch_kernel2_inv_setup: m out of range");
@@ -339,7 +351,7 @@ void launch_kernel2_inv_setup(
             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
     }
     kernel2_inv_kernel<scalar_t, true><<<grid, block, smem_bytes, stream>>>(
-        q_tilde, k_tilde, nullptr, softmax_lse, ns_iterates, k2_softmax,
+        q_tilde, k_tilde, m_out, softmax_lse, ns_iterates, k2_softmax,
         D, m, newton_iter, kappa_star);
     FN_CUDA_KERNEL_CHECK();
 }
