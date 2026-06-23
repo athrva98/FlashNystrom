@@ -5,10 +5,11 @@ os.environ["FN_K2INV_TC"] = "1"   # FN_KAPPA_STAR passed through from the env (r
 from flash_nystrom.flash_nystrom import _C
 dev = "cuda"; torch.manual_seed(0); torch.zeros(1, device=dev)
 fix = torch.load("C:/tmp/fn_real_fixture.pt"); m, nw = fix["M"], fix["NEWTON"]
+dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[os.environ.get("SAN_DTYPE", "fp16")]
 N = 1025
-q = fix["q0"][:, :, :N].contiguous().to(dev)
-k = fix["k0"][:, :, :N].contiguous().to(dev)
-v = fix["v0"][:, :, :N].contiguous().to(dev)
+q = fix["q0"][:, :, :N].contiguous().to(dev).to(dt)
+k = fix["k0"][:, :, :N].contiguous().to(dev).to(dt)
+v = fix["v0"][:, :, :N].contiguous().to(dev).to(dt)
 _C.forward(q, k, v, m, nw)        # graph capture
 r = _C.forward(q, k, v, m, nw)    # graph replay
 torch.cuda.synchronize()

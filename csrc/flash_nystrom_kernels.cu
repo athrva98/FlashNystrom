@@ -194,8 +194,10 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     // FN_K2INV_TC=1 routes the pinv through the tf32 tensor-core NS chain. CP2
     // covers the no-ridge path only; with the ridge on we still use the scalar
     // kernel until the TC ridge lands (CP5).
+    // tf32 tensor-core pinv is the default (faster, verified accurate); set
+    // FN_K2INV_TC=0 to fall back to the fp32-scalar kernel. Handles ridge + no-ridge.
     const char* tc_env = std::getenv("FN_K2INV_TC");
-    bool use_tc = (tc_env && atoi(tc_env) != 0);   // TC path handles ridge + no-ridge
+    bool use_tc = (tc_env == nullptr) || (atoi(tc_env) != 0);
     prof.run("kernel2_inv", [&] {
         BOOL_SWITCH(use_tc, kUseTC, [&] {
             run_kernel2_inv<elem_type, kUseTC>(qt, kt, p, kappa_star);
