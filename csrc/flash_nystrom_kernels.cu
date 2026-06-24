@@ -126,7 +126,15 @@ static void run_kernel2_inv_tc(const elem_type* qt, const elem_type* kt,
         auto side = c10::cuda::getStreamFromPool(/*isHighPriority=*/false);
         cudaStream_t cap = side.stream();
         FN_CUDA_CHECK(cudaStreamBeginCapture(cap, cudaStreamCaptureModeThreadLocal));
-        record_k2inv_tc_ns(s, cap);
+        try {
+            record_k2inv_tc_ns(s, cap);
+        } catch (...) {
+            // End the capture so a throw mid-record doesn't leave the side stream
+            // stuck in capturing state (which would poison all later launches).
+            cudaGraph_t g = nullptr; (void)cudaStreamEndCapture(cap, &g);
+            if (g) (void)cudaGraphDestroy(g);
+            throw;
+        }
         FN_CUDA_CHECK(cudaStreamEndCapture(cap, &s.graph));
         FN_CUDA_CHECK(cudaGraphInstantiate(&s.exec, s.graph, nullptr, nullptr, 0));
     }
@@ -197,7 +205,9 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     // tf32 tensor-core pinv is the default (faster, verified accurate); set
     // FN_K2INV_TC=0 to fall back to the fp32-scalar kernel. Handles ridge + no-ridge.
     const char* tc_env = std::getenv("FN_K2INV_TC");
-    bool use_tc = (tc_env == nullptr) || (atoi(tc_env) != 0);
+    // TC pinv supports m == 64 only (fixed-size cute tiles); fall back to the
+    // scalar kernel for sub-64 landmark counts.
+    bool use_tc = ((tc_env == nullptr) || (atoi(tc_env) != 0)) && (p.num_landmarks == 64);
     prof.run("kernel2_inv", [&] {
         BOOL_SWITCH(use_tc, kUseTC, [&] {
             run_kernel2_inv<elem_type, kUseTC>(qt, kt, p, kappa_star);
