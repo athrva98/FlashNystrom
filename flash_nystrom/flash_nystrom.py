@@ -66,10 +66,12 @@ class FlashNystromFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, num_landmarks, newton_iter, fast_dk2inv):
+    def forward(ctx, q, k, v, num_landmarks, newton_iter, fast_dk2inv,
+                kappa_star, use_tc_pinv):
         assert _C is not None, "CUDA extension not available"
 
-        results = _C.forward(q, k, v, num_landmarks, newton_iter)
+        results = _C.forward(q, k, v, num_landmarks, newton_iter,
+                             kappa_star, use_tc_pinv)
         # results: [output, q_s, k_s, q_tilde, k_tilde, k2inv, step2,
         #           lse1, lse2, lse3, ns_iterates, k2_softmax, b_saved]
         # b_saved = softmax(Q_tilde @ K_s^T) @ V (K_s = scaled K) is reused in
@@ -83,6 +85,7 @@ class FlashNystromFunction(torch.autograd.Function):
         ctx.num_landmarks = num_landmarks
         ctx.newton_iter = newton_iter
         ctx.fast_dk2inv = fast_dk2inv
+        ctx.kappa_star = kappa_star
 
         return output
 
@@ -116,11 +119,12 @@ class FlashNystromFunction(torch.autograd.Function):
             ctx.num_landmarks,
             ctx.newton_iter,
             ctx.fast_dk2inv,
+            ctx.kappa_star,
         )
 
-        # apply() args were (q, k, v, num_landmarks, newton_iter, fast_dk2inv)
-        # → six grad outputs; only q/k/v are differentiable.
-        return dQ, dK, dV, None, None, None
+        # apply() args were (q, k, v, num_landmarks, newton_iter, fast_dk2inv,
+        # kappa_star, use_tc_pinv) → eight grad outputs; only q/k/v differentiable.
+        return dQ, dK, dV, None, None, None, None, None
 
 
 # Landmark range gating constants. The custom CUDA kernels only handle m <= 64
@@ -168,7 +172,7 @@ def _check_reference_budget(q, num_landmarks):
 
 def flash_nystrom_attention(
     q, k, v, num_landmarks=64, newton_iter=6, conv_weight=None, conv_kernel_size=0,
-    fast_dk2inv=True,
+    fast_dk2inv=True, kappa_star=0.0, use_tc_pinv=True,
 ):
     """main entry point — uses CUDA kernels if available, falls back to pytorch.
 
@@ -198,16 +202,23 @@ def flash_nystrom_attention(
     mantissa — small accuracy cost, typically below FP16 training noise.
     `fast_dk2inv` is ignored when num_landmarks > 64 (the reference path
     doesn't use the custom dk2inv kernel).
+
+    `kappa_star` is the Tikhonov ridge target condition number, threaded
+    identically to the kernel and the reference dispatch so both compute the
+    same regularized pseudoinverse (0 = no ridge). `use_tc_pinv` routes the
+    pinv through the tf32 tensor-core path (m == 64 only).
     """
     if HAS_CUDA and q.is_cuda:
         if num_landmarks > _M_CUSTOM_KERNEL_MAX:
             # m > 64 -> reference. Memory check first so the user sees a
             # clear Python error before any allocation, not a CUDA OOM.
+            # kappa_star is passed through so the reference matches whatever the
+            # custom path would have used (consistency, not a separate default).
             _check_reference_budget(q, num_landmarks)
             from flash_nystrom.reference import nystrom_attention_reference
             return nystrom_attention_reference(
                 q, k, v, num_landmarks, newton_iter,
-                conv_weight, conv_kernel_size,
+                conv_weight, conv_kernel_size, kappa_star=kappa_star,
             )
 
         # m <= 64 -> custom CUDA path.
@@ -215,6 +226,7 @@ def flash_nystrom_attention(
         # about conv — that is added below at the Python level via cuDNN.
         out = FlashNystromFunction.apply(
             q, k, v, num_landmarks, newton_iter, fast_dk2inv,
+            kappa_star, use_tc_pinv,
         )
         # Add depthwise-conv residual via cuDNN if requested.
         if conv_weight is not None and conv_kernel_size > 0:
@@ -224,7 +236,8 @@ def flash_nystrom_attention(
         from flash_nystrom.reference import nystrom_attention_reference
 
         return nystrom_attention_reference(
-            q, k, v, num_landmarks, newton_iter, conv_weight, conv_kernel_size
+            q, k, v, num_landmarks, newton_iter, conv_weight, conv_kernel_size,
+            kappa_star=kappa_star,
         )
 
 
@@ -265,5 +278,7 @@ class FlashNystromAttention(nn.Module):
             conv_weight=self.conv_weight,
             conv_kernel_size=ks,
             fast_dk2inv=self.config.fast_dk2inv,
+            kappa_star=self.config.kappa_star,
+            use_tc_pinv=self.config.use_tc_pinv,
         )
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, N, self.dim))

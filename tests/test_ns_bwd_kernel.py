@@ -183,7 +183,13 @@ class TestNSBwdStep:
 class TestNSBwdFinal:
     """NS backward final step (Z_0 init gradient + softmax backward)."""
 
-    def _run(self, BH, m, D, seed=0, atol=1e-5):
+    # atol=2e-4: this compares the fused CUDA path against an fp32 PyTorch
+    # reference, and the trailing dS2 @ k_tilde / dS2^T @ q_tilde matmuls plus
+    # the softmax-Jacobian accumulate fp32 round-off that differs by GPU (cuBLAS
+    # Sgemm tiling). At D=128 the larger contraction reaches ~1.6e-5 on A100 vs
+    # <1e-5 on consumer Blackwell; both are fp32 round-off, not algorithmic error
+    # (a real bug shows ~1e-2+). Matches the sibling test_ns_bwd_graph tolerance.
+    def _run(self, BH, m, D, seed=0, atol=2e-4):
         torch.manual_seed(seed)
         q_tilde = torch.randn(BH, m, D, dtype=torch.float32, device="cuda")
         k_tilde = torch.randn(BH, m, D, dtype=torch.float32, device="cuda")

@@ -9,9 +9,15 @@
 #   - Python 3.10+
 #   - A compute-capability >= 8.0 GPU (Ampere, Ada, Hopper, Blackwell)
 #
-# Until a runner is attached, the workflow stays disabled by the `if`
-# guard below. Remove the guard and uncomment the `runs-on` line once
-# the runner is online.
+# The GPU job is gated on the repository variable GPU_RUNNER_AVAILABLE rather
+# than a hard `if: false`: set it to "true" in Settings > Secrets and variables
+# > Actions > Variables once a self-hosted runner is online, and the job runs on
+# every push/PR with no code change. Leaving it unset skips the job cleanly
+# (no stuck "pending" runs waiting on a runner that doesn't exist).
+#
+# The cpu-checks job below DOES run on GitHub-hosted runners every push: it
+# exercises the pure-PyTorch reference + config validation, so there is real
+# automated CI even before a GPU runner is attached.
 
 name: tests-gpu
 
@@ -23,9 +29,47 @@ on:
   workflow_dispatch:
 
 jobs:
+  cpu-checks:
+    # Always runs on GitHub-hosted runners: validates the pure-Python surface
+    # (reference attention + NystromConfig) that does not need a GPU.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU PyTorch + pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.4" pytest
+      - name: Reference forward/backward + config smoke test
+        run: |
+          python - <<'PY'
+          import torch
+          from flash_nystrom.reference import nystrom_attention_reference
+          from flash_nystrom.nystrom_config import NystromConfig
+          # config validation: bad kappa_star must raise
+          NystromConfig(kappa_star=5.0)
+          for bad in (-1.0, float("inf"), float("nan")):
+              try:
+                  NystromConfig(kappa_star=bad); raise SystemExit(f"FAIL: kappa_star={bad} accepted")
+              except AssertionError:
+                  pass
+          # reference forward+backward runs on CPU and produces finite grads
+          q = torch.randn(1, 2, 256, 64, requires_grad=True)
+          k = torch.randn(1, 2, 256, 64, requires_grad=True)
+          v = torch.randn(1, 2, 256, 64, requires_grad=True)
+          out = nystrom_attention_reference(q, k, v, 64, 6, kappa_star=5.0)
+          out.sum().backward()
+          assert all(t.grad is not None and torch.isfinite(t.grad).all() for t in (q, k, v))
+          print("cpu-checks OK")
+          PY
+
   tests:
-    # Disabled until a self-hosted GPU runner is attached.
-    if: false
+    # See header: set repo variable GPU_RUNNER_AVAILABLE=true once a runner is up.
+    if: ${{ vars.GPU_RUNNER_AVAILABLE == 'true' }}
     runs-on: [self-hosted, linux, cuda, gpu]
     timeout-minutes: 60
     strategy:

@@ -27,32 +27,90 @@ __global__ void kernel1_bwd_scalar_kernel(
     scalar_t* __restrict__ dQ_s, float* __restrict__ dstep2, float* __restrict__ dK_tilde,
     int N, int D, int m
 ) {
-    const int tile_idx = blockIdx.x, bh = blockIdx.y, tid = threadIdx.x, nt = blockDim.x;
-    constexpr int Br = 64;
-    const int rs = tile_idx*Br, re = min(rs+Br, N), tr = re-rs;
+    const int tile_idx = blockIdx.x, bh = blockIdx.y;
+    const int tid = threadIdx.x, nthreads = blockDim.x;
+    constexpr int Br = 64;                          // rows of Q handled per CTA
+    const int row_start = tile_idx * Br;
+    const int row_end   = min(row_start + Br, N);
+    const int tr        = row_end - row_start;      // rows in this tile
     if (tr <= 0) return;
-    extern __shared__ char sr[];
-    scalar_t* sKt = reinterpret_cast<scalar_t*>(sr);
-    scalar_t* sS2 = sKt+m*D; scalar_t* sQ = sS2+m*D; scalar_t* sdO = sQ+Br*D;
-    float* sP = reinterpret_cast<float*>(sdO+Br*D);
-    auto* kt=k_tilde+bh*m*D; auto* s2=step2+bh*m*D;
-    for(int i=tid;i<m*D;i+=nt){sKt[i]=kt[i];sS2[i]=s2[i];}
-    auto* q=q_s+bh*N*D+rs*D; auto* d=dO+bh*N*D+rs*D;
-    for(int i=tid;i<tr*D;i+=nt){sQ[i]=q[i];sdO[i]=d[i];}
+
+    // SMEM layout: k_tilde (m,D) | step2 (m,D) | Q tile (Br,D) | dO tile (Br,D)
+    // | P scratch (tr,m, FP32, reused for the softmax-Jacobian VJP).
+    extern __shared__ char smem_raw[];
+    scalar_t* sKt = reinterpret_cast<scalar_t*>(smem_raw);
+    scalar_t* sS2 = sKt + m * D;
+    scalar_t* sQ  = sS2 + m * D;
+    scalar_t* sdO = sQ  + Br * D;
+    float*    sP  = reinterpret_cast<float*>(sdO + Br * D);
+
+    // Load k_tilde and step2 (both (m,D)) for this batch-head.
+    const scalar_t* kt_bh = k_tilde + bh * m * D;
+    const scalar_t* s2_bh = step2   + bh * m * D;
+    for (int i = tid; i < m * D; i += nthreads) {
+        sKt[i] = kt_bh[i];
+        sS2[i] = s2_bh[i];
+    }
+    // Load this tile's Q and dO rows ((tr,D)).
+    const scalar_t* q_bh  = q_s + bh * N * D + row_start * D;
+    const scalar_t* dO_bh = dO  + bh * N * D + row_start * D;
+    for (int i = tid; i < tr * D; i += nthreads) {
+        sQ[i]  = q_bh[i];
+        sdO[i] = dO_bh[i];
+    }
     __syncthreads();
-    auto* lse=lse1+bh*N+rs;
-    for(int i=tid;i<tr*m;i+=nt){int r=i/m,c=i%m;float dot=0;for(int dd=0;dd<D;dd++)dot+=to_float(sQ[r*D+dd])*to_float(sKt[c*D+dd]);sP[i]=expf(dot-lse[r]);}
+
+    // P1[r,c] = softmax1 prob = exp(<Q[r], k_tilde[c]> - lse1[r]).
+    const float* lse_bh = lse1 + bh * N + row_start;
+    for (int i = tid; i < tr * m; i += nthreads) {
+        const int r = i / m, c = i % m;
+        float dot = 0.0f;
+        for (int dd = 0; dd < D; dd++)
+            dot += to_float(sQ[r * D + dd]) * to_float(sKt[c * D + dd]);
+        sP[i] = expf(dot - lse_bh[r]);
+    }
     __syncthreads();
-    float* ds2=dstep2+bh*m*D;
-    for(int i=tid;i<m*D;i+=nt){int j=i/D,dd=i%D;float s=0;for(int ii=0;ii<tr;ii++)s+=sP[ii*m+j]*to_float(sdO[ii*D+dd]);atomicAdd(&ds2[i],s);}
+
+    // dstep2 += P1^T @ dO (accumulated across row tiles -> atomicAdd into GMEM).
+    float* dstep2_bh = dstep2 + bh * m * D;
+    for (int i = tid; i < m * D; i += nthreads) {
+        const int j = i / D, dd = i % D;
+        float acc = 0.0f;
+        for (int r = 0; r < tr; r++)
+            acc += sP[r * m + j] * to_float(sdO[r * D + dd]);
+        atomicAdd(&dstep2_bh[i], acc);
+    }
     __syncthreads();
-    auto* d1=D1+bh*N+rs;
-    for(int i=tid;i<tr*m;i+=nt){int r=i/m,c=i%m;float dp=0;for(int dd=0;dd<D;dd++)dp+=to_float(sdO[r*D+dd])*to_float(sS2[c*D+dd]);sP[i]=sP[i]*(dp-d1[r]);}
+
+    // Softmax-Jacobian VJP, in place: dS1[r,c] = P1[r,c]*(<dO[r], step2[c]> - D1[r]).
+    const float* D1_bh = D1 + bh * N + row_start;
+    for (int i = tid; i < tr * m; i += nthreads) {
+        const int r = i / m, c = i % m;
+        float dp = 0.0f;
+        for (int dd = 0; dd < D; dd++)
+            dp += to_float(sdO[r * D + dd]) * to_float(sS2[c * D + dd]);
+        sP[i] = sP[i] * (dp - D1_bh[r]);
+    }
     __syncthreads();
-    auto* dq=dQ_s+bh*N*D+rs*D;
-    for(int i=tid;i<tr*D;i+=nt){int r=i/D,dd=i%D;float s=0;for(int j=0;j<m;j++)s+=sP[r*m+j]*to_float(sKt[j*D+dd]);dq[i]=from_float<scalar_t>(s);}
-    float* dkt=dK_tilde+bh*m*D;
-    for(int i=tid;i<m*D;i+=nt){int j=i/D,dd=i%D;float s=0;for(int ii=0;ii<tr;ii++)s+=sP[ii*m+j]*to_float(sQ[ii*D+dd]);atomicAdd(&dkt[i],s);}
+
+    // dQ_s = dS1 @ k_tilde (one write per element, no atomics).
+    scalar_t* dQ_bh = dQ_s + bh * N * D + row_start * D;
+    for (int i = tid; i < tr * D; i += nthreads) {
+        const int r = i / D, dd = i % D;
+        float acc = 0.0f;
+        for (int j = 0; j < m; j++)
+            acc += sP[r * m + j] * to_float(sKt[j * D + dd]);
+        dQ_bh[i] = from_float<scalar_t>(acc);
+    }
+    // dK_tilde += dS1^T @ Q_s (accumulated across row tiles -> atomicAdd into GMEM).
+    float* dKt_bh = dK_tilde + bh * m * D;
+    for (int i = tid; i < m * D; i += nthreads) {
+        const int j = i / D, dd = i % D;
+        float acc = 0.0f;
+        for (int r = 0; r < tr; r++)
+            acc += sP[r * m + j] * to_float(sQ[r * D + dd]);
+        atomicAdd(&dKt_bh[i], acc);
+    }
 }
 
 // -- tensor core kernel (fp16/bf16) --

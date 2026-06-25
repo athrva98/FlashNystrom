@@ -29,7 +29,9 @@ std::vector<torch::Tensor> nystrom_fwd(
     torch::Tensor k,
     torch::Tensor v,
     int64_t num_landmarks,
-    int64_t newton_iter
+    int64_t newton_iter,
+    double kappa_star,
+    bool use_tc_pinv
 ) {
     // Input validation
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
@@ -62,12 +64,22 @@ std::vector<torch::Tensor> nystrom_fwd(
     TORCH_CHECK(D == 64 || D == 128,
                 "head_dim must be 64 or 128 (other values not yet supported)");
     TORCH_CHECK(newton_iter >= 1 && newton_iter <= 20, "newton_iter must be in [1, 20]");
+    // Tikhonov ridge target cond(M). Must be finite and >= 0; 0 disables the
+    // ridge. Reject inf/NaN/negative (would yield a meaningless lambda).
+    TORCH_CHECK(std::isfinite(kappa_star) && kappa_star >= 0.0,
+                "kappa_star must be finite and >= 0 (got ", kappa_star,
+                "); 0 disables the Tikhonov ridge");
 
-    // FP32 scalar kernels need 4 bytes/elem vs 2 for FP16/BF16.
-    // At D=128, m=64: SMEM = ~144KB which exceeds all GPU limits.
-    TORCH_CHECK(!(dtype == at::ScalarType::Float && D == 128),
-                "FP32 with D=128 is not supported (scalar kernel SMEM overflow). "
-                "Use FP16 or BF16 for D=128.");
+    // FP32 D=128 needs large opt-in dynamic SMEM: the scalar kernels use ~4
+    // bytes/elem, so kernel3_scalar/kernel1_bwd peak near ~145-150KB at D=128,
+    // m=64. That fits on datacenter parts (A100 164KB, H100/B200 228KB) but NOT
+    // on consumer cards (RTX 40/50: ~100KB opt-in). We no longer hard-reject it
+    // here: each scalar kernel opts into the size it needs via
+    // cudaFuncSetAttribute and FN_CHECKs the request against
+    // get_max_smem_per_block(), so an undersized GPU gets a clear per-kernel
+    // "insufficient smem" error and a capable GPU just runs. FP32 D=128 is a
+    // verification path (gradcheck), not a perf path — the scalar kernels are
+    // slow by design.
 
     const at::cuda::CUDAGuard device_guard(q.device());
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
@@ -107,6 +119,8 @@ std::vector<torch::Tensor> nystrom_fwd(
     params.num_landmarks = static_cast<int>(m);
     params.newton_iter = static_cast<int>(newton_iter);
     params.is_bf16 = (dtype == at::ScalarType::BFloat16);
+    params.kappa_star = static_cast<float>(kappa_star);
+    params.use_tc_pinv = use_tc_pinv;
 
     params.q_in_ptr = q.data_ptr();   // unscaled user Q (landmark + scaled_copy source)
     params.k_in_ptr = k.data_ptr();   // unscaled user K
@@ -150,7 +164,8 @@ std::vector<torch::Tensor> nystrom_bwd(
     torch::Tensor b_saved,
     torch::Tensor v, torch::Tensor output,
     int64_t num_landmarks, int64_t newton_iter,
-    bool fast_dk2inv
+    bool fast_dk2inv,
+    double kappa_star
 ) {
     // ------------------------------------------------------------------
     // Input validation. Backward gets called from autograd with saved
@@ -173,9 +188,9 @@ std::vector<torch::Tensor> nystrom_bwd(
                 dtype == at::ScalarType::Half ||
                 dtype == at::ScalarType::BFloat16,
                 "dO dtype must be float32, float16, or bfloat16; got ", dtype);
-    TORCH_CHECK(!(dtype == at::ScalarType::Float && D == 128),
-                "FP32 backward with D=128 is not supported (scalar kernel SMEM overflow). "
-                "Use FP16 or BF16 for D=128.");
+    // FP32 D=128 backward: large opt-in SMEM, gated per-kernel (see the matching
+    // note in nystrom_fwd). No blanket rejection — capable GPUs run, small ones
+    // get a clear per-kernel "insufficient smem" error.
     TORCH_CHECK(D == 64 || D == 128,
                 "head_dim must be 64 or 128, got ", D);
     TORCH_CHECK(m > 0 && m <= 64,
@@ -184,6 +199,9 @@ std::vector<torch::Tensor> nystrom_bwd(
                 "seq_len (", N, ") must be >= num_landmarks (", m, ")");
     TORCH_CHECK(newton_iter >= 1 && newton_iter <= 20,
                 "newton_iter must be in [1, 20], got ", newton_iter);
+    TORCH_CHECK(std::isfinite(kappa_star) && kappa_star >= 0.0,
+                "kappa_star must be finite and >= 0 (got ", kappa_star,
+                "); must match the forward's kappa_star");
     TORCH_CHECK(B > 0 && H > 0,
                 "batch_size and num_heads must be positive (got B=", B, ", H=", H, ")");
     TORCH_CHECK(B * H * N * D <= INT32_MAX,
@@ -218,22 +236,20 @@ std::vector<torch::Tensor> nystrom_bwd(
     const at::cuda::CUDAGuard device_guard(dO.device());
     cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-    // BF16 backward precision fix. bf16's 7-bit mantissa accumulates ~3% error
-    // across the multi-stage backward (verified: an FP32 backward matches the
-    // pure-PyTorch reference to ~1e-5, so the gap is purely bf16 rounding, not
-    // an algorithmic bug). FP16's 10-bit mantissa cuts that ~8x at *identical*
-    // tensor-core throughput. The model stays BF16; only the backward compute
-    // runs in FP16. Activations and grads are O(1), comfortably inside FP16's
-    // range, so the bf16->fp16 cast is safe (and lossless — fp16 has strictly
-    // more mantissa bits than bf16). Grads are cast back to BF16 at return.
-    // DIAGNOSTIC (FN_FP32_BWD=1): route the 16-bit backward through FP32 to
-    // test whether the STL collapse is a precision effect. FP32 is exact vs the
-    // reference AND still uses the same nondeterministic atomicAdd accumulation,
-    // so: if this stops the collapse -> precision (bf16 softmax backwards) is
-    // the cause; if it still collapses -> precision is exonerated and it's the
-    // nondeterminism. bf16/fp16 -> fp32 is lossless. NOT a shipping path (the
-    // fp32 scalar backward is slow); this only isolates the mechanism. D=64
-    // only (the fp32 backward does not support D=128).
+    // The backward runs in the INPUT dtype (fp16 stays fp16, bf16 stays bf16)
+    // — see run_nystrom_bwd's FP16_SWITCH. There is no bf16->fp16 cast. The
+    // precision-sensitive softmax Jacobians are computed in FP32 inside the
+    // kernels (the fix for the large-N STL collapse), so bf16's 7-bit mantissa
+    // does not bias the gradient: an FP32 backward matches the pure-PyTorch
+    // reference to ~1e-5, and fp16/bf16 track it at their mantissa floor with
+    // zero systematic bias (verified by the grad-bias probe and by paired
+    // multi-seed training, where FN and the reference are statistically tied).
+    //
+    // DIAGNOSTIC ONLY (FN_FP32_BWD=1): route the whole 16-bit backward through
+    // FP32 to separate precision from the nondeterministic atomicAdd
+    // accumulation. Off by default and never a shipping path (the fp32 scalar
+    // backward is slow); kept as a debugging escape hatch. D=64 only (the fp32
+    // scalar backward overflows SMEM at D=128). 16-bit -> fp32 is lossless.
     const bool to_fp32 = std::getenv("FN_FP32_BWD") && (dtype != at::ScalarType::Float) && (D == 64);
     if (to_fp32) {
         dO      = dO.to(at::kFloat);
@@ -286,6 +302,7 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.newton_iter = static_cast<int>(newton_iter);
     params.is_bf16 = (dtype == at::ScalarType::BFloat16);
     params.fast_dk2inv = fast_dk2inv;
+    params.kappa_star = static_cast<float>(kappa_star);
 
     params.q_s_ptr = q_s.data_ptr();
     params.k_s_ptr = k_s.data_ptr();
@@ -458,7 +475,8 @@ std::vector<torch::Tensor> debug_kernel2_inv_bwd_full(
     torch::Tensor K2_softmax, // (BH, m, m) FP32 — softmax(QK^T) output
     torch::Tensor ns_iterates,// (BH, niter+1, m, m) FP32 — Z_0 .. Z_N from forward
     torch::Tensor dK2_inv_in, // (BH, m, m) FP32 — gradient w.r.t. Z_N
-    int64_t newton_iter
+    int64_t newton_iter,
+    double kappa_star
 ) {
     CHECK_DEVICE(q_tilde); CHECK_DEVICE(k_tilde); CHECK_DEVICE(K2_softmax);
     CHECK_DEVICE(ns_iterates); CHECK_DEVICE(dK2_inv_in);
@@ -495,7 +513,8 @@ std::vector<torch::Tensor> debug_kernel2_inv_bwd_full(
         ns_iterates.data_ptr<float>(),
         K2_softmax.data_ptr<float>(),
         dQ_tilde.data_ptr<float>(), dK_tilde.data_ptr<float>(),
-        BH, D, m, static_cast<int>(newton_iter), stream);
+        BH, D, m, static_cast<int>(newton_iter), stream,
+        static_cast<float>(kappa_star));
 
     return {dQ_tilde, dK_tilde};
 }
@@ -566,7 +585,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "point. See flash_nystrom.flash_nystrom_attention.",
           py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("num_landmarks") = 64,
-          py::arg("newton_iter") = 6);
+          py::arg("newton_iter") = 6,
+          py::arg("kappa_star") = 0.0,
+          py::arg("use_tc_pinv") = true);
     m.def("backward", &flash_nystrom::nystrom_bwd,
           "FlashNystrom backward (CUDA). Pass b_saved = softmax(Q_tilde @ K^T) "
           "@ V from the forward to skip the N-walk in compute_dk2inv. "
@@ -580,7 +601,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("b_saved"),
           py::arg("v"), py::arg("output"),
           py::arg("num_landmarks"), py::arg("newton_iter"),
-          py::arg("fast_dk2inv") = true);
+          py::arg("fast_dk2inv") = true,
+          py::arg("kappa_star") = 0.0);
     m.def("debug_k2inv_gemm_nn", &flash_nystrom::debug_k2inv_gemm_nn,
           "Debug: batched tf32 tensor-core GEMM C = A @ B (m x m x m).",
           py::arg("A"), py::arg("B"));
@@ -602,15 +624,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Debug: full launch_kernel2_inv_bwd (per-iter loop + final softmax bwd). "
           "Returns (dQ_tilde, dK_tilde) FP32.",
           py::arg("q_tilde"), py::arg("k_tilde"), py::arg("K2_softmax"),
-          py::arg("ns_iterates"), py::arg("dK2_inv_in"), py::arg("newton_iter"));
+          py::arg("ns_iterates"), py::arg("dK2_inv_in"), py::arg("newton_iter"),
+          py::arg("kappa_star") = 0.0);
     m.def("reset_caches", []() {
               flash_nystrom::reset_ns_bwd_caches();
               flash_nystrom::reset_kernel3_caches();
+              flash_nystrom::reset_k2inv_tc_caches();
           },
-          "Free the thread-local NS-backward graph caches/workspaces and the "
-          "kernel3 split-N scratch buffers. Reclaims GPU memory held by "
-          "FlashNystrom across all dtypes. Safe to call between calls but not "
-          "during a graph capture.");
+          "Free ALL three thread-local GPU caches held by FlashNystrom on the "
+          "calling thread: the NS-backward graph/workspaces, the kernel3 split-N "
+          "scratch, and the TC-pinv forward graph. Each cache holds one shape's "
+          "worth of CUDA graphs + FP32 workspaces per thread; they reallocate on "
+          "shape change (no per-shape growth) but persist for the thread's "
+          "lifetime. In a long-lived multi-threaded server, call this per worker "
+          "between requests (or on shape change) to reclaim the memory. Safe "
+          "between calls; must NOT be called during a graph capture.");
 
     // ----- Occupancy probe -----
     py::class_<flash_nystrom::OccupancyRow>(m, "OccupancyRow")

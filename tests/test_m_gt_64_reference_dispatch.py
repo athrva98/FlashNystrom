@@ -123,7 +123,7 @@ def test_m_le_64_still_uses_custom_path():
     v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16) * 0.5
 
     out_wrapper = flash_nystrom_attention(q, k, v, num_landmarks=m, newton_iter=6)
-    out_direct  = FlashNystromFunction.apply(q, k, v, m, 6, True)
+    out_direct  = FlashNystromFunction.apply(q, k, v, m, 6, True, 0.0, True)
 
     assert torch.equal(out_wrapper, out_direct), (
         "At m <= 64 the wrapper should be a direct forwarder over the custom "

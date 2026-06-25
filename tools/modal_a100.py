@@ -58,10 +58,11 @@ image = (
         "wheel",
         extra_index_url="https://download.pytorch.org/whl/cu128",
     )
-    # Build for A100 (sm_80) and H100 (sm_90): no nvidia-smi at image-build
-    # time, so pin both arches. The SM80 MMA / cp.async atoms compile and run
-    # on Hopper in Ampere-compatibility mode, so one image serves both GPUs.
-    .env({"FLASH_NYSTROM_CUDA_ARCH_LIST": "80 90"})
+    # Build for A100 (sm_80), H100/H200 (sm_90), and B200 (sm_100): no nvidia-smi
+    # at image-build time, so pin all three arches. The SM80 MMA / cp.async atoms
+    # compile and run on Hopper and Blackwell in compatibility mode, so one image
+    # serves every datacenter GPU (H200 is sm_90 like H100; B200 is sm_100).
+    .env({"FLASH_NYSTROM_CUDA_ARCH_LIST": "80 90 100"})
     .add_local_dir(
         str(REPO),
         remote_path=REMOTE,
@@ -127,6 +128,27 @@ fa_image = (
         "/tmp/flash-attention || echo FA_CLONE_FAILED",
         "cd /tmp/flash-attention/hopper && python setup.py install "
         "|| echo FA3_BUILD_FAILED",
+    )
+)
+
+# Image for the FA4 comparison. FA4 (flash-attn-4) is the CuTeDSL/JIT build that
+# runs natively on Hopper AND Blackwell, so it is the right exact-attention
+# baseline on B200. It is a pure-python wheel (no nvcc build, no
+# --no-build-isolation), JIT-compiled at first call. We also install FA2 (pip
+# wheel) for a second exact baseline. We deliberately do NOT build FA3 here: it
+# is sm_90a-only and does not run on B200's sm_100.
+fa4_image = (
+    image
+    .run_commands(
+        # flash-attn-4 ships only pre-releases (4.0.0bN), so --pre is required or
+        # pip reports "no matching distribution".
+        "pip install --pre 'flash-attn-4[cu12]' || pip install --pre flash-attn-4 "
+        "|| echo FA4_INSTALL_FAILED",
+        # The b19 wheel resolves an nvidia-cutlass-dsl whose `cute.core.ThrMma`
+        # was removed (AttributeError at import). Pin the version that still
+        # matches flash-attn-4 b19's API (upstream guidance: >= 4.5.2).
+        "pip install 'nvidia-cutlass-dsl==4.5.2' || echo CUTLASS_DSL_PIN_FAILED",
+        "pip install flash-attn --no-build-isolation || echo FA2_INSTALL_FAILED",
     )
 )
 
@@ -199,11 +221,11 @@ def _run_bench():
 
     def fn_fwd(q, k, v, m):
         with torch.no_grad():
-            return FlashNystromFunction.apply(q, k, v, m, 6, True)
+            return FlashNystromFunction.apply(q, k, v, m, 6, True, 5.0, True)
 
     def ref_fwd(q, k, v, m):
         with torch.no_grad():
-            return nystrom_attention_reference(q, k, v, m, 6, None, 0)
+            return nystrom_attention_reference(q, k, v, m, 6, None, 0, 5.0)
 
     def fwdbwd(impl, q, k, v, dout, m):
         def run():
@@ -211,9 +233,9 @@ def _run_bench():
             kk = k.detach().requires_grad_(True)
             vv = v.detach().requires_grad_(True)
             if impl == "fn":
-                out = FlashNystromFunction.apply(qq, kk, vv, m, 6, True)
+                out = FlashNystromFunction.apply(qq, kk, vv, m, 6, True, 5.0, True)
             else:
-                out = nystrom_attention_reference(qq, kk, vv, m, 6, None, 0)
+                out = nystrom_attention_reference(qq, kk, vv, m, 6, None, 0, 5.0)
             out.backward(dout)
         return run
 
@@ -311,11 +333,11 @@ def _run_bench_gaps():
 
     def fn_fwd(q, k, v, m):
         with torch.no_grad():
-            return FlashNystromFunction.apply(q, k, v, m, 6, True)
+            return FlashNystromFunction.apply(q, k, v, m, 6, True, 5.0, True)
 
     def ref_fwd(q, k, v, m):
         with torch.no_grad():
-            return nystrom_attention_reference(q, k, v, m, 6, None, 0)
+            return nystrom_attention_reference(q, k, v, m, 6, None, 0, 5.0)
 
     def fwdbwd(impl, q, k, v, dout, m):
         def run():
@@ -323,9 +345,9 @@ def _run_bench_gaps():
             kk = k.detach().requires_grad_(True)
             vv = v.detach().requires_grad_(True)
             if impl == "fn":
-                out = FlashNystromFunction.apply(qq, kk, vv, m, 6, True)
+                out = FlashNystromFunction.apply(qq, kk, vv, m, 6, True, 5.0, True)
             else:
-                out = nystrom_attention_reference(qq, kk, vv, m, 6, None, 0)
+                out = nystrom_attention_reference(qq, kk, vv, m, 6, None, 0, 5.0)
             out.backward(dout)
         return run
 
@@ -379,6 +401,30 @@ def bench_gaps_h100():
     _run_bench_gaps()
 
 
+@app.function(gpu="H200", timeout=5400)
+def bench_gaps_h200():
+    """Extended high-BH + long-context sweep on an H200 (sm_90, 141 GB HBM3e)."""
+    _run_bench_gaps()
+
+
+@app.function(gpu="B200", timeout=5400)
+def bench_gaps_b200():
+    """Extended high-BH + long-context sweep on a B200 (sm_100, Blackwell)."""
+    _run_bench_gaps()
+
+
+@app.function(gpu="H200", timeout=3600)
+def test_h200():
+    """Full test suite on an H200."""
+    _run_tests()
+
+
+@app.function(gpu="B200", timeout=3600)
+def test_b200():
+    """Full test suite on a B200 (sm_100)."""
+    _run_tests()
+
+
 @app.function(gpu="A100-80GB", timeout=3600)
 def bench_sweep():
     """Forward-only: sweep FLASH_NYSTROM_KERNEL3_SPLITS to find the best path.
@@ -419,11 +465,11 @@ def bench_sweep():
 
     def fn_fwd(q, k, v, m):
         with torch.no_grad():
-            return FlashNystromFunction.apply(q, k, v, m, 6, True)
+            return FlashNystromFunction.apply(q, k, v, m, 6, True, 5.0, True)
 
     def ref_fwd(q, k, v, m):
         with torch.no_grad():
-            return nystrom_attention_reference(q, k, v, m, 6, None, 0)
+            return nystrom_attention_reference(q, k, v, m, 6, None, 0, 5.0)
 
     # "0" = auto (atoi("0") < 1 so the kernel falls through to its heuristic).
     # "1" = pipelined single-CTA kernel3_fused_tc. >=2 = split path.
@@ -482,13 +528,13 @@ def bench_profile():
         os.environ.pop("FLASH_NYSTROM_PROFILE", None)
         for _ in range(5):
             with torch.no_grad():
-                FlashNystromFunction.apply(q, k, v, m, 6, True)
+                FlashNystromFunction.apply(q, k, v, m, 6, True, 5.0, True)
         torch.cuda.synchronize()
         print(f"\n=== B={B} H={H} N={N} D={D} m={m}  (BH={B*H}) ===", flush=True)
         os.environ["FLASH_NYSTROM_PROFILE"] = "1"
         for _ in range(profiled_calls):
             with torch.no_grad():
-                FlashNystromFunction.apply(q, k, v, m, 6, True)
+                FlashNystromFunction.apply(q, k, v, m, 6, True, 5.0, True)
             torch.cuda.synchronize()
         os.environ.pop("FLASH_NYSTROM_PROFILE", None)
         del q, k, v
@@ -557,7 +603,7 @@ def bench_fa_h100():
             kk = k.detach().requires_grad_(True)
             vv = v.detach().requires_grad_(True)
             flash_nystrom_attention(qq, kk, vv, num_landmarks=m,
-                                    newton_iter=6).backward(dout)
+                                    newton_iter=6, kappa_star=5.0).backward(dout)
         return run
 
     def fa_fwdbwd(fa, q, k, v, dout):
@@ -611,6 +657,133 @@ def bench_fa_h100():
     print("\nFA2/FA3 are exact O(N^2) attention; FN is approximate O(m*N). "
           "FA2/FN and FA3/FN = FA_total / FN_total; >1 means FN is faster. "
           "'-' = FA past its compute-feasible N (O(N^2) wall); FN keeps scaling.")
+
+
+def _run_bench_fa4():
+    """FlashNystrom vs FlashAttention-2 and FlashAttention-4 (CuTeDSL/JIT).
+
+    FA4 (`pip flash-attn-4`) is the Blackwell/Hopper-native exact-attention
+    build, so on a B200 it is the right exact baseline (FA3 is sm_90a-only and
+    does not run here). FN is approximate O(mN). We measure BOTH forward-only and
+    fwd+bwd, so FA4 is captured even if its CuTeDSL build is forward-only (the
+    fwd column is still a fair comparison). FA tensors are (B,S,H,D); FN is
+    (B,H,N,D), so we transpose for the FA calls.
+    """
+    import torch
+    from flash_nystrom.flash_nystrom import flash_nystrom_attention
+    fa2 = fa4 = None
+    try:
+        from flash_attn import flash_attn_func as fa2
+    except Exception as e:  # noqa: BLE001
+        print("FA2 unavailable:", repr(e))
+    try:
+        from flash_attn.cute import flash_attn_func as fa4
+    except Exception as e:  # noqa: BLE001
+        print("FA4 unavailable:", repr(e))
+
+    dtype = torch.float16; dev = "cuda"
+    print(f"GPU: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
+    print(f"FA2: {'available' if fa2 else 'MISSING'}   "
+          f"FA4: {'available' if fa4 else 'MISSING'}\n")
+
+    def cuda_time(fn, w, r):
+        try:
+            for _ in range(w): fn()
+            torch.cuda.synchronize()
+            evs = [(torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True)) for _ in range(r)]
+            for s, e in evs: s.record(); fn(); e.record()
+            torch.cuda.synchronize()
+            return sorted(s.elapsed_time(e) for s, e in evs)[r // 2]
+        except Exception:  # noqa: BLE001  (OOM, or FA4 has no backward)
+            torch.cuda.empty_cache(); return float("nan")
+
+    def fa_out(o): return o[0] if isinstance(o, tuple) else o
+
+    def fn_fwd(q, k, v, m):
+        def run():
+            with torch.no_grad():
+                flash_nystrom_attention(q, k, v, num_landmarks=m, newton_iter=6,
+                                        kappa_star=5.0)
+        return run
+
+    def fn_fb(q, k, v, dout, m):
+        def run():
+            qq = q.detach().requires_grad_(True)
+            kk = k.detach().requires_grad_(True)
+            vv = v.detach().requires_grad_(True)
+            flash_nystrom_attention(qq, kk, vv, num_landmarks=m, newton_iter=6,
+                                    kappa_star=5.0).backward(dout)
+        return run
+
+    def fa_fwd(fa, q, k, v):
+        def run():
+            with torch.no_grad():
+                fa_out(fa(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                          causal=False))
+        return run
+
+    def fa_fb(fa, q, k, v, dout):
+        def run():
+            qq = q.transpose(1, 2).detach().requires_grad_(True)
+            kk = k.transpose(1, 2).detach().requires_grad_(True)
+            vv = v.transpose(1, 2).detach().requires_grad_(True)
+            fa_out(fa(qq, kk, vv, causal=False)).backward(dout.transpose(1, 2))
+        return run
+
+    def reps(N):
+        if N <= 16384:  return 5, 15
+        if N <= 65536:  return 3, 8
+        if N <= 262144: return 2, 5
+        return 1, 2
+
+    def rx(a, b):
+        return f"{b/a:6.1f}x" if (a == a and b == b and a > 0) else "   -  "
+
+    configs = [
+        ("HIGH BH (B=4, H=16, D=128, m=64)",
+         4, 16, 128, 64, [4096, 16384, 65536, 131072], 131072),
+        ("LONG CONTEXT (B=1, H=4, D=64, m=32)",
+         1, 4, 64, 32, [16384, 65536, 131072, 262144, 524288, 1048576, 2097152],
+         1048576),
+    ]
+    for (label, B, H, D, m, Ns, cap) in configs:
+        print(f"\n### {label}  (ms; FA2/FA4 = exact O(N^2))")
+        hdr = (f"{'N':>8} | {'FN fwd':>7} {'FN tot':>7} | {'FA2 fwd':>8} {'FA2 tot':>8} | "
+               f"{'FA4 fwd':>8} {'FA4 tot':>8} | {'FA4f/FNf':>8} {'FA4t/FNt':>8}")
+        print(hdr); print("-" * len(hdr))
+        for N in Ns:
+            if B * H * N * D > 2**31 - 1:
+                print(f"{N:>8} | FN exceeds int32 element cap; skipped"); continue
+            g = lambda: torch.randn(B, H, N, D, dtype=dtype, device=dev)
+            q, k, v, dout = g(), g(), g(), g()
+            w, r = reps(N)
+            fnf = cuda_time(fn_fwd(q, k, v, m), w, r)
+            fnt = cuda_time(fn_fb(q, k, v, dout, m), w, r)
+            f2f = cuda_time(fa_fwd(fa2, q, k, v), w, r) if (fa2 and N <= cap) else float("nan")
+            f2t = cuda_time(fa_fb(fa2, q, k, v, dout), w, r) if (fa2 and N <= cap) else float("nan")
+            f4f = cuda_time(fa_fwd(fa4, q, k, v), w, r) if (fa4 and N <= cap) else float("nan")
+            f4t = cuda_time(fa_fb(fa4, q, k, v, dout), w, r) if (fa4 and N <= cap) else float("nan")
+            print(f"{N:>8} | {fnf:7.2f} {fnt:7.2f} | {f2f:8.2f} {f2t:8.2f} | "
+                  f"{f4f:8.2f} {f4t:8.2f} | {rx(fnf, f4f):>8} {rx(fnt, f4t):>8}")
+            del q, k, v, dout; torch.cuda.empty_cache()
+
+    print("\nFA4 fwd / FA4 tot = forward-only / fwd+bwd (separate so FA4 is captured "
+          "even if its CuTeDSL build is forward-only). FA4f/FNf and FA4t/FNt = "
+          "FA4 / FN; >1 means FN is faster. nan = OOM, past compute-feasible N, or "
+          "operation unsupported.")
+
+
+@app.function(gpu="B200", timeout=7200, image=fa4_image)
+def bench_fa4_b200():
+    """FN vs FlashAttention-2/4 on a B200 (FA4's native Blackwell card)."""
+    _run_bench_fa4()
+
+
+@app.function(gpu="H200", timeout=7200, image=fa4_image)
+def bench_fa4_h200():
+    """FN vs FlashAttention-2/4 on an H200 (FA4 also runs on Hopper)."""
+    _run_bench_fa4()
 
 
 @app.local_entrypoint()

@@ -22,6 +22,15 @@ struct NystromParams {
     int batch_size, num_heads, seq_len, head_dim, num_landmarks;
     int newton_iter;
     bool is_bf16;
+    // Tikhonov ridge target condition number: the pinv inverts
+    // M = K2^T K2 + lambda*I with lambda = (||K2||_1 ||K2||_inf)/kappa_star,
+    // guaranteeing cond(M) <= kappa_star. 0 disables the ridge (raw K2 pinv).
+    // Threaded from the Python API (no longer an env var); validated at entry.
+    float kappa_star;
+    // Route the pinv through the tf32 tensor-core Newton-Schulz chain (faster,
+    // verified accurate). Only applies at num_landmarks == 64; the scalar fp32
+    // kernel is used otherwise regardless of this flag.
+    bool use_tc_pinv;
 
     // q_ptr/k_ptr hold the SCALED copies (q*scale, k*scale) that the forward
     // kernels read and that are saved for the backward. q_in_ptr/k_in_ptr are
@@ -53,12 +62,10 @@ struct NystromParams {
     cudaStream_t stream;
 
     int BH;
-    int seg_len;
     float scale;
 
     void set_derived() {
         BH = batch_size * num_heads;
-        seg_len = (seq_len + num_landmarks - 1) / num_landmarks;
         scale = powf(static_cast<float>(head_dim), -0.25f);
     }
 };
@@ -74,6 +81,10 @@ struct NystromBwdParams {
     // True only for FP16/BF16 input dtype; trades a small precision drop for
     // a large bwd latency win at large N. See compute_dk2inv.cuh.
     bool fast_dk2inv;
+    // Tikhonov ridge target cond(M); must match the forward's kappa_star so the
+    // backward inverts the same M = K2^T K2 + lambda*I. 0 = no ridge. Threaded
+    // from the Python API (no longer an env var).
+    float kappa_star;
 
     // Forward saved tensors (const, read-only)
     const void* __restrict__ q_s_ptr;        // (B,H,N,D) scaled Q
@@ -150,5 +161,8 @@ void run_nystrom_bwd_fp32(NystromBwdParams &params);
 // the pybind reset_caches can free them without flash_nystrom.cu pulling in the
 // full CUTLASS header.
 void reset_kernel3_caches();
+// Free the thread-local TC-pinv forward graph cache (K2InvTcGraph). Defined in
+// flash_nystrom_kernels.cu.
+void reset_k2inv_tc_caches();
 
 } // namespace flash_nystrom

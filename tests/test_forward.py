@@ -170,8 +170,11 @@ class TestCUDAForward:
     def test_bf16_d128(self):
         self._compare(1, 2, 512, 128, 64, torch.bfloat16, 5e-3)
 
-    def test_fp32_d128_raises(self):
-        """FP32+D=128 should raise a clear error, not crash."""
+    def test_fp32_d128_runs_or_smem_gated(self):
+        """FP32+D=128 is no longer hard-rejected (it's a gradient-checking path).
+        On a GPU with enough opt-in SMEM (datacenter parts, ~150KB) it runs; on
+        an undersized GPU it raises a clear 'insufficient smem' capability error
+        — never the old blanket 'not supported', and never a silent crash."""
         try:
             from flash_nystrom._C import forward as cuda_forward
         except ImportError:
@@ -182,8 +185,12 @@ class TestCUDAForward:
         k = torch.randn(1, 2, 256, 128, dtype=torch.float32, device="cuda")
         v = torch.randn(1, 2, 256, 128, dtype=torch.float32, device="cuda")
 
-        with pytest.raises(RuntimeError, match="FP32 with D=128 is not supported"):
-            cuda_forward(q, k, v, 64, 6)
+        try:
+            out = cuda_forward(q, k, v, 64, 6)[0]
+            assert torch.isfinite(out).all()  # capable GPU: it actually ran
+        except RuntimeError as e:
+            assert "insufficient smem" in str(e), \
+                f"expected a SMEM capability error, got: {e}"
 
     # -- partial tile edge cases --
 

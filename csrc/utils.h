@@ -66,7 +66,10 @@
 namespace flash_nystrom {
 
 constexpr int kMaxHeadDim = 256;
-constexpr int kMaxLandmarks = 128;
+// The fused kernels use fixed m=64 tiles; the public entry (flash_nystrom.cu)
+// hard-rejects m > 64, and m > 64 dispatches to the PyTorch reference at the
+// Python level. This is the real limit, kept in sync with that check.
+constexpr int kMaxLandmarks = 64;
 constexpr float kLog2e = 1.4426950408889634f;  // log2(e) for exp2-based softmax trick
 
 // gpu arch detection — cached after first call so we dont keep querying the driver

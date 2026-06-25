@@ -56,13 +56,30 @@ struct K2InvTcGraph {
         wB = at::empty({bh, m_, m_}, o);  wZ = at::empty({bh, m_, m_}, o);
         wZn = at::empty({bh, m_, m_}, o);
     }
+    // Explicit free: destroy the captured graph and drop the workspace tensors
+    // (back to the caching allocator). Called by reset_caches() so a long-lived
+    // serving thread can reclaim this cache between shapes/requests without
+    // waiting for thread exit. Resets the shape so the next call reallocates.
+    void reset() {
+        invalidate();
+        K2 = iter = k2inv = wKZ = wA = wB = wZ = wZn = at::Tensor();
+        BH = m = niter = -1;
+    }
     ~K2InvTcGraph() {
+        // At process/thread exit the CUDA context may already be gone; the
+        // (void) casts swallow the resulting "invalid resource" — the context
+        // teardown frees the graph anyway. Mid-life cleanup goes through reset().
         if (exec)  (void)cudaGraphExecDestroy(exec);
         if (graph) (void)cudaGraphDestroy(graph);
     }
 };
 
 static K2InvTcGraph& k2inv_tc_graph() { static thread_local K2InvTcGraph s; return s; }
+
+// Bridge so the pybind reset_caches can free the TC-pinv forward graph cache
+// (the third thread-local cache; the other two are the NS-backward graph and
+// the kernel3 split-N scratch).
+void reset_k2inv_tc_caches() { k2inv_tc_graph().reset(); }
 
 // Record the NS chain on persistent buffers (K2 and iter[0]=Z_0 must be populated
 // before launch). Fills iter[1..J] and k2inv (=Z_J). Capturable: only kernel
@@ -194,20 +211,13 @@ static void run_nystrom_fwd_half(NystromParams &p) {
         launch_scaled_copy<elem_type>(q_in, q_m, total, p.scale, p.stream);
         launch_scaled_copy<elem_type>(k_in, k_m, total, p.scale, p.stream);
     });
-    // Tikhonov ridge target condition number; the kernel computes lambda =
-    // (||K2||_1 ||K2||_inf)/kappa_star internally and inverts M = K2^T K2 +
-    // lambda*I (non-normality-proof). FN_KAPPA_STAR is the knob; unset/0 = off.
-    const char* ks_env = std::getenv("FN_KAPPA_STAR");
-    float kappa_star = ks_env ? static_cast<float>(atof(ks_env)) : 0.0f;
-    // FN_K2INV_TC=1 routes the pinv through the tf32 tensor-core NS chain. CP2
-    // covers the no-ridge path only; with the ridge on we still use the scalar
-    // kernel until the TC ridge lands (CP5).
-    // tf32 tensor-core pinv is the default (faster, verified accurate); set
-    // FN_K2INV_TC=0 to fall back to the fp32-scalar kernel. Handles ridge + no-ridge.
-    const char* tc_env = std::getenv("FN_K2INV_TC");
-    // TC pinv supports m == 64 only (fixed-size cute tiles); fall back to the
-    // scalar kernel for sub-64 landmark counts.
-    bool use_tc = ((tc_env == nullptr) || (atoi(tc_env) != 0)) && (p.num_landmarks == 64);
+    // Tikhonov ridge target condition number, threaded from the Python API.
+    // The kernel computes lambda = (||K2||_1 ||K2||_inf)/kappa_star internally
+    // and inverts M = K2^T K2 + lambda*I (non-normality-proof). 0 = no ridge.
+    const float kappa_star = p.kappa_star;
+    // tf32 tensor-core pinv (default, verified accurate). Supports m == 64 only
+    // (fixed-size cute tiles); fall back to the fp32-scalar kernel otherwise.
+    const bool use_tc = p.use_tc_pinv && (p.num_landmarks == 64);
     prof.run("kernel2_inv", [&] {
         BOOL_SWITCH(use_tc, kUseTC, [&] {
             run_kernel2_inv<elem_type, kUseTC>(qt, kt, p, kappa_star);
@@ -248,8 +258,7 @@ static void run_nystrom_fwd_fp32_impl(NystromParams &p) {
     launch_scaled_copy<T>(q_in, q_m, total, p.scale, p.stream);
     launch_scaled_copy<T>(k_in, k_m, total, p.scale, p.stream);
 
-    const char* ks_env = std::getenv("FN_KAPPA_STAR");
-    float kappa_star = ks_env ? static_cast<float>(atof(ks_env)) : 0.0f;
+    const float kappa_star = p.kappa_star;
     launch_kernel2_inv<T>(qt, kt,
         p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
         p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream, kappa_star);
@@ -332,11 +341,10 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
             p.dQ_tilde_split_ptr, p.num_splits,
             BH, N, D, m, p.stream);
     });
-    // Tikhonov ridge: pass kappa_star through; the backward computes the
-    // per-bh lambda and the M = K2^T K2 + lambda*I wrap internally, matching
-    // the forward. FN_KAPPA_STAR is the knob; unset/0 = no ridge.
-    const char* ks_env_b = std::getenv("FN_KAPPA_STAR");
-    float kappa_star_b = ks_env_b ? static_cast<float>(atof(ks_env_b)) : 0.0f;
+    // Tikhonov ridge: kappa_star is threaded from the Python API and MUST match
+    // the forward's value so the backward inverts the same M = K2^T K2 +
+    // lambda*I. The backward computes the per-bh lambda internally. 0 = no ridge.
+    const float kappa_star_b = p.kappa_star;
     prof.run("kernel2_inv_bwd", [&] {
         launch_kernel2_inv_bwd<elem_type>(q_tilde, k_tilde,
             p.dK2_inv_ptr,
