@@ -62,7 +62,10 @@ image = (
     # at image-build time, so pin all three arches. The SM80 MMA / cp.async atoms
     # compile and run on Hopper and Blackwell in compatibility mode, so one image
     # serves every datacenter GPU (H200 is sm_90 like H100; B200 is sm_100).
-    .env({"FLASH_NYSTROM_CUDA_ARCH_LIST": "80 90 100"})
+    # 90a (not 90): the architecture-specific Hopper target that enables WGMMA +
+    # TMA, needed by the native Hopper kernel family. SM80-idiom code still
+    # compiles and runs on Hopper under sm_90a. 100 = B200; local builds are sm_120.
+    .env({"FLASH_NYSTROM_CUDA_ARCH_LIST": "80 90a 100"})
     .add_local_dir(
         str(REPO),
         remote_path=REMOTE,

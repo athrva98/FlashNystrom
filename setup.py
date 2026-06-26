@@ -44,7 +44,10 @@ def _detect_cuda_arches():
         out = set()
         for t in toks:
             t = t.replace("+PTX", "").replace(".", "").strip()
-            if t.isdigit():
+            # Accept bare caps ("80", "90", "100") and the architecture-specific
+            # variants ("90a", "100a") that gate Hopper WGMMA/TMA and Blackwell
+            # tcgen05. nvcc emits -gencode arch=compute_90a,code=sm_90a for "90a".
+            if t.isdigit() or (len(t) > 1 and t[-1] == "a" and t[:-1].isdigit()):
                 out.add(t)
         if out:
             return sorted(out)
