@@ -107,7 +107,7 @@ class TinyViT(nn.Module):
 def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
               patch_size=4, dim=256, heads=4, grad_clip=1.0,
               autobatch=False, autobatch_cap=2048, dataset="cifar10", img_size=32,
-              instrument=False):
+              instrument=False, seed=42):
     if autobatch and torch.cuda.is_available():
         from autobatch import search_and_profile
 
@@ -155,7 +155,7 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
         testset, batch_size=200, shuffle=False, num_workers=0,
         pin_memory=True, drop_last=True)
 
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     model = TinyViT(attn_factory, dim=dim, depth=4, heads=heads,
                     patch_size=patch_size, img_size=img_size).cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
@@ -294,12 +294,17 @@ def main():
     ap.add_argument("--no-instrument", dest="instrument", action="store_false",
                     help="disable the per-step collapse diagnostics (ON by default): "
                          "per-layer dO underflow, NaN origin, collapse onset")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="seed for weight init + data order (for multi-seed runs)")
+    ap.add_argument("--out_json", type=str, default="three_way_results.json",
+                    help="where to write the structured per-backend results")
     a = ap.parse_args()
     m, ni, fdk = a.num_landmarks, a.newton_iter, a.fast_dk2inv
     img_size = 96 if a.dataset == "stl10" else 32
     kw = dict(epochs=a.epochs, patch_size=a.patch_size, grad_clip=a.grad_clip,
               autobatch=a.autobatch, autobatch_cap=a.autobatch_cap,
-              dataset=a.dataset, img_size=img_size, instrument=a.instrument)
+              dataset=a.dataset, img_size=img_size, instrument=a.instrument,
+              seed=a.seed)
 
     factories = {
         "sdpa": ("SDPA", lambda d, h: SDPAAttention(d, h)),
@@ -328,9 +333,11 @@ def main():
         print(f"  {r['label']:>14}: test_acc={r['test_acc']:.1f}%  N={r.get('N_tokens','?')}  "
               f"batch={r.get('batch','?')}  samp/s={r.get('samples_per_s',0):.0f}  "
               f"peak_GiB={r.get('peak_gib',0):.2f}")
-    with open("three_way_results.json", "w") as f:
-        json.dump(results, f, indent=2)
-    print("Saved to three_way_results.json")
+    record = dict(dataset=a.dataset, patch_size=a.patch_size, seed=a.seed,
+                  num_landmarks=m, newton_iter=ni, n_tokens=n_tokens, results=results)
+    with open(a.out_json, "w") as f:
+        json.dump(record, f, indent=2)
+    print(f"Saved to {a.out_json}")
 
 
 if __name__ == "__main__":
