@@ -137,15 +137,18 @@ def build_attention(
             newton_iter=newton_iter,
             use_conv_residual=use_conv_residual,
         )
-    if backend == "flash_nystrom":
+    if backend in ("flash_nystrom", "flash_nystrom_tc"):
         if causal:
             raise ValueError("FlashNystrom does not support causal masking")
         from flash_nystrom import FlashNystromAttention
         from flash_nystrom.nystrom_config import NystromConfig
 
+        # flash_nystrom    -> faithful scalar fp32 Newton-Schulz pinv (default).
+        # flash_nystrom_tc -> opt-in tf32 tensor-core pinv (faster, small accuracy cost).
         cfg = NystromConfig(
             num_landmarks=num_landmarks,
             newton_iter=newton_iter,
+            use_tc_pinv=(backend == "flash_nystrom_tc"),
             conv_kernel_size=3 if use_conv_residual else 0,
             use_conv_residual=use_conv_residual,
         )

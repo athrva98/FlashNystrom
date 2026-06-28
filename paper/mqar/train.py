@@ -228,7 +228,7 @@ def build_parser():
     # model
     p.add_argument(
         "--backend",
-        choices=["sdpa", "flash_nystrom", "nystrom_reference"],
+        choices=["sdpa", "flash_nystrom", "flash_nystrom_tc", "nystrom_reference"],
         default="sdpa",
     )
     p.add_argument("--dim", type=int, default=128)

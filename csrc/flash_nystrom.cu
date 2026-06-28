@@ -587,7 +587,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("num_landmarks") = 64,
           py::arg("newton_iter") = 6,
           py::arg("kappa_star") = 0.0,
-          py::arg("use_tc_pinv") = true);
+          py::arg("use_tc_pinv") = false);
     m.def("backward", &flash_nystrom::nystrom_bwd,
           "FlashNystrom backward (CUDA). Pass b_saved = softmax(Q_tilde @ K^T) "
           "@ V from the forward to skip the N-walk in compute_dk2inv. "

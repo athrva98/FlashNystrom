@@ -46,13 +46,15 @@ class SDPAAttention(nn.Module):
 
 class NystromRefAttention(nn.Module):
     """Pure-PyTorch Nyström attention — same algorithm as FlashNystrom but no custom kernels."""
-    def __init__(self, dim, heads, num_landmarks=32, newton_iter=20, conv_kernel_size=0):
+    def __init__(self, dim, heads, num_landmarks=32, newton_iter=20, conv_kernel_size=0,
+                 kappa_star=0.0):
         super().__init__()
         self.heads = heads
         self.head_dim = dim // heads
         self.m = num_landmarks
         self.newton_iter = newton_iter
         self.conv_kernel_size = conv_kernel_size
+        self.kappa_star = kappa_star
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
@@ -70,7 +72,8 @@ class NystromRefAttention(nn.Module):
         k = self.k_proj(x).view(B, N, H, D).transpose(1, 2).contiguous()
         v = self.v_proj(x).view(B, N, H, D).transpose(1, 2).contiguous()
         cw = self.conv_weight.to(q.dtype) if self.conv_weight is not None else None
-        out = nystrom_attention_reference(q, k, v, self.m, self.newton_iter, cw, self.conv_kernel_size)
+        out = nystrom_attention_reference(q, k, v, self.m, self.newton_iter, cw,
+                                          self.conv_kernel_size, kappa_star=self.kappa_star)
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, N, -1))
 
 
@@ -283,6 +286,11 @@ def main():
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--num_landmarks", type=int, default=64)
     ap.add_argument("--newton_iter", type=int, default=6)
+    ap.add_argument("--kappa_star", type=float, default=1.0e3,
+                    help="Tikhonov ridge target cond(M) for the pinv, threaded "
+                         "identically to FN and the reference. 0 = no ridge "
+                         "(vanilla Nystromformer). Use 0 at small N (CIFAR), "
+                         "~1e3 at large N where cond(K2) explodes.")
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--no-fast-dk2inv", dest="fast_dk2inv", action="store_false",
                     help="use the FP32 reference-consistent dk2inv backward "
@@ -306,20 +314,30 @@ def main():
               dataset=a.dataset, img_size=img_size, instrument=a.instrument,
               seed=a.seed)
 
+    ks = a.kappa_star
     factories = {
         "sdpa": ("SDPA", lambda d, h: SDPAAttention(d, h)),
         "nystrom_reference": ("Nystrom-Ref",
-            lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni, conv_kernel_size=0)),
+            lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni,
+                                             conv_kernel_size=0, kappa_star=ks)),
+        # flash_nystrom = the faithful scalar fp32 Newton-Schulz pinv (default path).
         "flash_nystrom": ("FlashNystrom",
             lambda d, h: FlashNystromAttention(
                 d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
+                                    kappa_star=ks, use_tc_pinv=False,
+                                    conv_kernel_size=0, use_conv_residual=False))),
+        # flash_nystrom_tc = the opt-in tf32 tensor-core pinv (faster, ~1-5% accuracy cost).
+        "flash_nystrom_tc": ("FlashNystrom-TC",
+            lambda d, h: FlashNystromAttention(
+                d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
+                                    kappa_star=ks, use_tc_pinv=True,
                                     conv_kernel_size=0, use_conv_residual=False))),
     }
     n_tokens = (img_size // a.patch_size) ** 2 + 1
     print("=" * 70)
     print(f"{a.dataset}  img_size={img_size}  patch_size={a.patch_size}  "
           f"N={n_tokens} tokens  m={m}  grad_clip={a.grad_clip}  "
-          f"fast_dk2inv={fdk}  autobatch={a.autobatch}")
+          f"fast_dk2inv={fdk}  kappa_star={a.kappa_star:g}  autobatch={a.autobatch}")
     print("=" * 70)
     results = []
     for backend in a.backends:
@@ -334,7 +352,8 @@ def main():
               f"batch={r.get('batch','?')}  samp/s={r.get('samples_per_s',0):.0f}  "
               f"peak_GiB={r.get('peak_gib',0):.2f}")
     record = dict(dataset=a.dataset, patch_size=a.patch_size, seed=a.seed,
-                  num_landmarks=m, newton_iter=ni, n_tokens=n_tokens, results=results)
+                  num_landmarks=m, newton_iter=ni, kappa_star=a.kappa_star,
+                  n_tokens=n_tokens, results=results)
     with open(a.out_json, "w") as f:
         json.dump(record, f, indent=2)
     print(f"Saved to {a.out_json}")

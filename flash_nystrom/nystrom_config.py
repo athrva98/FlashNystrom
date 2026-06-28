@@ -45,7 +45,7 @@ class NystromConfig:
     scalar fallback regardless of this flag (the TC atom requires
     16-bit operands)."""
 
-    kappa_star: float = 5.0
+    kappa_star: float = 1.0e3
     """Tikhonov ridge target condition number for the pseudoinverse.
 
     The pinv inverts M = K2^T K2 + lambda*I with
@@ -54,19 +54,31 @@ class NystromConfig:
     when the landmark Gram matrix K2 is near-singular (which it becomes as N
     grows, since segment-mean landmarks regress toward the global mean).
 
-    Default 5.0 (the value used in all experiments). Set 0.0 to disable the
-    ridge and invert the raw K2 (the original Nystromformer formulation; only
-    safe when K2 is well-conditioned). Threaded identically to the kernel and
-    the reference so both compute the same regularized pseudoinverse — this
-    replaces the old FN_KAPPA_STAR environment variable."""
+    Default 1e3: a weak ridge that is safe at any N. It barely perturbs the
+    pseudoinverse when K2 is well-conditioned (small N) yet bounds cond(M) <= 1e3
+    when cond(K2) explodes to ~1e7-1e11 at large N, keeping Newton-Schulz
+    convergent (a stronger ridge like the old 5.0 over-regularizes and costs
+    accuracy). Set 0.0 to disable the ridge and invert the raw K2 (the original
+    Nystromformer formulation; only safe when K2 is well-conditioned, e.g. small
+    N). Threaded identically to the kernel and the reference so both compute the
+    same regularized pseudoinverse — this replaces the old FN_KAPPA_STAR
+    environment variable."""
 
-    use_tc_pinv: bool = True
+    use_tc_pinv: bool = False
     """Route the pseudoinverse through the tf32 tensor-core Newton-Schulz chain.
 
-    Default True (faster, verified accurate; the tf32 pinv floor ~6e-4 is
-    actually tighter than the fp16-reference's ~1.2e-3). Set False to force the
-    fp32 scalar kernel. Only applies at num_landmarks == 64; the scalar kernel
-    is used otherwise regardless. Replaces the old FN_K2INV_TC environment var."""
+    Default False (the faithful path): the fp32 scalar Newton-Schulz matches the
+    pure-torch reference to ~3e-4 on the output at every N, and the full fwd+bwd
+    is still ~3x faster than the reference. Set True to opt into the tf32 tensor-
+    core chain, which is ~4x faster than the reference but carries an N-
+    independent ~1-3% error in the pseudoinverse (tf32 truncation when forming
+    M = K2^T K2). That error is invisible when the Nystrom approximation is near-
+    exact (small N, landmarks ~ tokens) but costs ~5% accuracy where the
+    approximation actually works: 3-seed STL-10 at N=2304 measured scalar 36.0
+    vs tf32 31.2 (matched kappa=1e3, J=16). Use True only as a speed/accuracy
+    trade when that cost is acceptable. Only applies at num_landmarks == 64; the
+    scalar kernel is used otherwise regardless. Replaces the old FN_K2INV_TC
+    environment var."""
 
     def __post_init__(self):
         assert self.num_landmarks > 0, "num_landmarks must be positive"

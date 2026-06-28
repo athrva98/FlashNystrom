@@ -172,7 +172,7 @@ def _check_reference_budget(q, num_landmarks):
 
 def flash_nystrom_attention(
     q, k, v, num_landmarks=64, newton_iter=6, conv_weight=None, conv_kernel_size=0,
-    fast_dk2inv=True, kappa_star=0.0, use_tc_pinv=True,
+    fast_dk2inv=True, kappa_star=0.0, use_tc_pinv=False,
 ):
     """main entry point — uses CUDA kernels if available, falls back to pytorch.
 

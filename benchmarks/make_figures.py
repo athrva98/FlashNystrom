@@ -24,11 +24,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 LABEL = {"sdpa": "Full attn (SDPA)", "flash_nystrom": "FlashNystrom",
-         "nystrom_reference": "Nystrom ref", "SDPA": "Full attn (SDPA)",
-         "FlashNystrom": "FlashNystrom", "Nystrom-Ref": "Nystrom ref"}
+         "flash_nystrom_tc": "FlashNystrom-TC", "nystrom_reference": "Nystrom ref",
+         "SDPA": "Full attn (SDPA)", "FlashNystrom": "FlashNystrom",
+         "FlashNystrom-TC": "FlashNystrom-TC", "Nystrom-Ref": "Nystrom ref"}
 COLOR = {"sdpa": "tab:blue", "flash_nystrom": "tab:orange",
-         "nystrom_reference": "tab:green", "SDPA": "tab:blue",
-         "FlashNystrom": "tab:orange", "Nystrom-Ref": "tab:green"}
+         "flash_nystrom_tc": "tab:red", "nystrom_reference": "tab:green",
+         "SDPA": "tab:blue", "FlashNystrom": "tab:orange",
+         "FlashNystrom-TC": "tab:red", "Nystrom-Ref": "tab:green"}
 
 
 def _load(path):
@@ -134,7 +136,9 @@ def main():
         made.append(fig_mqar(d, a.outdir, "mqar_capacity", "key-value pairs",
                              "MQAR recall vs capacity (rank limit)"))
     if (d := _load(a.cifar)):
-        made.append(fig_cifar(d, a.outdir))
+        # train_three_way.py writes {..., "results": [...]}; accept the bare list too.
+        rows = d["results"] if isinstance(d, dict) else d
+        made.append(fig_cifar(rows, a.outdir))
 
     made = [m for m in made if m]
     if made:
