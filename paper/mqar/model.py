@@ -83,6 +83,7 @@ class NystromReferenceAttention(nn.Module):
         newton_iter: int = 6,
         use_conv_residual: bool = False,
         conv_kernel_size: int = 3,
+        kappa_star: float = 0.0,
     ):
         super().__init__()
         if dim % heads != 0:
@@ -90,6 +91,7 @@ class NystromReferenceAttention(nn.Module):
         self.dim, self.heads, self.head_dim = dim, heads, dim // heads
         self.num_landmarks = num_landmarks
         self.newton_iter = newton_iter
+        self.kappa_star = kappa_star
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
@@ -111,7 +113,7 @@ class NystromReferenceAttention(nn.Module):
         v = self.v_proj(x).view(B, N, H, D).transpose(1, 2).contiguous()
         out = nystrom_attention_reference(
             q, k, v, self.num_landmarks, self.newton_iter,
-            self.conv_weight, self.conv_kernel_size,
+            self.conv_weight, self.conv_kernel_size, kappa_star=self.kappa_star,
         )
         out = out.transpose(1, 2).contiguous().view(B, N, self.dim)
         return self.out_proj(out)
@@ -125,6 +127,7 @@ def build_attention(
     num_landmarks: int = 64,
     newton_iter: int = 6,
     use_conv_residual: bool = False,
+    kappa_star: float = 1.0e3,
 ) -> nn.Module:
     if backend == "sdpa":
         return SdpaAttention(dim, heads, causal=causal)
@@ -136,6 +139,7 @@ def build_attention(
             num_landmarks=num_landmarks,
             newton_iter=newton_iter,
             use_conv_residual=use_conv_residual,
+            kappa_star=kappa_star,
         )
     if backend in ("flash_nystrom", "flash_nystrom_tc"):
         if causal:
@@ -148,6 +152,7 @@ def build_attention(
         cfg = NystromConfig(
             num_landmarks=num_landmarks,
             newton_iter=newton_iter,
+            kappa_star=kappa_star,
             use_tc_pinv=(backend == "flash_nystrom_tc"),
             conv_kernel_size=3 if use_conv_residual else 0,
             use_conv_residual=use_conv_residual,

@@ -24,6 +24,75 @@ from .data import generate_mqar
 from .model import MQARModel
 
 
+@torch.no_grad()
+def _diag_probe(model, probe_x, kappa_star, device, dtype):
+    """Backend-agnostic conditioning probe of the LEARNED landmark Gram K2.
+
+    Tests the hypothesis that MQAR (seq_len 256, seg_len 4) is well-conditioned,
+    so the ridge is unnecessary and a too-strong ridge only adds bias. Captures
+    the Nystrom attention layer's input on a fixed probe batch via a pre-hook,
+    then recomputes K2 (segment-mean landmarks + softmax) and the ridge
+    M = K2^T K2 + lambda*I in fp32 from the layer's OWN q/k projections (so it is
+    independent of which forward kernel runs). Returns dict with cond(K2),
+    cond(M), and the ridged-pinv residual ||I - K2 P|| / ||I||. NaN for sdpa."""
+    from flash_nystrom.reference import iterative_pinverse
+
+    mix = None
+    for layer in model.layers:
+        mm = getattr(layer, "mixer", None)
+        if mm is not None and hasattr(mm, "q_proj") and (
+            hasattr(mm, "num_landmarks") or hasattr(mm, "config")):
+            mix = mm
+            break
+    if mix is None:  # sdpa has no landmarks
+        return {"cond_K2": float("nan"), "cond_M": float("nan"), "pinv_resid": float("nan")}
+
+    m_land = getattr(mix, "num_landmarks", None) or mix.config.num_landmarks
+    H, D = mix.heads, mix.head_dim
+    cap = {}
+    handle = mix.register_forward_pre_hook(lambda mod, inp: cap.__setitem__("x", inp[0].detach()))
+    with _autocast_ctx(device, dtype):
+        model.encode(probe_x.to(device))
+    handle.remove()
+
+    x = cap["x"].float()
+    B, N, _ = x.shape
+    q = (x @ mix.q_proj.weight.float().t()).view(B, N, H, D).transpose(1, 2)
+    k = (x @ mix.k_proj.weight.float().t()).view(B, N, H, D).transpose(1, 2)
+    s = D ** -0.25
+    qs, ks = q * s, k * s
+    seg = N // m_land
+    tn = seg * (m_land - 1)
+    qf = qs[:, :, :tn].reshape(B, H, m_land - 1, seg, D).mean(3)
+    kf = ks[:, :, :tn].reshape(B, H, m_land - 1, seg, D).mean(3)
+    ql = qs[:, :, tn:].mean(2, keepdim=True)
+    kl = ks[:, :, tn:].mean(2, keepdim=True)
+    qt = torch.cat([qf, ql], 2)
+    kt = torch.cat([kf, kl], 2)
+    K2 = torch.softmax(qt @ kt.transpose(-2, -1), -1)  # (B,H,m,m)
+
+    def condmax(A):
+        try:
+            return torch.linalg.cond(A).flatten().max().item()
+        except Exception:
+            return float("inf")
+
+    Kt2 = K2.transpose(-2, -1)
+    M0 = Kt2 @ K2
+    eye = torch.eye(m_land, device=K2.device, dtype=K2.dtype)
+    if kappa_star > 0:
+        n1 = K2.abs().sum(-2).amax(-1)
+        ninf = K2.abs().sum(-1).amax(-1)
+        lam = (n1 * ninf / kappa_star)[..., None, None]
+        M = M0 + lam * eye
+        P = iterative_pinverse(M, n_iter=16) @ Kt2
+    else:
+        M = M0
+        P = iterative_pinverse(K2, n_iter=16)
+    resid = (eye - K2 @ P).norm(dim=(-2, -1)).max().item() / eye.norm().item()
+    return {"cond_K2": condmax(K2), "cond_M": condmax(M), "pinv_resid": resid}
+
+
 def _autocast_ctx(device: str, dtype: torch.dtype):
     if device == "cuda":
         return torch.autocast(device_type="cuda", dtype=dtype)
@@ -64,7 +133,7 @@ def _autobatch_config(args, train_x, train_y, device, dtype):
             vocab_size=args.vocab_size, max_seq_len=args.seq_len, dim=args.dim,
             depth=args.depth, heads=args.heads, backend=args.backend, init=args.init,
             num_landmarks=args.num_landmarks, newton_iter=args.newton_iter,
-            use_conv_residual=args.conv,
+            use_conv_residual=args.conv, kappa_star=args.kappa_star,
         ).to(device)
         opt = torch.optim.AdamW(m.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         xb, yb = train_x[:bs].to(device), train_y[:bs].to(device)
@@ -130,6 +199,7 @@ def train(args):
         num_landmarks=args.num_landmarks,
         newton_iter=args.newton_iter,
         use_conv_residual=args.conv,
+        kappa_star=args.kappa_star,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -161,6 +231,8 @@ def train(args):
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    # Fixed probe batch for the per-eval conditioning diagnostic (--diag).
+    diag_probe_x = test_x[: min(64, test_x.size(0))]
     epoch_times = []
     best_acc = 0.0
     for epoch in range(args.epochs):
@@ -172,6 +244,7 @@ def train(args):
         if device == "cuda":
             torch.cuda.synchronize()
         ep_start = time.perf_counter()
+        last_gn = float("nan")
         for i in range(0, train_x.size(0), args.batch_size):
             idx = perm[i : i + args.batch_size]
             xb = train_x[idx].to(device)
@@ -188,7 +261,9 @@ def train(args):
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                last_gn = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
+            elif args.diag:
+                last_gn = float(torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")))
             scaler.step(opt)
             scaler.update()
             running += loss.item()
@@ -200,10 +275,13 @@ def train(args):
         if (epoch + 1) % eval_every == 0 or epoch == args.epochs - 1:
             acc = evaluate(model, test_x, test_y, args.batch_size, device, dtype)
             best_acc = max(best_acc, acc)
-            print(
-                f"epoch {epoch+1:4d}/{args.epochs}  loss {running/steps_per_epoch:.4f}  "
-                f"test recall {acc*100:.2f}%"
-            )
+            line = (f"epoch {epoch+1:4d}/{args.epochs}  loss {running/steps_per_epoch:.4f}  "
+                    f"test recall {acc*100:.2f}%")
+            if args.diag:
+                d = _diag_probe(model, diag_probe_x, args.kappa_star, device, dtype)
+                line += (f"  grad_norm {last_gn:.3f}  cond_K2 {d['cond_K2']:.2e}  "
+                         f"cond_M {d['cond_M']:.2e}  pinv_resid {d['pinv_resid']:.2e}")
+            print(line)
 
     print(f"best test recall: {best_acc*100:.2f}%")
     # Training throughput + peak memory (median epoch after warmup).
@@ -236,6 +314,12 @@ def build_parser():
     p.add_argument("--heads", type=int, default=2, help="dim/heads must be 64 or 128 for flash_nystrom")
     p.add_argument("--num_landmarks", type=int, default=64)
     p.add_argument("--newton_iter", type=int, default=6)
+    p.add_argument("--kappa_star", type=float, default=1.0e3,
+                   help="Tikhonov ridge target cond(M), threaded identically to "
+                        "flash_nystrom and the reference. 0 = no ridge (vanilla).")
+    p.add_argument("--diag", action="store_true",
+                   help="log per-eval conditioning diagnostics (grad_norm, cond(K2), "
+                        "cond(M), ridged-pinv residual) on a fixed probe batch")
     p.add_argument("--init", choices=["normal", "orthogonal"], default="normal",
                    help="weight init for Linear layers (orthogonal = head-independence ablation)")
     p.add_argument("--conv", action="store_true", help="enable the Nystromformer depthwise-conv residual")
