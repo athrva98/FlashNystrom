@@ -320,6 +320,12 @@ def main():
         "nystrom_reference": ("Nystrom-Ref",
             lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni,
                                              conv_kernel_size=0, kappa_star=ks)),
+        # Vanilla Nystromformer: the reference with NO ridge (kappa=0), regardless of
+        # --kappa_star. At large N its landmark Gram K2 is near-singular, so this arm
+        # exposes the conditioning failure that the ridge (in FN/Nystrom-Ref) fixes.
+        "nystrom_vanilla": ("Nystrom-Vanilla",
+            lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni,
+                                             conv_kernel_size=0, kappa_star=0.0)),
         # flash_nystrom = the faithful scalar fp32 Newton-Schulz pinv (default path).
         "flash_nystrom": ("FlashNystrom",
             lambda d, h: FlashNystromAttention(

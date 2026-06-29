@@ -25,12 +25,16 @@ import matplotlib.pyplot as plt
 
 LABEL = {"sdpa": "Full attn (SDPA)", "flash_nystrom": "FlashNystrom",
          "flash_nystrom_tc": "FlashNystrom-TC", "nystrom_reference": "Nystrom ref",
+         "nystrom_vanilla": "Nystrom vanilla (k=0)",
          "SDPA": "Full attn (SDPA)", "FlashNystrom": "FlashNystrom",
-         "FlashNystrom-TC": "FlashNystrom-TC", "Nystrom-Ref": "Nystrom ref"}
+         "FlashNystrom-TC": "FlashNystrom-TC", "Nystrom-Ref": "Nystrom ref",
+         "Nystrom-Vanilla": "Nystrom vanilla (k=0)"}
 COLOR = {"sdpa": "tab:blue", "flash_nystrom": "tab:orange",
          "flash_nystrom_tc": "tab:red", "nystrom_reference": "tab:green",
+         "nystrom_vanilla": "tab:purple",
          "SDPA": "tab:blue", "FlashNystrom": "tab:orange",
-         "FlashNystrom-TC": "tab:red", "Nystrom-Ref": "tab:green"}
+         "FlashNystrom-TC": "tab:red", "Nystrom-Ref": "tab:green",
+         "Nystrom-Vanilla": "tab:purple"}
 
 
 def _load(path):
