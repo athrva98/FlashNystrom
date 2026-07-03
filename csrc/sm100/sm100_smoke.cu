@@ -38,6 +38,7 @@
 #include <cutlass/numeric_types.h>
 
 #include "sm100/fmha_common.hpp"  // gemm_zero_acc (vendored from example 77, Apache-2.0)
+#include "sm100/kernel3_bwd_sm100.cuh"
 
 namespace flash_nystrom_sm100 {
 
@@ -523,6 +524,79 @@ torch::Tensor smoke(const torch::Tensor& a, const torch::Tensor& b) {
     return (d == 64) ? run_smoke<64>(a, b) : run_smoke<128>(a, b);
 }
 
+template <int kHeadDim>
+std::vector<torch::Tensor> run_kernel3_bwd(
+    const torch::Tensor& qt, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& lse3, const torch::Tensor& d3,
+    const torch::Tensor& do3) {
+    using Traits = K3BwdSm100Traits<kHeadDim>;
+    const at::cuda::CUDAGuard guard(qt.device());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+
+    const int64_t BH = k.size(0), N = k.size(1);
+    auto dv  = torch::zeros_like(v);
+    auto dk  = torch::zeros_like(k);
+    auto dqt = torch::zeros({BH, 64, (int64_t)kHeadDim},
+                            qt.options().dtype(torch::kFloat32));
+
+    constexpr size_t smem = sizeof(typename Traits::SharedStorage);
+    auto* kernel = kernel3_bwd_sm100_kernel<Traits>;
+    if (smem > 48 * 1024) {
+        cudaFuncSetAttribute(kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem));
+    }
+    dim3 grid((unsigned)(N / Traits::kTileK), (unsigned)BH);
+    kernel<<<grid, Traits::kNumThreads, smem, stream>>>(
+        reinterpret_cast<const typename Traits::Element*>(qt.data_ptr()),
+        reinterpret_cast<const typename Traits::Element*>(k.data_ptr()),
+        reinterpret_cast<const typename Traits::Element*>(v.data_ptr()),
+        static_cast<const float*>(lse3.data_ptr()),
+        static_cast<const float*>(d3.data_ptr()),
+        reinterpret_cast<const typename Traits::Element*>(do3.data_ptr()),
+        reinterpret_cast<typename Traits::Element*>(dv.data_ptr()),
+        reinterpret_cast<typename Traits::Element*>(dk.data_ptr()),
+        static_cast<float*>(dqt.data_ptr()),
+        (int)N);
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess,
+                "kernel3_bwd_sm100 launch failed: ", cudaGetErrorString(err));
+    return {dv, dk, dqt};
+}
+
+std::vector<torch::Tensor> kernel3_bwd(
+    const torch::Tensor& qt, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& lse3, const torch::Tensor& d3,
+    const torch::Tensor& do3) {
+    for (const auto* t : {&qt, &k, &v, &do3}) {
+        TORCH_CHECK(t->is_cuda() && t->dtype() == torch::kFloat16
+                    && t->is_contiguous() && t->dim() == 3,
+                    "kernel3_bwd: qt/k/v/do3 must be contiguous CUDA fp16 3D");
+    }
+    for (const auto* t : {&lse3, &d3}) {
+        TORCH_CHECK(t->is_cuda() && t->dtype() == torch::kFloat32
+                    && t->is_contiguous() && t->dim() == 2,
+                    "kernel3_bwd: lse3/d3 must be contiguous CUDA fp32 2D");
+    }
+    const int64_t BH = k.size(0), N = k.size(1), D = k.size(2);
+    TORCH_CHECK(qt.size(0) == BH && qt.size(1) == 64 && qt.size(2) == D,
+                "kernel3_bwd: qt must be (BH, 64, D)");
+    TORCH_CHECK(do3.sizes() == qt.sizes(), "kernel3_bwd: do3 must match qt");
+    TORCH_CHECK(v.sizes() == k.sizes(), "kernel3_bwd: v must match k");
+    TORCH_CHECK(lse3.size(0) == BH && lse3.size(1) == 64
+                && d3.sizes() == lse3.sizes(),
+                "kernel3_bwd: lse3/d3 must be (BH, 64)");
+    TORCH_CHECK(D == 64 || D == 128, "kernel3_bwd: D must be 64 or 128");
+    TORCH_CHECK(N % 128 == 0, "kernel3_bwd: v1 requires N % 128 == 0");
+
+    int major = 0, device = qt.get_device();
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    TORCH_CHECK(major == 10, "kernel3_bwd_sm100 requires sm_100x");
+
+    return (D == 64) ? run_kernel3_bwd<64>(qt, k, v, lse3, d3, do3)
+                     : run_kernel3_bwd<128>(qt, k, v, lse3, d3, do3);
+}
+
 bool available() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) return false;
@@ -543,6 +617,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "CP-B2 shape smoke: C2[128xD] = P @ E and C3[64xD] = P^T @ K via "
           "MN-major union views + M=64 TMEM_LOAD",
           py::arg("p"), py::arg("e"), py::arg("k"));
+    m.def("kernel3_bwd", &flash_nystrom_sm100::kernel3_bwd,
+          "Blackwell-native kernel3 backward (v1: m=64, N%128==0): "
+          "returns (dV, dK_s, dQ_tilde)",
+          py::arg("q_tilde"), py::arg("k_s"), py::arg("v"),
+          py::arg("lse3"), py::arg("d3"), py::arg("do3"));
     m.def("available", &flash_nystrom_sm100::available,
           "True when the current device is a Blackwell datacenter GPU");
 }

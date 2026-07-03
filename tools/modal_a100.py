@@ -444,6 +444,29 @@ def smoke_sm100():
         print(f"bwd-shapes D={d}: C2 relerr {rel2:.3e}  C3 relerr {rel3:.3e}  "
               f"{'PASS' if max(rel2, rel3) < 1e-2 else 'FAIL'}")
         ok &= max(rel2, rel3) < 1e-2
+    # CP-B2 kernel3_bwd_sm100: full math parity vs a torch composition
+    for d in (64, 128):
+        BH, N, m = 4, 512, 64
+        qt = 0.25 * torch.randn(BH, m, d, device="cuda", dtype=torch.float16)
+        k = 0.25 * torch.randn(BH, N, d, device="cuda", dtype=torch.float16)
+        v = torch.randn(BH, N, d, device="cuda", dtype=torch.float16)
+        do3 = torch.randn(BH, m, d, device="cuda", dtype=torch.float16)
+        s_ref = qt.float() @ k.float().transpose(1, 2)
+        lse3 = torch.logsumexp(s_ref, dim=-1).contiguous()
+        p_ref = torch.exp(s_ref - lse3[..., None])
+        dp_ref = do3.float() @ v.float().transpose(1, 2)
+        d3 = (p_ref * dp_ref).sum(-1).contiguous()
+        ds_ref = p_ref * (dp_ref - d3[..., None])
+        dv_ref = p_ref.transpose(1, 2) @ do3.float()
+        dk_ref = ds_ref.transpose(1, 2) @ qt.float()
+        dqt_ref = ds_ref @ k.float()
+        dv, dk, dqt = sm100.kernel3_bwd(qt, k, v, lse3, d3, do3)
+        rels = [((a.float() - b).norm() / b.norm()).item()
+                for a, b in ((dv, dv_ref), (dk, dk_ref), (dqt, dqt_ref))]
+        good = max(rels) < 2e-2
+        print(f"kernel3_bwd D={d}: dV {rels[0]:.3e} dK {rels[1]:.3e} "
+              f"dQt {rels[2]:.3e}  {'PASS' if good else 'FAIL'}")
+        ok &= good
     if not ok:
         raise RuntimeError("sm100 smoke FAILED")
     print("sm100 smoke PASSED")
