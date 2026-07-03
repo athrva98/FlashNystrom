@@ -310,7 +310,9 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
     });
     prof.run("kernel1_bwd", [&] {
         launch_kernel1_bwd<elem_type>(q_s, k_tilde, step2, p.lse1_ptr, p.D1_ptr, dO,
-            dQ, p.dstep2_ptr, p.dK_tilde_ptr, BH, N, D, m, p.stream);
+            dQ, p.dstep2_ptr, p.dK_tilde_ptr,
+            p.dstep2_split_ptr, p.dK_tilde_split_ptr, p.k1_num_splits,
+            BH, N, D, m, p.stream);
     });
 
     // dO3 = K2_inv^T @ dstep2 — precomputed in GMEM for both the FP32 scalar

@@ -130,6 +130,15 @@ struct NystromBwdParams {
     float* __restrict__ dQ_tilde_split_ptr;  // (num_splits, B, H, m, D) FP32 or nullptr
     int num_splits;
 
+    // Split-K workspaces for kernel1_bwd_tc's dstep2 / dK_tilde accumulators,
+    // same scheme as dQ_tilde_split: row-tile tile_idx atomicAdds into slot
+    // (tile_idx % k1_num_splits), then a reduce sums the slots into
+    // dstep2_ptr / dK_tilde_ptr. k1_num_splits == 0 (or nullptr) keeps the
+    // legacy direct atomicAdd. The FP32 scalar path ignores these.
+    float* __restrict__ dstep2_split_ptr;    // (k1_num_splits, B, H, m, D) FP32 or nullptr
+    float* __restrict__ dK_tilde_split_ptr;  // (k1_num_splits, B, H, m, D) FP32 or nullptr
+    int k1_num_splits;
+
     // Intermediate for TC kernel3_bwd: dO3 = K2_inv^T @ dstep2, stored as elem_type
     void* __restrict__ dO3_ptr;              // (B,H,m,D) FP16/BF16, or nullptr for FP32
 

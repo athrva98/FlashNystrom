@@ -7,6 +7,7 @@
 #include "nystrom_utils.h"
 #include "static_switch.h"
 #include "kernels/kernel1_output_fused.cuh"
+#include "kernels/backward/kernel3_bwd.cuh"  // reduce_dQ_tilde_split (shared split reducer)
 
 #include <cute/tensor.hpp>
 #include <cute/atom/mma_atom.hpp>
@@ -141,8 +142,16 @@ kernel1_bwd_tc(
     const float* __restrict__ D1_ptr,
     const typename Traits::Element* __restrict__ dO_ptr,
     typename Traits::Element* __restrict__ dQ_s_ptr,
+    // dstep2 / dK_tilde targets. With num_splits == 0 these are the legacy
+    // (BH, m, D) accumulators and every row tile atomicAdds the same cells
+    // (N/64-way contention). With num_splits > 0 they are
+    // (num_splits, BH, m, D) split workspaces: tile_idx writes slot
+    // (tile_idx % num_splits), cutting contention num_splits-fold; the
+    // launcher reduces the slots afterwards (same scheme as kernel3_bwd's
+    // dQ_tilde split).
     float* __restrict__ dstep2_ptr,
     float* __restrict__ dK_tilde_ptr,
+    int num_splits,
     int N, int D, int m
 ) {
     using Element = typename Traits::Element;
@@ -374,8 +383,15 @@ kernel1_bwd_tc(
                   tiled_mma_dkv, smem_copy_PdSt, smem_copy_SlotT,
                   thr_copy_PdSt, thr_copy_SlotT);
 
-        // atomicAdd results to dstep2 (FP32 global accumulator)
-        float* ds2 = dstep2_ptr + bh*m*D;
+        // atomicAdd results to dstep2 (FP32 accumulator; split slot when
+        // num_splits > 0, same slot math as kernel3_bwd's dQ_tilde split).
+        const int split_idx = (num_splits > 0) ? (tile_idx % num_splits) : 0;
+        const long long bh_slot_stride = static_cast<long long>(m) * D;
+        const long long split_slot_stride =
+            static_cast<long long>(gridDim.y) * bh_slot_stride;
+        float* ds2 = dstep2_ptr
+                   + static_cast<long long>(split_idx) * split_slot_stride
+                   + static_cast<long long>(bh) * bh_slot_stride;
         #pragma unroll
         for (int fi = 0; fi < size(acc_ds2); fi++) {
             int row = get<0>(tDKVc(fi));
@@ -422,8 +438,15 @@ kernel1_bwd_tc(
                   tiled_mma_dkv, smem_copy_PdSt, smem_copy_SlotT,
                   thr_copy_PdSt, thr_copy_SlotT);
 
-        // atomicAdd results to dK_tilde (FP32 global accumulator)
-        float* dk = dK_tilde_ptr + bh*m*D;
+        // atomicAdd results to dK_tilde (FP32 accumulator; split slot when
+        // num_splits > 0, mirroring the dstep2 slot write above).
+        const int split_idx = (num_splits > 0) ? (tile_idx % num_splits) : 0;
+        const long long bh_slot_stride = static_cast<long long>(m) * D;
+        const long long split_slot_stride =
+            static_cast<long long>(gridDim.y) * bh_slot_stride;
+        float* dk = dK_tilde_ptr
+                  + static_cast<long long>(split_idx) * split_slot_stride
+                  + static_cast<long long>(bh) * bh_slot_stride;
         #pragma unroll
         for (int fi = 0; fi < size(acc_dkt); fi++) {
             int row = get<0>(tDKVc(fi));
@@ -476,6 +499,11 @@ void launch_kernel1_bwd(
     const scalar_t* q_s, const scalar_t* k_tilde, const scalar_t* step2,
     const float* lse1, const float* D1, const scalar_t* dO,
     scalar_t* dQ_s, float* dstep2, float* dK_tilde,
+    // Split-K workspaces (k1_num_splits, BH, m, D) FP32 for the two m*D
+    // accumulators, or nullptr / 0 for the legacy direct atomicAdd. Only the
+    // TC path uses them (reduced into dstep2 / dK_tilde before returning);
+    // the FP32 scalar path keeps direct atomics.
+    float* dstep2_split, float* dK_tilde_split, int k1_num_splits,
     int BH, int N, int D, int m, cudaStream_t stream
 ) {
     if constexpr (std::is_same_v<scalar_t, float>) {
@@ -493,6 +521,11 @@ void launch_kernel1_bwd(
     } else {
         // FP16/BF16: tensor cores
         FN_CHECK(D == 64 || D == 128, "kernel1_bwd: D must be 64 or 128");
+        const bool use_split =
+            (dstep2_split != nullptr && dK_tilde_split != nullptr && k1_num_splits > 0);
+        float* ds2_target = use_split ? dstep2_split : dstep2;
+        float* dkt_target = use_split ? dK_tilde_split : dK_tilde;
+        const int eff_splits = use_split ? k1_num_splits : 0;
         auto launch = [&](auto HeadDimTag) {
             constexpr int kHeadDim = decltype(HeadDimTag)::value;
             using Traits = K1Traits<kHeadDim, scalar_t>;
@@ -544,10 +577,20 @@ void launch_kernel1_bwd(
                         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
                 }
                 kernel1_bwd_tc<Traits, kWide><<<grid, block, smem, stream>>>(
-                    q_s, k_tilde, step2, lse1, D1, dO, dQ_s, dstep2, dK_tilde, N, D, m);
+                    q_s, k_tilde, step2, lse1, D1, dO, dQ_s,
+                    ds2_target, dkt_target, eff_splits, N, D, m);
             });
         };
         if (D == 64) launch(Int<64>{}); else launch(Int<128>{});
+        FN_CUDA_KERNEL_CHECK();
+        if (use_split) {
+            // Sum the split slots into the real accumulators (the reducer is
+            // layout-generic over (num_splits, BH, m*D) -> (BH, m*D)).
+            launch_reduce_dQ_tilde_split(dstep2_split, dstep2,
+                                         eff_splits, BH, m, D, stream);
+            launch_reduce_dQ_tilde_split(dK_tilde_split, dK_tilde,
+                                         eff_splits, BH, m, D, stream);
+        }
     }
     FN_CUDA_KERNEL_CHECK();
 }

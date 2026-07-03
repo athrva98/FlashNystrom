@@ -11,6 +11,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <algorithm>  // std::min / std::max for the k1 split heuristic
+#include <cstdlib>    // std::getenv / std::atoi for FLASH_NYSTROM_K1_SPLITS
+
 #include "flash_nystrom.h"
 #include "kernels/backward/kernel2_inv_bwd.cuh"  // for debug hooks
 #include "kernels/backward/compute_dk2inv.cuh"   // for debug hooks
@@ -285,6 +288,23 @@ std::vector<torch::Tensor> nystrom_bwd(
     constexpr int kNumSplits = 64;
     auto dQ_tilde_split = torch::zeros({kNumSplits, B, H, m, D}, opts_f32);
 
+    // Split-K workspaces for kernel1_bwd's dstep2/dK_tilde accumulators (same
+    // scheme as dQ_tilde_split). Without them every row-tile CTA in a (b,h)
+    // column atomicAdds the same m*D cells: N/64-way contention per cell.
+    // 16 slots cut that 16x while bounding the workspace + zero-init + reduce
+    // cost at 2*16*BH*m*D floats. FLASH_NYSTROM_K1_SPLITS overrides the slot
+    // count (0 = legacy direct atomicAdd; capped at the row-tile count).
+    const int64_t k1_row_tiles = (N + 63) / 64;
+    int64_t k1_splits = std::min<int64_t>(16, k1_row_tiles);
+    if (const char* env = std::getenv("FLASH_NYSTROM_K1_SPLITS");
+        env != nullptr && env[0] != '\0') {
+        k1_splits = std::min<int64_t>(std::max(0, std::atoi(env)), k1_row_tiles);
+    }
+    torch::Tensor k1_split_ws;  // (2, k1_splits, B, H, m, D): dstep2 then dK_tilde
+    if (k1_splits > 0) {
+        k1_split_ws = torch::zeros({2, k1_splits, B, H, m, D}, opts_f32);
+    }
+
     // No NS backward workspaces here. launch_kernel2_inv_bwd owns its own
     // thread-local persistent workspaces (NsBwdGraphState).
 
@@ -330,6 +350,15 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.dK2_inv_ptr = dK2_inv.data_ptr<float>();
     params.dQ_tilde_split_ptr = dQ_tilde_split.data_ptr<float>();
     params.num_splits = kNumSplits;
+    if (k1_splits > 0) {
+        const int64_t k1_slot_elems = k1_splits * B * H * m * D;
+        params.dstep2_split_ptr   = k1_split_ws.data_ptr<float>();
+        params.dK_tilde_split_ptr = k1_split_ws.data_ptr<float>() + k1_slot_elems;
+    } else {
+        params.dstep2_split_ptr   = nullptr;
+        params.dK_tilde_split_ptr = nullptr;
+    }
+    params.k1_num_splits = static_cast<int>(k1_splits);
     params.D1_ptr = D1.data_ptr<float>();
     params.D3_ptr = D3.data_ptr<float>();
     params.dO3_ptr = dO3.data_ptr();
