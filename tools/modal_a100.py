@@ -431,6 +431,19 @@ def smoke_sm100():
         print(f"D={d}: max abs err {err:.3e}  relerr {rel:.3e}  "
               f"{'PASS' if rel < 1e-2 else 'FAIL'}")
         ok &= rel < 1e-2
+    # CP-B2 shape smoke: MN-major union views + M=64 accumulator epilogue
+    for d in (64, 128):
+        p = torch.randn(128, 64, device="cuda", dtype=torch.float16)
+        e = torch.randn(64, d, device="cuda", dtype=torch.float16)
+        k = torch.randn(128, d, device="cuda", dtype=torch.float16)
+        c2, c3 = sm100.smoke_bwd_shapes(p, e, k)
+        r2 = p.float() @ e.float()
+        r3 = p.float().t() @ k.float()
+        rel2 = (c2 - r2).norm().item() / r2.norm().item()
+        rel3 = (c3 - r3).norm().item() / r3.norm().item()
+        print(f"bwd-shapes D={d}: C2 relerr {rel2:.3e}  C3 relerr {rel3:.3e}  "
+              f"{'PASS' if max(rel2, rel3) < 1e-2 else 'FAIL'}")
+        ok &= max(rel2, rel3) < 1e-2
     if not ok:
         raise RuntimeError("sm100 smoke FAILED")
     print("sm100 smoke PASSED")
