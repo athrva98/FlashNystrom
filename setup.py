@@ -146,7 +146,13 @@ def _build_ext_modules():
     ]
 
     if os.name == "nt":
-        cxx_flags = ["/O2", "/std:c++17"]
+        # /Zc:__cplusplus makes MSVC report the real __cplusplus value
+        # (199711L otherwise, even under /std:c++17). CUTLASS >= 3.8 guards
+        # its C++17 platform aliases (is_unsigned_v etc., used by
+        # exmy_base.h) with `201703L <= __cplusplus`, so without this flag
+        # the MSVC host pass of every nvcc TU fails to find them.
+        cxx_flags = ["/O2", "/std:c++17", "/Zc:__cplusplus"]
+        nvcc_flags += ["-Xcompiler", "/Zc:__cplusplus"]
         if strict:
             # /permissive- disables MSVC's non-conforming extensions. This
             # is the flag that makes the build refuse the rvalue-to-non-
