@@ -65,7 +65,9 @@ image = (
     # 90a (not 90): the architecture-specific Hopper target that enables WGMMA +
     # TMA, needed by the native Hopper kernel family. SM80-idiom code still
     # compiles and runs on Hopper under sm_90a. 100 = B200; local builds are sm_120.
-    .env({"FLASH_NYSTROM_CUDA_ARCH_LIST": "80 90a 100"})
+    # MAX_JOBS=2: the sm100 module's CollectiveBuilder TUs are template-heavy
+    # and parallel nvcc invocations OOM the Modal build container (exit 137).
+    .env({"FLASH_NYSTROM_CUDA_ARCH_LIST": "80 90a 100", "MAX_JOBS": "2"})
     .add_local_dir(
         str(REPO),
         remote_path=REMOTE,
@@ -408,6 +410,30 @@ def bench_gaps_h100():
 def bench_gaps_h200():
     """Extended high-BH + long-context sweep on an H200 (sm_90, 141 GB HBM3e)."""
     _run_bench_gaps()
+
+
+@app.function(gpu="B200", timeout=3600)
+def smoke_sm100():
+    """CP-B1 gate: tcgen05 GEMM smoke vs torch.matmul on a real B200."""
+    import torch
+    import flash_nystrom._C_sm100 as sm100
+    print(f"GPU: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
+    assert sm100.available(), "sm100 module reports unavailable on B200?!"
+    torch.manual_seed(0)
+    ok = True
+    for d in (64, 128):
+        a = torch.randn(128, d, device="cuda", dtype=torch.float16)
+        b = torch.randn(64, d, device="cuda", dtype=torch.float16)
+        c = sm100.smoke(a, b)
+        ref = a.float() @ b.float().t()
+        err = (c - ref).abs().max().item()
+        rel = (c - ref).norm().item() / ref.norm().item()
+        print(f"D={d}: max abs err {err:.3e}  relerr {rel:.3e}  "
+              f"{'PASS' if rel < 1e-2 else 'FAIL'}")
+        ok &= rel < 1e-2
+    if not ok:
+        raise RuntimeError("sm100 smoke FAILED")
+    print("sm100 smoke PASSED")
 
 
 @app.function(gpu="B200", timeout=5400)

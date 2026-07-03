@@ -201,7 +201,7 @@ def _build_ext_modules():
         # (cute/layout.hpp:1443 has this pattern intentionally).
         nvcc_flags += ["-Xcudafe", "--diag_suppress=550"]
 
-    return [
+    modules = [
         CUDAExtension(
             name="flash_nystrom._C",
             sources=[
@@ -219,6 +219,49 @@ def _build_ext_modules():
             extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
         ),
     ]
+
+    # ------------------- Blackwell-native module (sm_100a) -----------------
+    # Separate extension so the tcgen05/TMEM code never touches the
+    # multi-arch main module: it is compiled ONLY for sm_100a (arch-specific
+    # features are not portable across compute capabilities), imported lazily,
+    # and dispatched to at runtime only on Blackwell datacenter GPUs. The
+    # module cross-compiles on any host with CUDA >= 12.6; it simply cannot
+    # LAUNCH on non-sm_100 devices. Disable with FLASH_NYSTROM_BUILD_SM100=0.
+    if os.environ.get("FLASH_NYSTROM_BUILD_SM100", "1") != "0":
+        # Strip the multi-arch gencodes (this module is sm_100a-only) and
+        # the -Werror reorder/all-warnings promotions: CUTLASS's sm100
+        # pipeline/collective headers emit member-init-order warnings in
+        # their own code, which we cannot fix. cross-execution-space-call
+        # stays. Host-side MSVC /WX still applies to our code.
+        nvcc_flags_sm100 = []
+        skip_next = False
+        for i, f in enumerate(nvcc_flags):
+            if skip_next:
+                skip_next = False
+                continue
+            if f.startswith("-gencode"):
+                continue
+            if f == "-Werror" and i + 1 < len(nvcc_flags) and                     nvcc_flags[i + 1] in ("reorder", "all-warnings"):
+                skip_next = True
+                continue
+            nvcc_flags_sm100.append(f)
+        nvcc_flags_sm100 += ["-gencode=arch=compute_100a,code=sm_100a"]
+        modules.append(
+            CUDAExtension(
+                name="flash_nystrom._C_sm100",
+                sources=[
+                    "csrc/sm100/sm100_smoke.cu",
+                ],
+                include_dirs=[
+                    os.path.join(this_dir, "csrc"),
+                    cutlass_include,
+                ],
+                extra_compile_args={"cxx": cxx_flags,
+                                    "nvcc": nvcc_flags_sm100},
+            )
+        )
+
+    return modules
 
 
 def _cmdclass():
