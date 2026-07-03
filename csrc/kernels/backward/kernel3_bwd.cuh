@@ -179,7 +179,7 @@ __global__ void kernel3_bwd_kernel(
 // sKV lifecycle: K (Phase 1) -> V (Phase 4, 7) -> K (Phase 10)
 // sPdS lifecycle: P (Phase 7) -> dS (Phase 10, 11)
 
-template <typename Traits>
+template <typename Traits, bool kWide>
 __global__ void __launch_bounds__(Traits::kNThreads)
 kernel3_bwd_tc(
     const typename Traits::Element* __restrict__ q_tilde_ptr,  // (BH, m, D)
@@ -215,19 +215,24 @@ kernel3_bwd_tc(
     const int tile_len = min(kBlockN, N - tile_start);
     const bool full_tile = (tile_len == kBlockN);
 
-    // 3-buffer SMEM layout. sQB holds Qt or dO3 depending on phase; the two
-    // views below share storage. SmemLayoutQ == SmemLayoutKV under
-    // kBlockM == kBlockN, so partition_fragment and copy atoms compose
-    // identically against either view.
+    // SMEM layout. Narrow (3 buffers): sQB holds Qt or dO3 depending on phase
+    // and sKV holds K or V, forcing two mid-kernel swap stalls plus K and Qt
+    // reloads from GMEM. Wide (5 buffers): dedicated sdO3 and sV, everything
+    // loads once in the prologue, no swaps, no reloads. SmemLayoutQ ==
+    // SmemLayoutKV under kBlockM == kBlockN, so partition_fragment and copy
+    // atoms compose identically against either view.
     extern __shared__ char smem_[];
     Element* sQB_ptr  = reinterpret_cast<Element*>(smem_);
     Element* sKV_ptr  = sQB_ptr  + Traits::kSmemQElems;
     Element* sPdS_ptr = sKV_ptr  + Traits::kSmemKVElems;
+    Element* sdO3_ptr = kWide ? sPdS_ptr + Traits::kSmemPdSElems : sQB_ptr;
+    Element* sV_ptr   = kWide ? sdO3_ptr + Traits::kSmemQElems   : sKV_ptr;
 
-    // Normal views (sQt and sdO3 alias the same SMEM region)
+    // Normal views (sdO3/sV alias sQB/sKV when narrow)
     auto sQt   = make_tensor(make_smem_ptr(sQB_ptr),  typename Traits::SmemLayoutQ{});
-    auto sdO3  = make_tensor(make_smem_ptr(sQB_ptr),  typename Traits::SmemLayoutKV{});
+    auto sdO3  = make_tensor(make_smem_ptr(sdO3_ptr), typename Traits::SmemLayoutKV{});
     auto sKV   = make_tensor(make_smem_ptr(sKV_ptr),  typename Traits::SmemLayoutKV{});
+    auto sV    = make_tensor(make_smem_ptr(sV_ptr),   typename Traits::SmemLayoutKV{});
     auto sPdS  = make_tensor(make_smem_ptr(sPdS_ptr), typename Traits::SmemLayoutPdS{});
 
     // Transposed views for TC GEMM B-operands and A-operands
@@ -241,13 +246,16 @@ kernel3_bwd_tc(
     auto sPdStNS = make_tensor(make_smem_ptr(sPdS_ptr), typename Traits::SmemLayoutPdStransposedNoSwizzle{});
 
     // Zero-init all buffers (handles partial tiles and m < kBlockM)
-    constexpr int total_elems = Traits::kSmemBwdElems;
+    constexpr int total_elems = kWide
+        ? 2*Traits::kSmemQElems + 2*Traits::kSmemKVElems + Traits::kSmemPdSElems
+        : Traits::kSmemBwdElems;
     for (int i = tidx; i < total_elems; i += Traits::kNThreads)
         reinterpret_cast<Element*>(smem_)[i] = Element(0);
     __syncthreads();
 
-    // Load Q_tilde into sQB. dO3 is loaded later (before Phase 4), reusing
-    // the same buffer. Qt will be reloaded a second time before Phase 11.
+    // Load Q_tilde into sQB and K into sKV. Narrow loads dO3/V later by
+    // swapping buffers and reloads Qt/K before Phases 10/11; wide issues dO3
+    // and V here as a second cp.async group that completes under GEMM1.
     typename Traits::GmemTiledCopy gmem_copy;
     auto gmem_thr = gmem_copy.get_thread_slice(tidx);
 
@@ -275,7 +283,38 @@ kernel3_bwd_tc(
             if (c < D) sKV(r,c) = k_base[r*D+c];
         }
     }
-    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
+    if constexpr (kWide) {
+        cp_async_fence();  // group 1: Qt + K (GEMM1's operands)
+        // Issue V and dO3 now; they complete under GEMM1 and are waited
+        // before Phase 4 (GEMM_dP).
+        if (full_tile) {
+            auto gV = make_tensor(make_gmem_ptr(v_ptr + bh*N*D + tile_start*D),
+                                  Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_copy, gmem_thr.partition_S(gV), gmem_thr.partition_D(sV));
+        } else {
+            auto* v_base = v_ptr + bh*N*D + tile_start*D;
+            for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
+                int r = i / kHeadDim, c = i % kHeadDim;
+                if (c < D) sV(r,c) = v_base[r*D+c];
+            }
+        }
+        if (m == kBlockM) {
+            auto gdO3 = make_tensor(make_gmem_ptr(dO3_ptr + bh*m*D),
+                                    Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_copy, gmem_thr.partition_S(gdO3), gmem_thr.partition_D(sdO3));
+        } else {
+            auto* d3 = dO3_ptr + bh*m*D;
+            for (int i = tidx; i < m*kHeadDim; i += Traits::kNThreads) {
+                int r = i / kHeadDim, c = i % kHeadDim;
+                if (c < D) sdO3(r,c) = d3[r*D+c];
+            }
+        }
+        cp_async_fence();  // group 2: V + dO3
+        cp_async_wait<1>();  // group 1 done; group 2 may still be in flight
+    } else {
+        cp_async_fence(); cp_async_wait<0>();
+    }
+    __syncthreads();
 
     // ======== TiledMma setup (GEMM1, GEMM_dP, GEMM_dQt) ========
     typename Traits::TiledMma tiled_mma;
@@ -338,44 +377,49 @@ kernel3_bwd_tc(
     Tensor rP = convert_type<Element>(acc_s);
     auto rP_rc = make_tensor(rP.data(), convert_layout_acc_rowcol(acc_s.layout()));
 
-    // ======== Phase 3: Swap sKV (K -> V) and sQB (Qt -> dO3) ========
-    // Phase 4 needs V (for dP = dO3 @ V^T) and dO3 (as A operand of GEMM_dP).
-    // sQt is dead after Phase 1 (acc_s now holds S); sKV(K) is dead after
-    // GEMM1's inner-K loop completes. Overwriting both is safe past this sync.
-    __syncthreads();  // GEMM1 done reading sQt and sKV(K)
-    // Partial-tile tails stay zero from the kernel-start init: K-load only
-    // touched rows [0, tile_len) and Qt-load only touched rows [0, m), so we
-    // can skip re-zeroing here.
-    if (full_tile) {
-        auto gV = make_tensor(make_gmem_ptr(v_ptr + bh*N*D + tile_start*D),
-                              Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-        cute::copy(gmem_copy, gmem_thr.partition_S(gV), gmem_thr.partition_D(sKV));
+    // ======== Phase 3: make V and dO3 readable ========
+    if constexpr (kWide) {
+        // V and dO3 were issued in the prologue and have been loading under
+        // GEMM1; Qt and K stay resident for Phases 10/11.
+        cp_async_wait<0>();
+        __syncthreads();
     } else {
-        auto* v_base = v_ptr + bh*N*D + tile_start*D;
-        for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
-            int r = i / kHeadDim, c = i % kHeadDim;
-            if (c < D) sKV(r,c) = v_base[r*D+c];
+        // Narrow: swap sKV (K -> V) and sQB (Qt -> dO3). Phase 4 needs V (for
+        // dP = dO3 @ V^T) and dO3 (as A operand of GEMM_dP). sQt is dead after
+        // Phase 1 (acc_s now holds S); sKV(K) is dead after GEMM1's inner-K
+        // loop completes. Overwriting both is safe past this sync. Partial
+        // tails stay zero from the kernel-start init.
+        __syncthreads();  // GEMM1 done reading sQt and sKV(K)
+        if (full_tile) {
+            auto gV = make_tensor(make_gmem_ptr(v_ptr + bh*N*D + tile_start*D),
+                                  Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_copy, gmem_thr.partition_S(gV), gmem_thr.partition_D(sV));
+        } else {
+            auto* v_base = v_ptr + bh*N*D + tile_start*D;
+            for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
+                int r = i / kHeadDim, c = i % kHeadDim;
+                if (c < D) sV(r,c) = v_base[r*D+c];
+            }
         }
-    }
-    // Load dO3 into sQB (overwrites Qt).
-    if (m == kBlockM) {
-        auto gdO3 = make_tensor(make_gmem_ptr(dO3_ptr + bh*m*D),
-                                Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-        cute::copy(gmem_copy, gmem_thr.partition_S(gdO3), gmem_thr.partition_D(sdO3));
-    } else {
-        auto* d3 = dO3_ptr + bh*m*D;
-        for (int i = tidx; i < m*kHeadDim; i += Traits::kNThreads) {
-            int r = i / kHeadDim, c = i % kHeadDim;
-            if (c < D) sdO3(r,c) = d3[r*D+c];
+        if (m == kBlockM) {
+            auto gdO3 = make_tensor(make_gmem_ptr(dO3_ptr + bh*m*D),
+                                    Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_copy, gmem_thr.partition_S(gdO3), gmem_thr.partition_D(sdO3));
+        } else {
+            auto* d3 = dO3_ptr + bh*m*D;
+            for (int i = tidx; i < m*kHeadDim; i += Traits::kNThreads) {
+                int r = i / kHeadDim, c = i % kHeadDim;
+                if (c < D) sdO3(r,c) = d3[r*D+c];
+            }
         }
+        cp_async_fence(); cp_async_wait<0>(); __syncthreads();
     }
-    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
 
-    // ======== Phase 4: GEMM_dP — dP = dO3 @ V^T (sKV now has V_tile) ========
+    // ======== Phase 4: GEMM_dP — dP = dO3 @ V^T ========
     auto acc_dp = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_dp);
-    gemm_smem(acc_dp, thr_mma.partition_fragment_A(sdO3), thr_mma.partition_fragment_B(sKV),
-              thr_copy_A.partition_S(sdO3), thr_copy_B.partition_S(sKV),
+    gemm_smem(acc_dp, thr_mma.partition_fragment_A(sdO3), thr_mma.partition_fragment_B(sV),
+              thr_copy_A.partition_S(sdO3), thr_copy_B.partition_S(sV),
               tiled_mma, smem_copy_A, smem_copy_B, thr_copy_A, thr_copy_B);
 
     // ======== Phase 5: Softmax backward — dS = P * (dP - D3) ========
@@ -454,39 +498,38 @@ kernel3_bwd_tc(
         cute::copy(sc, tc.retile_S(rdS), tc.partition_D(sPdS));
     }
 
-    // ======== Phase 9: Reload K into sKV (overwrite V) and Qt into sQB (overwrite dO3) ========
-    // After Phase 7 finishes reading sdO3 and sPdS(P), and after Phase 8 writes
-    // dS to sPdS, both V (in sKV) and dO3 (in sQB) are dead. We reload K and
-    // Qt in parallel for Phases 10 and 11. The sync above is the one that
-    // protects dO3's last read.
+    // ======== Phase 9: make dS visible (+ reload K and Qt when narrow) ========
+    // The sync also protects dO3's last read (Phase 7) and the dS write to
+    // sPdS (Phase 8) before Phases 10/11 consume them.
     __syncthreads();  // GEMM_dV done reading sdO3 and sPdS(P); dS write to sPdS complete
-    // Partial tails stay zero (V-load touched only first tile_len rows of sKV;
-    // dO3-load touched only first m rows of sQB), so no re-zero needed.
-    // full_tile gates the K reload (sKV size), m == kBlockM gates the Qt
-    // reload (sQB size) — they are independent so check them separately.
-    if (full_tile) {
-        auto gK  = make_tensor(make_gmem_ptr(k_s_ptr + bh*N*D + tile_start*D),
-                               Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-        cute::copy(gmem_copy, gmem_thr.partition_S(gK),  gmem_thr.partition_D(sKV));
-    } else {
-        auto* k_base = k_s_ptr + bh*N*D + tile_start*D;
-        for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
-            int r = i / kHeadDim, c = i % kHeadDim;
-            if (c < D) sKV(r,c) = k_base[r*D+c];
+    if constexpr (!kWide) {
+        // Narrow: V evicted K and dO3 evicted Qt, so reload both for Phases
+        // 10 and 11. Partial tails stay zero. full_tile gates the K reload
+        // (sKV size), m == kBlockM gates the Qt reload (sQB size).
+        if (full_tile) {
+            auto gK  = make_tensor(make_gmem_ptr(k_s_ptr + bh*N*D + tile_start*D),
+                                   Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_copy, gmem_thr.partition_S(gK),  gmem_thr.partition_D(sKV));
+        } else {
+            auto* k_base = k_s_ptr + bh*N*D + tile_start*D;
+            for (int i = tidx; i < tile_len*kHeadDim; i += Traits::kNThreads) {
+                int r = i / kHeadDim, c = i % kHeadDim;
+                if (c < D) sKV(r,c) = k_base[r*D+c];
+            }
         }
-    }
-    if (m == kBlockM) {
-        auto gQt = make_tensor(make_gmem_ptr(q_tilde_ptr + bh*m*D),
-                               Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-        cute::copy(gmem_copy, gmem_thr.partition_S(gQt), gmem_thr.partition_D(sQt));
-    } else {
-        auto* qt_base = q_tilde_ptr + bh*m*D;
-        for (int i = tidx; i < m*kHeadDim; i += Traits::kNThreads) {
-            int r = i / kHeadDim, c = i % kHeadDim;
-            if (c < D) sQt(r,c) = qt_base[r*D+c];
+        if (m == kBlockM) {
+            auto gQt = make_tensor(make_gmem_ptr(q_tilde_ptr + bh*m*D),
+                                   Shape<Int<kBlockM>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_copy, gmem_thr.partition_S(gQt), gmem_thr.partition_D(sQt));
+        } else {
+            auto* qt_base = q_tilde_ptr + bh*m*D;
+            for (int i = tidx; i < m*kHeadDim; i += Traits::kNThreads) {
+                int r = i / kHeadDim, c = i % kHeadDim;
+                if (c < D) sQt(r,c) = qt_base[r*D+c];
+            }
         }
+        cp_async_fence(); cp_async_wait<0>(); __syncthreads();
     }
-    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
 
     // ======== Phase 10: GEMM_dQt — dQt += dS @ K^T (atomicAdd) ========
     {
@@ -626,15 +669,45 @@ void launch_kernel3_bwd(
             int num_tiles = (N + Bc - 1) / Bc;
             dim3 grid(num_tiles, BH);
             dim3 block(Traits::kNThreads);
-            size_t smem = Traits::kSmemBwdBytes;
-            if (smem > 48 * 1024) {
-                FN_CHECK(smem <= get_max_smem_per_block(), "kernel3_bwd_tc: insufficient smem");
-                FN_CUDA_CHECK(cudaFuncSetAttribute(kernel3_bwd_tc<Traits>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+            // Auto rule: wide only if it costs no resident CTAs vs narrow.
+            // The runtime occupancy query accounts for both SMEM and register
+            // limits (wide loses SMEM-bound residency on 100KB/SM consumer
+            // parts but is free on A100/H100/B200, where registers bind first).
+            // Interleaved A/B on an RTX 5060 and A100/H100 Modal runs both
+            // match this rule. Cached once per Traits instantiation.
+            static const bool wide_auto = [] {
+                if ((size_t)Traits::kSmemBwdWideBytes > 48 * 1024) {
+                    cudaFuncSetAttribute((const void*)kernel3_bwd_tc<Traits, true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        Traits::kSmemBwdWideBytes);
+                }
+                int bw = 0, bn = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bw,
+                    (const void*)kernel3_bwd_tc<Traits, true>,
+                    Traits::kNThreads, Traits::kSmemBwdWideBytes);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bn,
+                    (const void*)kernel3_bwd_tc<Traits, false>,
+                    Traits::kNThreads, Traits::kSmemBwdBytes);
+                return bw > 0 && bw >= bn;
+            }();
+            // FLASH_NYSTROM_BWD_WIDE overrides the auto rule ("0" narrow /
+            // "1" wide), for A/B measurement; empty or unset = auto.
+            bool wide_ok = wide_auto;
+            if (const char* env = std::getenv("FLASH_NYSTROM_BWD_WIDE");
+                env != nullptr && env[0] != '\0') {
+                wide_ok = (env[0] != '0');
             }
-            kernel3_bwd_tc<Traits><<<grid, block, smem, stream>>>(
-                q_tilde, k_s, v, lse3, D3, dO3, dV, dK_s,
-                dqt_target, eff_num_splits, N, D, m);
+            BOOL_SWITCH(wide_ok, kWide, [&] {
+                size_t smem = kWide ? Traits::kSmemBwdWideBytes : Traits::kSmemBwdBytes;
+                if (smem > 48 * 1024) {
+                    FN_CHECK(smem <= get_max_smem_per_block(), "kernel3_bwd_tc: insufficient smem");
+                    FN_CUDA_CHECK(cudaFuncSetAttribute((kernel3_bwd_tc<Traits, kWide>),
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+                }
+                kernel3_bwd_tc<Traits, kWide><<<grid, block, smem, stream>>>(
+                    q_tilde, k_s, v, lse3, D3, dO3, dV, dK_s,
+                    dqt_target, eff_num_splits, N, D, m);
+            });
         };
         if (D == 64) launch(Int<64>{}); else launch(Int<128>{});
         FN_CUDA_KERNEL_CHECK();

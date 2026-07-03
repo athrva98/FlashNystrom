@@ -5,6 +5,7 @@
 #pragma once
 #include "utils.h"
 #include "nystrom_utils.h"
+#include "static_switch.h"
 #include "kernels/kernel1_output_fused.cuh"
 
 #include <cute/tensor.hpp>
@@ -130,7 +131,7 @@ __global__ void kernel1_bwd_scalar_kernel(
 //  → GEMM3(TC) → write dQ
 
 
-template <typename Traits>
+template <typename Traits, bool kWide>
 __global__ void __launch_bounds__(Traits::kNThreads)
 kernel1_bwd_tc(
     const typename Traits::Element* __restrict__ q_s_ptr,
@@ -155,30 +156,40 @@ kernel1_bwd_tc(
     int tile_rows = min(kBlockM, N - row_start);
     bool full = (tile_rows == kBlockM);
 
-    // 3-buffer SMEM: slot (Q or dO) + sKt (K_tilde, persistent) + sS2 (step2, then P/dS)
+    // SMEM: slot (Q) + sKt (K_tilde, persistent) + sS2 (step2, then P/dS).
+    // Narrow mode time-multiplexes slot between Q and dO, forcing a mid-kernel
+    // swap stall plus a second Q load from GMEM. Wide mode adds a dedicated dO
+    // buffer: dO's load is issued in the prologue and completes under GEMM1,
+    // and both the swap and the Q reload disappear.
     extern __shared__ char smem_[];
     Element* slot_ptr = reinterpret_cast<Element*>(smem_);
     Element* sKt_ptr  = slot_ptr + Traits::kSmemQElems;
     Element* sS2_ptr  = sKt_ptr + Traits::kSmemKVElems;
+    Element* sdO_ptr  = kWide ? sS2_ptr + Traits::kSmemKVElems : slot_ptr;
 
     auto sSlot = make_tensor(make_smem_ptr(slot_ptr), typename Traits::SmemLayoutQ{});
     auto sKt   = make_tensor(make_smem_ptr(sKt_ptr),  typename Traits::SmemLayoutKV{});
     auto sS2   = make_tensor(make_smem_ptr(sS2_ptr),  typename Traits::SmemLayoutKV{});
+    auto sdO   = make_tensor(make_smem_ptr(sdO_ptr),  typename Traits::SmemLayoutQ{});
 
-    // Transposed views for GEMM3 B-operand (Kt) and GEMM4/5 B-operand (slot)
-    // kBlockM == kBlockN == 64, so SmemLayoutQ == SmemLayoutKV — reuse KV transposed types
+    // Transposed views for GEMM3 B-operand (Kt), GEMM4 B-operand (Q in slot),
+    // and GEMM5 B-operand (dO). kBlockM == kBlockN == 64, so SmemLayoutQ ==
+    // SmemLayoutKV — reuse KV transposed types. sdO* alias sSlot* when narrow.
     auto sKtt    = make_tensor(sKt.data(),       typename Traits::SmemLayoutKVtransposed{});
     auto sKttNS  = make_tensor(sKt.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
     auto sSlotT  = make_tensor(sSlot.data(),       typename Traits::SmemLayoutKVtransposed{});
     auto sSlotTNS = make_tensor(sSlot.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
+    auto sdOT    = make_tensor(sdO.data(),       typename Traits::SmemLayoutKVtransposed{});
+    auto sdOTNS  = make_tensor(sdO.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
 
     // PdS views on sS2 region (SmemLayoutPdS fits: cosize(PdS) = 64*64 <= cosize(KV) = 64*D)
     auto sPdS    = make_tensor(make_smem_ptr(sS2_ptr), typename Traits::SmemLayoutPdS{});
     auto sPdSt   = make_tensor(make_smem_ptr(sS2_ptr), typename Traits::SmemLayoutPdStransposed{});
     auto sPdStNS = make_tensor(make_smem_ptr(sS2_ptr),  typename Traits::SmemLayoutPdStransposedNoSwizzle{});
 
-    // Zero-init all 3 buffers (needed for partial tiles: rows >= tile_rows and cols >= m)
-    constexpr int total_elems = Traits::kSmemQElems + Traits::kSmemKVElems*2;
+    // Zero-init all buffers (needed for partial tiles: rows >= tile_rows and cols >= m)
+    constexpr int total_elems = Traits::kSmemQElems + Traits::kSmemKVElems*2
+                              + (kWide ? Traits::kSmemQElems : 0);
     for (int i = tidx; i < total_elems; i += Traits::kNThreads)
         reinterpret_cast<Element*>(smem_)[i] = Element(0);
     __syncthreads();
@@ -205,7 +216,22 @@ kernel1_bwd_tc(
         auto* q=q_s_ptr+bh*N*D+row_start*D;
         for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D) sSlot(r,c)=q[r*D+c];}
     }
-    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
+    if constexpr (kWide) {
+        cp_async_fence();  // group 1: Kt + step2 + Q (GEMM1's operands)
+        // Issue dO now; it completes under GEMM1 and is waited before GEMM2.
+        if (full) {
+            auto gdO = make_tensor(make_gmem_ptr(dO_ptr+bh*N*D+row_start*D), Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
+            cute::copy(gmem_copy, gmem_thr.partition_S(gdO), gmem_thr.partition_D(sdO));
+        } else {
+            auto* d=dO_ptr+bh*N*D+row_start*D;
+            for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D) sdO(r,c)=d[r*D+c];}
+        }
+        cp_async_fence();  // group 2: dO
+        cp_async_wait<1>();  // group 1 done; dO may still be in flight
+    } else {
+        cp_async_fence(); cp_async_wait<0>();
+    }
+    __syncthreads();
 
     // ======== TiledMma setup (GEMM1/2/3: kBlockM × kBlockN output) ========
     typename Traits::TiledMma tiled_mma;
@@ -271,22 +297,29 @@ kernel1_bwd_tc(
     Tensor rP = convert_type<Element>(acc_s);
     auto rP_rc = make_tensor(rP.data(), convert_layout_acc_rowcol(acc_s.layout()));
 
-    // ======== Swap slot: Q → dO ========
-    __syncthreads();
-    if (full) {
-        auto gdO = make_tensor(make_gmem_ptr(dO_ptr+bh*N*D+row_start*D), Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
-        cute::copy(gmem_copy, gmem_thr.partition_S(gdO), gmem_thr.partition_D(sSlot));
+    // ======== dO becomes readable ========
+    if constexpr (kWide) {
+        // dO was issued in the prologue and has been loading under GEMM1.
+        cp_async_wait<0>();
+        __syncthreads();
     } else {
-        auto* d=dO_ptr+bh*N*D+row_start*D;
-        for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D) sSlot(r,c)=d[r*D+c];}
+        // Narrow: swap slot Q -> dO (Q is reloaded later for GEMM4).
+        __syncthreads();
+        if (full) {
+            auto gdO = make_tensor(make_gmem_ptr(dO_ptr+bh*N*D+row_start*D), Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
+            cute::copy(gmem_copy, gmem_thr.partition_S(gdO), gmem_thr.partition_D(sdO));
+        } else {
+            auto* d=dO_ptr+bh*N*D+row_start*D;
+            for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D) sdO(r,c)=d[r*D+c];}
+        }
+        cp_async_fence(); cp_async_wait<0>(); __syncthreads();
     }
-    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
 
-    // ======== GEMM2: dP = dO @ step2^T (slot=dO, sS2=step2) ========
+    // ======== GEMM2: dP = dO @ step2^T (sdO=dO, sS2=step2) ========
     auto acc_dp = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_dp);
-    gemm_smem(acc_dp, thr_mma.partition_fragment_A(sSlot), thr_mma.partition_fragment_B(sS2),
-              thr_copy_A.partition_S(sSlot), thr_copy_B.partition_S(sS2),
+    gemm_smem(acc_dp, thr_mma.partition_fragment_A(sdO), thr_mma.partition_fragment_B(sS2),
+              thr_copy_A.partition_S(sdO), thr_copy_B.partition_S(sS2),
               tiled_mma, smem_copy_A, smem_copy_B, thr_copy_A, thr_copy_B);
 
     // Softmax backward: dS = P * (dP - D1). P comes from rP (FP16) and is
@@ -329,15 +362,15 @@ kernel1_bwd_tc(
 
     // ======== GEMM5 TC: dstep2 = P^T @ dO (TiledMmaDKV) ========
     // A = P^T: SmemLayoutPdStransposed on sS2_ptr (LDSM_T)
-    // B = dO:  SmemLayoutKVtransposed on slot_ptr (LDSM_T)
+    // B = dO:  SmemLayoutKVtransposed on sdO_ptr (LDSM_T; aliases slot when narrow)
     {
         auto acc_ds2 = partition_fragment_C(tiled_mma_dkv, Shape<Int<kBlockN>, Int<kHeadDim>>{});
         clear(acc_ds2);
         gemm_smem(acc_ds2,
                   thr_mma_dkv.partition_fragment_A(sPdStNS),
-                  thr_mma_dkv.partition_fragment_B(sSlotTNS),
+                  thr_mma_dkv.partition_fragment_B(sdOTNS),
                   thr_copy_PdSt.partition_S(sPdSt),
-                  thr_copy_SlotT.partition_S(sSlotT),
+                  thr_copy_SlotT.partition_S(sdOT),
                   tiled_mma_dkv, smem_copy_PdSt, smem_copy_SlotT,
                   thr_copy_PdSt, thr_copy_SlotT);
 
@@ -352,8 +385,8 @@ kernel1_bwd_tc(
         }
     }
 
-    // ======== Write dS to sS2 + reload Q into slot (parallel: different SMEM regions) ========
-    __syncthreads();  // GEMM5 done reading sS2 (P) and slot (dO)
+    // ======== Write dS to sS2 (+ reload Q into slot when narrow) ========
+    __syncthreads();  // GEMM5 done reading sS2 (P) and sdO (dO)
 
     // Write dS (rdS, already FP16 from the eager convert above) over P in sS2
     {
@@ -362,15 +395,18 @@ kernel1_bwd_tc(
         cute::copy(sc, tc.retile_S(rdS), tc.partition_D(sPdS));
     }
 
-    // Reload Q into slot (GMEM → SMEM, async or scalar)
-    if (full) {
-        auto gQ = make_tensor(make_gmem_ptr(q_s_ptr+bh*N*D+row_start*D), Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
-        cute::copy(gmem_copy, gmem_thr.partition_S(gQ), gmem_thr.partition_D(sSlot));
-    } else {
-        auto* q=q_s_ptr+bh*N*D+row_start*D;
-        for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D) sSlot(r,c)=q[r*D+c];}
+    if constexpr (!kWide) {
+        // Narrow: reload Q into slot (dO evicted it). Wide keeps Q resident.
+        if (full) {
+            auto gQ = make_tensor(make_gmem_ptr(q_s_ptr+bh*N*D+row_start*D), Shape<Int<kBlockM>,Int<kHeadDim>>{}, Stride<Int<kHeadDim>,_1>{});
+            cute::copy(gmem_copy, gmem_thr.partition_S(gQ), gmem_thr.partition_D(sSlot));
+        } else {
+            auto* q=q_s_ptr+bh*N*D+row_start*D;
+            for(int i=tidx;i<tile_rows*kHeadDim;i+=Traits::kNThreads){int r=i/kHeadDim,c=i%kHeadDim;if(c<D) sSlot(r,c)=q[r*D+c];}
+        }
+        cp_async_fence(); cp_async_wait<0>();
     }
-    cp_async_fence(); cp_async_wait<0>(); __syncthreads();
+    __syncthreads();  // dS visible to GEMM4/GEMM3 readers (+ Q reloaded when narrow)
 
     // ======== GEMM4 TC: dKt = dS^T @ Q (TiledMmaDKV) ========
     // A = dS^T: SmemLayoutPdStransposed on sS2_ptr (LDSM_T)
@@ -462,15 +498,54 @@ void launch_kernel1_bwd(
             using Traits = K1Traits<kHeadDim, scalar_t>;
             dim3 grid((N+Traits::kBlockM-1)/Traits::kBlockM, BH);
             dim3 block(Traits::kNThreads);
-            // 3-buffer layout: slot (Q/dO) + sKt + sS2 (reused for sdS)
-            size_t smem = (Traits::kSmemQElems + Traits::kSmemKVElems*2) * sizeof(scalar_t);
-            if (smem > 48*1024) {
-                FN_CHECK(smem <= get_max_smem_per_block(), "kernel1_bwd: smem");
-                FN_CUDA_CHECK(cudaFuncSetAttribute(kernel1_bwd_tc<Traits>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+            // Narrow: slot (Q/dO time-multiplexed) + sKt + sS2. Wide adds a
+            // dedicated dO buffer (no swap stall, no second Q load); use it
+            // only where it keeps at least 2 CTAs resident per SM.
+            constexpr size_t kNarrowBytes =
+                (Traits::kSmemQElems + Traits::kSmemKVElems*2) * sizeof(scalar_t);
+            constexpr size_t kWideBytes =
+                (Traits::kSmemQElems*2 + Traits::kSmemKVElems*2) * sizeof(scalar_t);
+            // Auto rule: wide only if it costs no resident CTAs vs narrow (the
+            // runtime occupancy query accounts for SMEM and register limits;
+            // see kernel3_bwd for the measurement basis). Cached per Traits.
+            static const bool wide_auto = [] {
+                // Recomputed here (not captured): MSVC rejects implicit
+                // capture of the enclosing constexpr locals (C3493).
+                constexpr size_t wide_b =
+                    (Traits::kSmemQElems*2 + Traits::kSmemKVElems*2) * sizeof(scalar_t);
+                constexpr size_t narrow_b =
+                    (Traits::kSmemQElems + Traits::kSmemKVElems*2) * sizeof(scalar_t);
+                if (wide_b > 48 * 1024) {
+                    cudaFuncSetAttribute((const void*)kernel1_bwd_tc<Traits, true>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                        static_cast<int>(wide_b));
+                }
+                int bw = 0, bn = 0;
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bw,
+                    (const void*)kernel1_bwd_tc<Traits, true>,
+                    Traits::kNThreads, wide_b);
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bn,
+                    (const void*)kernel1_bwd_tc<Traits, false>,
+                    Traits::kNThreads, narrow_b);
+                return bw > 0 && bw >= bn;
+            }();
+            // FLASH_NYSTROM_BWD_WIDE overrides the auto rule ("0" narrow /
+            // "1" wide), for A/B measurement; empty or unset = auto.
+            bool wide_ok = wide_auto;
+            if (const char* env = std::getenv("FLASH_NYSTROM_BWD_WIDE");
+                env != nullptr && env[0] != '\0') {
+                wide_ok = (env[0] != '0');
             }
-            kernel1_bwd_tc<Traits><<<grid, block, smem, stream>>>(
-                q_s, k_tilde, step2, lse1, D1, dO, dQ_s, dstep2, dK_tilde, N, D, m);
+            BOOL_SWITCH(wide_ok, kWide, [&] {
+                size_t smem = kWide ? kWideBytes : kNarrowBytes;
+                if (smem > 48*1024) {
+                    FN_CHECK(smem <= get_max_smem_per_block(), "kernel1_bwd: smem");
+                    FN_CUDA_CHECK(cudaFuncSetAttribute((kernel1_bwd_tc<Traits, kWide>),
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+                }
+                kernel1_bwd_tc<Traits, kWide><<<grid, block, smem, stream>>>(
+                    q_s, k_tilde, step2, lse1, D1, dO, dQ_s, dstep2, dK_tilde, N, D, m);
+            });
         };
         if (D == 64) launch(Int<64>{}); else launch(Int<128>{});
     }

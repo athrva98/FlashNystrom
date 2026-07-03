@@ -137,6 +137,13 @@ struct K3Traits {
     // shared buffer compose correctly.
     static constexpr int kSmemBwdElems = kSmemQElems + kSmemKVElems + kSmemPdSElems;
     static constexpr int kSmemBwdBytes = kSmemBwdElems * sizeof(Element);
+
+    // Wide backward (kWide=true in kernel3_bwd_tc): dedicated buffers for Qt,
+    // dO3, K, V (+ sPdS), so nothing is swapped or reloaded mid-kernel and the
+    // dO3/V loads complete under GEMM1. Used only where the footprint keeps at
+    // least 2 CTAs resident per SM.
+    static constexpr int kSmemBwdWideBytes =
+        (2 * kSmemQElems + 2 * kSmemKVElems + kSmemPdSElems) * sizeof(Element);
 };
 
 // -- the actual kernel --

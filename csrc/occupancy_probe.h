@@ -193,12 +193,18 @@ inline std::vector<OccupancyRow> probe_all(
         if (D == 64) {
             using Tk1 = K1Traits<64, Element>;
             using Tk3 = K3Traits<64, Element>;
-            rows.push_back(probe("kernel1_bwd_tc<D=64," + tag + ">",
-                kernel1_bwd_tc<Tk1>, Tk1::kNThreads,
+            rows.push_back(probe("kernel1_bwd_tc<D=64,narrow," + tag + ">",
+                kernel1_bwd_tc<Tk1, false>, Tk1::kNThreads,
                 (Tk1::kSmemQElems + Tk1::kSmemKVElems * 2) * (int)sizeof(Element),
                 lim));
-            rows.push_back(probe("kernel3_bwd_tc<D=64," + tag + ">",
-                kernel3_bwd_tc<Tk3>, Tk3::kNThreads, Tk3::kSmemBwdBytes, lim));
+            rows.push_back(probe("kernel1_bwd_tc<D=64,wide," + tag + ">",
+                kernel1_bwd_tc<Tk1, true>, Tk1::kNThreads,
+                (Tk1::kSmemQElems * 2 + Tk1::kSmemKVElems * 2) * (int)sizeof(Element),
+                lim));
+            rows.push_back(probe("kernel3_bwd_tc<D=64,narrow," + tag + ">",
+                kernel3_bwd_tc<Tk3, false>, Tk3::kNThreads, Tk3::kSmemBwdBytes, lim));
+            rows.push_back(probe("kernel3_bwd_tc<D=64,wide," + tag + ">",
+                kernel3_bwd_tc<Tk3, true>, Tk3::kNThreads, Tk3::kSmemBwdWideBytes, lim));
             // compute_dk2inv_tc SMEM: sQ + sKV in Element + sB in FP32 (m * D)
             int dk2inv_smem = (Tk3::kSmemQElems + Tk3::kSmemKVElems) * (int)sizeof(Element)
                               + Tk3::kBlockM * 64 * (int)sizeof(float);
@@ -207,12 +213,18 @@ inline std::vector<OccupancyRow> probe_all(
         } else if (D == 128) {
             using Tk1 = K1Traits<128, Element>;
             using Tk3 = K3Traits<128, Element>;
-            rows.push_back(probe("kernel1_bwd_tc<D=128," + tag + ">",
-                kernel1_bwd_tc<Tk1>, Tk1::kNThreads,
+            rows.push_back(probe("kernel1_bwd_tc<D=128,narrow," + tag + ">",
+                kernel1_bwd_tc<Tk1, false>, Tk1::kNThreads,
                 (Tk1::kSmemQElems + Tk1::kSmemKVElems * 2) * (int)sizeof(Element),
                 lim));
-            rows.push_back(probe("kernel3_bwd_tc<D=128," + tag + ">",
-                kernel3_bwd_tc<Tk3>, Tk3::kNThreads, Tk3::kSmemBwdBytes, lim));
+            rows.push_back(probe("kernel1_bwd_tc<D=128,wide," + tag + ">",
+                kernel1_bwd_tc<Tk1, true>, Tk1::kNThreads,
+                (Tk1::kSmemQElems * 2 + Tk1::kSmemKVElems * 2) * (int)sizeof(Element),
+                lim));
+            rows.push_back(probe("kernel3_bwd_tc<D=128,narrow," + tag + ">",
+                kernel3_bwd_tc<Tk3, false>, Tk3::kNThreads, Tk3::kSmemBwdBytes, lim));
+            rows.push_back(probe("kernel3_bwd_tc<D=128,wide," + tag + ">",
+                kernel3_bwd_tc<Tk3, true>, Tk3::kNThreads, Tk3::kSmemBwdWideBytes, lim));
             int dk2inv_smem = (Tk3::kSmemQElems + Tk3::kSmemKVElems) * (int)sizeof(Element)
                               + Tk3::kBlockM * 128 * (int)sizeof(float);
             rows.push_back(probe("compute_dk2inv_tc<D=128," + tag + ">",
