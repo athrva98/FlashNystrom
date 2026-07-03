@@ -6,6 +6,7 @@
 
 #include "utils.h"
 #include "nystrom_utils.h"
+#include "../static_switch.h"
 
 #include <algorithm>  // std::min / std::max in host launch dispatch
 #include <cstdlib>    // std::getenv / std::atoi for the splits override
@@ -116,13 +117,18 @@ struct K3Traits {
     static constexpr int kSmemKVElems  = static_cast<int>(cosize(SmemLayoutKV{}));
     static constexpr int kSmemPdSElems = static_cast<int>(cosize(SmemLayoutPdS{}));
 
-    // Forward: sQt (persistent) + sKV (single, reloaded per tile)
+    // Fallback forward (kPipelined=false): sQt (persistent) + one shared K/V
+    // buffer, reloaded twice per tile. Used when the pipelined footprint would
+    // cost a resident CTA (100KB/SM parts at D=128).
     static constexpr int kSmemBytes = (kSmemQElems + kSmemKVElems) * sizeof(Element);
 
-    // Pipelined forward: sQt (persistent) + sK[2] + sV[2] (double-buffered so
-    // tile t+1's K/V load overlaps tile t's compute via cp.async). 5 buffers.
-    static constexpr int kSmemPipeBytes =
-        (kSmemQElems + 4 * kSmemKVElems) * sizeof(Element);
+    // Pipelined forward: sQt (persistent) + separate sK + sV. Single buffers
+    // suffice for a FlashAttention-2 style one-stage lookahead (at most one
+    // cp.async group in flight): V(t)'s load hides under GEMM1 and K(t+1)'s
+    // load hides under softmax+GEMM2, with no double buffering and therefore
+    // no occupancy cost beyond the one extra KV buffer.
+    static constexpr int kSmemFwdBytes =
+        (kSmemQElems + 2 * kSmemKVElems) * sizeof(Element);
 
     // Backward: sQB (shared Qt/dO3, time-multiplexed) + sKV + sPdS (3 buffers).
     // sQt and sdO3 never coexist in time, so we fold them into one buffer and
@@ -136,7 +142,7 @@ struct K3Traits {
 // -- the actual kernel --
 
 
-template <typename Traits>
+template <typename Traits, bool kPipelined>
 __global__ void __launch_bounds__(Traits::kNThreads, 3)
 kernel3_fused_tc(
     const typename Traits::Element* __restrict__ q_tilde_ptr,  // (B*H, m, D)
@@ -157,11 +163,15 @@ kernel3_fused_tc(
     const int tidx = threadIdx.x;
 
     extern __shared__ char smem_[];
-    Element* sQ_ptr  = reinterpret_cast<Element*>(smem_);
-    Element* sKV_ptr = sQ_ptr + Traits::kSmemQElems;
+    Element* sQ_ptr = reinterpret_cast<Element*>(smem_);
+    Element* sK_ptr = sQ_ptr + Traits::kSmemQElems;
+    // Fallback mode time-multiplexes one buffer between K and V (the legacy
+    // layout); pipelined mode gives V its own buffer so loads overlap compute.
+    Element* sV_ptr = kPipelined ? sK_ptr + Traits::kSmemKVElems : sK_ptr;
 
-    Tensor sQ  = make_tensor(make_smem_ptr(sQ_ptr),  typename Traits::SmemLayoutQ{});
-    Tensor sKV = make_tensor(make_smem_ptr(sKV_ptr), typename Traits::SmemLayoutKV{});
+    Tensor sQ = make_tensor(make_smem_ptr(sQ_ptr), typename Traits::SmemLayoutQ{});
+    Tensor sK = make_tensor(make_smem_ptr(sK_ptr), typename Traits::SmemLayoutKV{});
+    Tensor sV = make_tensor(make_smem_ptr(sV_ptr), typename Traits::SmemLayoutKV{});
 
     // Load Q_tilde into SMEM (persistent)
     for (int idx = tidx; idx < Traits::kSmemQElems; idx += Traits::kNThreads)
@@ -214,58 +224,98 @@ kernel3_fused_tc(
     #pragma unroll
     for (int i = 0; i < nrow; i++) { row_max(i) = fp32_neg_inf(); row_sum(i) = 0.0f; }
 
-    // Main tile loop over K/V
+    // K/V tile loaders. A full tile goes through the 128-bit cp.async tiled
+    // copy; the (at most one) partial tail tile takes a bounds-checked scalar
+    // path that also zero-fills the padding rows so GEMM2 never multiplies
+    // P (exactly 0 in masked columns) by garbage that could be NaN/Inf.
+    // Both fence one commit group so the consumer's cp_async_wait<0>() is
+    // uniform. Callers guarantee no other cp.async group is in flight and all
+    // warps are past the buffer's last reader when a loader is invoked.
+    auto load_k_tile = [&](int tile) {
+        const int ts = tile * kBlockN;
+        const Element* base = k_ptr + bh * N * D + ts * D;
+        if (N - ts >= kBlockN) {
+            Tensor gK = make_tensor(make_gmem_ptr(base),
+                Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_tiled_copy, gmem_thr.partition_S(gK), gmem_thr.partition_D(sK));
+        } else {
+            const int len = N - ts;
+            for (int idx = tidx; idx < kBlockN * kHeadDim; idx += Traits::kNThreads) {
+                int r = idx / kHeadDim, c = idx % kHeadDim;
+                sK(r, c) = (r < len) ? base[r * D + c] : Element(0);
+            }
+        }
+        cp_async_fence();
+    };
+    auto load_v_tile = [&](int tile) {
+        const int ts = tile * kBlockN;
+        const Element* base = v_ptr + bh * N * D + ts * D;
+        if (N - ts >= kBlockN) {
+            Tensor gV = make_tensor(make_gmem_ptr(base),
+                Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_tiled_copy, gmem_thr.partition_S(gV), gmem_thr.partition_D(sV));
+        } else {
+            const int len = N - ts;
+            for (int idx = tidx; idx < kBlockN * kHeadDim; idx += Traits::kNThreads) {
+                int r = idx / kHeadDim, c = idx % kHeadDim;
+                sV(r, c) = (r < len) ? base[r * D + c] : Element(0);
+            }
+        }
+        cp_async_fence();
+    };
+
+    // Loop-invariant MMA/copy descriptors over the dedicated sK/sV buffers.
+    Tensor tSrK = thr_mma.partition_fragment_B(sK);
+    auto smem_copy_K = make_tiled_copy_B(typename Traits::SmemCopyAtom{}, tiled_mma);
+    auto thr_copy_K  = smem_copy_K.get_thread_slice(tidx);
+    Tensor tCsK = thr_copy_K.partition_S(sK);
+    auto tCrK_view = thr_copy_K.retile_D(tSrK);
+
+    Tensor sVt = make_tensor(sV.data(), typename Traits::SmemLayoutKVtransposed{});
+    Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
+    Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);
+    auto smem_copy_V = make_tiled_copy_B(typename Traits::SmemCopyAtomTransposed{}, tiled_mma);
+    auto thr_copy_V  = smem_copy_V.get_thread_slice(tidx);
+    Tensor tCsVt = thr_copy_V.partition_S(sVt);
+
+    // Main tile loop over K/V. Pipelined mode is a FlashAttention-2 style
+    // single-stage software pipeline with at most one cp.async group in
+    // flight: V(tile)'s load overlaps GEMM1 and K(tile+1)'s load overlaps
+    // softmax + GEMM2. sK is rewritten only after the mid-loop barrier (all
+    // warps done reading it in GEMM1); sV only after the top-of-loop barrier
+    // (all warps past the previous tile's gemm_rs). Fallback mode (sV aliases
+    // sK) loads K and V synchronously in-loop, as before the pipeline.
     const int num_tiles = (N + kBlockN - 1) / kBlockN;
+    if constexpr (kPipelined) {
+        load_k_tile(0);  // prologue: K(0) in flight before the first iteration
+    }
 
     for (int tile = 0; tile < num_tiles; tile++) {
         const int tile_start = tile * kBlockN;
         const int tile_end = min(tile_start + kBlockN, N);
-        const bool is_full_tile = (tile_end - tile_start) == kBlockN;
 
-        // Load K_tile into sKV
-        for (int idx = tidx; idx < Traits::kSmemKVElems; idx += Traits::kNThreads)
-            sKV_ptr[idx] = Element(0);
-        __syncthreads();
-
-        if (is_full_tile) {
-            Tensor gK = make_tensor(
-                make_gmem_ptr(k_ptr + bh * N * D + tile_start * D),
-                Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-            cute::copy(gmem_tiled_copy, gmem_thr.partition_S(gK), gmem_thr.partition_D(sKV));
-            cp_async_fence();
+        if constexpr (kPipelined) {
             cp_async_wait<0>();
+            __syncthreads();      // K(tile) visible; sV free to overwrite
+            load_v_tile(tile);    // in flight underneath GEMM1
         } else {
-            const Element* k_base = k_ptr + bh * N * D + tile_start * D;
-            int tile_len = tile_end - tile_start;
-            for (int idx = tidx; idx < tile_len * kHeadDim; idx += Traits::kNThreads) {
-                int r = idx / kHeadDim, c = idx % kHeadDim;
-                if (c < D) sKV(r, c) = k_base[r * D + c];
-            }
+            __syncthreads();      // all warps past the previous tile's gemm_rs
+            load_k_tile(tile);
+            cp_async_wait<0>();
+            __syncthreads();      // K(tile) visible
         }
-        __syncthreads();
 
         // GEMM1: S_tile = Q_tilde @ K_tile^T (Q in regs, K from SMEM)
-        Tensor tSrK = thr_mma.partition_fragment_B(sKV);
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
         clear(acc_s);
-
-        auto smem_copy_K = make_tiled_copy_B(typename Traits::SmemCopyAtom{}, tiled_mma);
-        auto thr_copy_K  = smem_copy_K.get_thread_slice(tidx);
-        Tensor tCsK = thr_copy_K.partition_S(sKV);
-
-        // Q is already in registers (tSrQ loaded before the loop)
-        // K-loop
-        {
-            auto tCrK_view = thr_copy_K.retile_D(tSrK);
-            #pragma unroll
-            for (int ki = 0; ki < size<2>(tSrQ); ++ki) {
-                cute::copy(smem_copy_K, tCsK(_, _, ki), tCrK_view(_, _, ki));
-                cute::gemm(tiled_mma, tSrQ(_, _, ki), tSrK(_, _, ki), acc_s);
-            }
+        #pragma unroll
+        for (int ki = 0; ki < size<2>(tSrQ); ++ki) {
+            cute::copy(smem_copy_K, tCsK(_, _, ki), tCrK_view(_, _, ki));
+            cute::gemm(tiled_mma, tSrQ(_, _, ki), tSrK(_, _, ki), acc_s);
         }
 
         // Mask invalid columns (tile padding + m padding)
-        int valid_cols = is_full_tile ? kBlockN : (tile_end - tile_start);
+        int valid_cols = tile_end - tile_start;
         #pragma unroll
         for (int i = 0; i < size(acc_s); i++) {
             int col = get<1>(tScS(i));
@@ -276,6 +326,17 @@ kernel3_fused_tc(
         for (int i = 0; i < size(acc_s); i++) {
             int row = get<0>(tScS(i));
             if (row >= m) acc_s(i) = fp32_neg_inf();
+        }
+
+        if constexpr (kPipelined) {
+            cp_async_wait<0>();
+            __syncthreads();      // V(tile) visible; all warps done reading sK
+            if (tile + 1 < num_tiles) load_k_tile(tile + 1);  // hides under softmax + GEMM2
+        } else {
+            __syncthreads();      // all warps done reading sK in GEMM1
+            load_v_tile(tile);
+            cp_async_wait<0>();
+            __syncthreads();      // V(tile) visible
         }
 
         // Online softmax update
@@ -341,46 +402,12 @@ kernel3_fused_tc(
         Tensor tOrP = make_tensor(rP.data(),
             convert_layout_acc_Aregs<typename Traits::TiledMma>(rP.layout()));
 
-        // Load V_tile into sKV (reusing K_tile's space)
-        __syncthreads();
-        for (int idx = tidx; idx < Traits::kSmemKVElems; idx += Traits::kNThreads)
-            sKV_ptr[idx] = Element(0);
-        __syncthreads();
-
-        if (is_full_tile) {
-            Tensor gV = make_tensor(
-                make_gmem_ptr(v_ptr + bh * N * D + tile_start * D),
-                Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-            cute::copy(gmem_tiled_copy, gmem_thr.partition_S(gV), gmem_thr.partition_D(sKV));
-            cp_async_fence();
-            cp_async_wait<0>();
-        } else {
-            const Element* v_base = v_ptr + bh * N * D + tile_start * D;
-            int tile_len = tile_end - tile_start;
-            for (int idx = tidx; idx < tile_len * kHeadDim; idx += Traits::kNThreads) {
-                int r = idx / kHeadDim, c = idx % kHeadDim;
-                if (c < D) sKV(r, c) = v_base[r * D + c];
-            }
-        }
-        __syncthreads();
-
-        // V transposed views for GEMM2
-        Tensor sKVt = make_tensor(sKV.data(), typename Traits::SmemLayoutKVtransposed{});
-        Tensor sKVtNoSwizzle = make_tensor(sKV.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
-
-        Tensor tOrVt = thr_mma.partition_fragment_B(sKVtNoSwizzle);
-        auto smem_copy_V = make_tiled_copy_B(typename Traits::SmemCopyAtomTransposed{}, tiled_mma);
-        auto thr_copy_V  = smem_copy_V.get_thread_slice(tidx);
-        Tensor tCsVt = thr_copy_V.partition_S(sKVt);
-
         gemm_rs(acc_o, tOrP, tOrVt, tCsVt, tiled_mma, smem_copy_V, thr_copy_V);
 
-        // Barrier before looping back: gemm_rs reads sKV (V) via LDSM and the
-        // next iteration zeroes sKV. Without this, a fast warp can zero V while
-        // a slow warp is still reading it. Latent here (single-CTA per bh keeps
-        // occupancy low) but real; the split-N partial kernel hits it at high
-        // CTA counts. Synced for correctness in both.
-        __syncthreads();
+        // No trailing barrier: the next iteration's cp_async_wait<0>() +
+        // __syncthreads() orders every warp past this gemm_rs before sV is
+        // rewritten, and the epilogue below has its own barrier before it
+        // reuses SMEM.
     }
 
     // Final normalization: O_acc /= row_sum
@@ -484,7 +511,7 @@ kernel3_fused_tc(
 
 // Phase A: per-split partial. Same inner loop as kernel3_fused_tc, restricted
 // to this split's tile range, writing partial state instead of final outputs.
-template <typename Traits>
+template <typename Traits, bool kPipelined>
 __global__ void __launch_bounds__(Traits::kNThreads, 3)
 kernel3_partial_tc(
     const typename Traits::Element* __restrict__ q_tilde_ptr,  // (BH, m, D)
@@ -510,10 +537,14 @@ kernel3_partial_tc(
     const int tile_stop  = min(tile_begin + tiles_per_split, num_tiles);
 
     extern __shared__ char smem_[];
-    Element* sQ_ptr  = reinterpret_cast<Element*>(smem_);
-    Element* sKV_ptr = sQ_ptr + Traits::kSmemQElems;
-    Tensor sQ  = make_tensor(make_smem_ptr(sQ_ptr),  typename Traits::SmemLayoutQ{});
-    Tensor sKV = make_tensor(make_smem_ptr(sKV_ptr), typename Traits::SmemLayoutKV{});
+    Element* sQ_ptr = reinterpret_cast<Element*>(smem_);
+    Element* sK_ptr = sQ_ptr + Traits::kSmemQElems;
+    // Fallback mode time-multiplexes one buffer between K and V (the legacy
+    // layout); pipelined mode gives V its own buffer so loads overlap compute.
+    Element* sV_ptr = kPipelined ? sK_ptr + Traits::kSmemKVElems : sK_ptr;
+    Tensor sQ = make_tensor(make_smem_ptr(sQ_ptr), typename Traits::SmemLayoutQ{});
+    Tensor sK = make_tensor(make_smem_ptr(sK_ptr), typename Traits::SmemLayoutKV{});
+    Tensor sV = make_tensor(make_smem_ptr(sV_ptr), typename Traits::SmemLayoutKV{});
 
     // Determine nrow from the accumulator's rowcol layout.
     typename Traits::TiledMma tiled_mma;
@@ -579,54 +610,104 @@ kernel3_partial_tc(
     for (int ki = 0; ki < size<2>(tSrQ); ++ki)
         cute::copy(smem_copy_Q, tCsQ(_, _, ki), tCrQ_view(_, _, ki));
 
+    // K/V tile loaders: identical contract to kernel3_fused_tc's (full tiles
+    // via 128-bit cp.async, the at-most-one tail tile via a bounds-checked
+    // scalar path that zero-fills padding; one commit group fenced either way).
+    auto load_k_tile = [&](int tile) {
+        const int ts = tile * kBlockN;
+        const Element* base = k_ptr + bh * N * D + ts * D;
+        if (N - ts >= kBlockN) {
+            Tensor gK = make_tensor(make_gmem_ptr(base),
+                Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_tiled_copy, gmem_thr.partition_S(gK), gmem_thr.partition_D(sK));
+        } else {
+            const int len = N - ts;
+            for (int idx = tidx; idx < kBlockN * kHeadDim; idx += Traits::kNThreads) {
+                int r = idx / kHeadDim, c = idx % kHeadDim;
+                sK(r, c) = (r < len) ? base[r * D + c] : Element(0);
+            }
+        }
+        cp_async_fence();
+    };
+    auto load_v_tile = [&](int tile) {
+        const int ts = tile * kBlockN;
+        const Element* base = v_ptr + bh * N * D + ts * D;
+        if (N - ts >= kBlockN) {
+            Tensor gV = make_tensor(make_gmem_ptr(base),
+                Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
+            cute::copy(gmem_tiled_copy, gmem_thr.partition_S(gV), gmem_thr.partition_D(sV));
+        } else {
+            const int len = N - ts;
+            for (int idx = tidx; idx < kBlockN * kHeadDim; idx += Traits::kNThreads) {
+                int r = idx / kHeadDim, c = idx % kHeadDim;
+                sV(r, c) = (r < len) ? base[r * D + c] : Element(0);
+            }
+        }
+        cp_async_fence();
+    };
+
+    // Loop-invariant MMA/copy descriptors over the dedicated sK/sV buffers.
+    Tensor tSrK = thr_mma.partition_fragment_B(sK);
+    auto smem_copy_K = make_tiled_copy_B(typename Traits::SmemCopyAtom{}, tiled_mma);
+    auto thr_copy_K  = smem_copy_K.get_thread_slice(tidx);
+    Tensor tCsK = thr_copy_K.partition_S(sK);
+    auto tCrK_view = thr_copy_K.retile_D(tSrK);
+
+    Tensor sVt = make_tensor(sV.data(), typename Traits::SmemLayoutKVtransposed{});
+    Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
+    Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);
+    auto smem_copy_V = make_tiled_copy_B(typename Traits::SmemCopyAtomTransposed{}, tiled_mma);
+    auto thr_copy_V  = smem_copy_V.get_thread_slice(tidx);
+    Tensor tCsVt = thr_copy_V.partition_S(sVt);
+
+    // Tile loop over this split's slice; same pipelined/fallback scheme as
+    // kernel3_fused_tc (V load overlaps GEMM1, K(tile+1) load overlaps
+    // softmax + GEMM2 when pipelined; synchronous in-loop loads otherwise).
+    if constexpr (kPipelined) {
+        load_k_tile(tile_begin);  // prologue
+    }
+
     for (int tile = tile_begin; tile < tile_stop; tile++) {
         const int tile_start = tile * kBlockN;
         const int tile_end = min(tile_start + kBlockN, N);
-        const bool is_full_tile = (tile_end - tile_start) == kBlockN;
 
-        for (int idx = tidx; idx < Traits::kSmemKVElems; idx += Traits::kNThreads)
-            sKV_ptr[idx] = Element(0);
-        __syncthreads();
-
-        if (is_full_tile) {
-            Tensor gK = make_tensor(
-                make_gmem_ptr(k_ptr + bh * N * D + tile_start * D),
-                Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-            cute::copy(gmem_tiled_copy, gmem_thr.partition_S(gK), gmem_thr.partition_D(sKV));
-            cp_async_fence();
+        if constexpr (kPipelined) {
             cp_async_wait<0>();
+            __syncthreads();      // K(tile) visible; sV free to overwrite
+            load_v_tile(tile);    // in flight underneath GEMM1
         } else {
-            const Element* k_base = k_ptr + bh * N * D + tile_start * D;
-            int tile_len = tile_end - tile_start;
-            for (int idx = tidx; idx < tile_len * kHeadDim; idx += Traits::kNThreads) {
-                int r = idx / kHeadDim, c = idx % kHeadDim;
-                if (c < D) sKV(r, c) = k_base[r * D + c];
-            }
+            __syncthreads();      // all warps past the previous tile's gemm_rs
+            load_k_tile(tile);
+            cp_async_wait<0>();
+            __syncthreads();      // K(tile) visible
         }
-        __syncthreads();
 
-        Tensor tSrK = thr_mma.partition_fragment_B(sKV);
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
         clear(acc_s);
-        auto smem_copy_K = make_tiled_copy_B(typename Traits::SmemCopyAtom{}, tiled_mma);
-        auto thr_copy_K  = smem_copy_K.get_thread_slice(tidx);
-        Tensor tCsK = thr_copy_K.partition_S(sKV);
-        {
-            auto tCrK_view = thr_copy_K.retile_D(tSrK);
-            #pragma unroll
-            for (int ki = 0; ki < size<2>(tSrQ); ++ki) {
-                cute::copy(smem_copy_K, tCsK(_, _, ki), tCrK_view(_, _, ki));
-                cute::gemm(tiled_mma, tSrQ(_, _, ki), tSrK(_, _, ki), acc_s);
-            }
+        #pragma unroll
+        for (int ki = 0; ki < size<2>(tSrQ); ++ki) {
+            cute::copy(smem_copy_K, tCsK(_, _, ki), tCrK_view(_, _, ki));
+            cute::gemm(tiled_mma, tSrQ(_, _, ki), tSrK(_, _, ki), acc_s);
         }
 
-        int valid_cols = is_full_tile ? kBlockN : (tile_end - tile_start);
+        int valid_cols = tile_end - tile_start;
         #pragma unroll
         for (int i = 0; i < size(acc_s); i++)
             if (get<1>(tScS(i)) >= valid_cols) acc_s(i) = fp32_neg_inf();
         #pragma unroll
         for (int i = 0; i < size(acc_s); i++)
             if (get<0>(tScS(i)) >= m) acc_s(i) = fp32_neg_inf();
+
+        if constexpr (kPipelined) {
+            cp_async_wait<0>();
+            __syncthreads();      // V(tile) visible; all warps done reading sK
+            if (tile + 1 < tile_stop) load_k_tile(tile + 1);  // hides under softmax + GEMM2
+        } else {
+            __syncthreads();      // all warps done reading sK in GEMM1
+            load_v_tile(tile);
+            cp_async_wait<0>();
+            __syncthreads();      // V(tile) visible
+        }
 
         Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
         Tensor tile_max = make_tensor<float>(Shape<Int<nrow>>{});
@@ -674,41 +755,11 @@ kernel3_partial_tc(
         Tensor tOrP = make_tensor(rP.data(),
             convert_layout_acc_Aregs<typename Traits::TiledMma>(rP.layout()));
 
-        __syncthreads();
-        for (int idx = tidx; idx < Traits::kSmemKVElems; idx += Traits::kNThreads)
-            sKV_ptr[idx] = Element(0);
-        __syncthreads();
-        if (is_full_tile) {
-            Tensor gV = make_tensor(
-                make_gmem_ptr(v_ptr + bh * N * D + tile_start * D),
-                Shape<Int<kBlockN>, Int<kHeadDim>>{}, Stride<Int<kHeadDim>, _1>{});
-            cute::copy(gmem_tiled_copy, gmem_thr.partition_S(gV), gmem_thr.partition_D(sKV));
-            cp_async_fence();
-            cp_async_wait<0>();
-        } else {
-            const Element* v_base = v_ptr + bh * N * D + tile_start * D;
-            int tile_len = tile_end - tile_start;
-            for (int idx = tidx; idx < tile_len * kHeadDim; idx += Traits::kNThreads) {
-                int r = idx / kHeadDim, c = idx % kHeadDim;
-                if (c < D) sKV(r, c) = v_base[r * D + c];
-            }
-        }
-        __syncthreads();
-
-        Tensor sKVt = make_tensor(sKV.data(), typename Traits::SmemLayoutKVtransposed{});
-        Tensor sKVtNoSwizzle = make_tensor(sKV.data().get(), typename Traits::SmemLayoutKVtransposedNoSwizzle{});
-        Tensor tOrVt = thr_mma.partition_fragment_B(sKVtNoSwizzle);
-        auto smem_copy_V = make_tiled_copy_B(typename Traits::SmemCopyAtomTransposed{}, tiled_mma);
-        auto thr_copy_V  = smem_copy_V.get_thread_slice(tidx);
-        Tensor tCsVt = thr_copy_V.partition_S(sKVt);
         gemm_rs(acc_o, tOrP, tOrVt, tCsVt, tiled_mma, smem_copy_V, thr_copy_V);
 
-        // Barrier before looping back. gemm_rs reads sKV (V) via LDSM; the next
-        // iteration's first act is to zero sKV. Without this sync, under high
-        // occupancy (many concurrent CTAs, warps skewed) a fast warp can zero
-        // sKV while a slow warp is still reading V from it, corrupting the
-        // result intermittently. Cheap insurance (one sync per tile).
-        __syncthreads();
+        // No trailing barrier: the next iteration's cp_async_wait<0>() +
+        // __syncthreads() orders every warp past this gemm_rs before sV is
+        // rewritten, and the epilogue below re-syncs before reusing SMEM.
     }
 
     // Normalize acc_o by this split's row_sum BEFORE storing. The stored
@@ -737,12 +788,12 @@ kernel3_partial_tc(
     // far beyond the single rounding. Keeping partials in FP32 is what makes
     // the split path match the single-CTA path.
     //
-    // Reuse the whole dynamic SMEM block as float scratch (sQ and sKV are dead
-    // after the loop). kSmemBytes == (kSmemQElems + kSmemKVElems) * sizeof(Element)
-    // == m*D floats at the max m=64, D=128, so it fits exactly.
+    // Reuse the whole dynamic SMEM block as float scratch (sQ, sK, and sV are
+    // dead after the loop). kSmemFwdBytes == (kSmemQElems + 2*kSmemKVElems) *
+    // sizeof(Element) >= m*D floats at the max m=64, D=128, so it fits.
     //
     // CRITICAL: barrier before touching this memory. The last loop iteration's
-    // gemm_rs reads sKV (which aliases this float scratch). Without the sync,
+    // gemm_rs reads sV (which aliases this float scratch). Without the sync,
     // threads still finishing that GEMM race against threads zeroing sOf,
     // corrupting the partial output in a timing/shape-dependent way.
     __syncthreads();
@@ -919,19 +970,31 @@ void launch_kernel3_output_fused(
     const int num_tiles = (N + kBlockN - 1) / kBlockN;
     const int num_splits = kernel3_choose_splits(BH, num_tiles);
 
+    // Pipeline the forward only where the extra V buffer does not cost a
+    // resident CTA: __launch_bounds__ targets 3 CTAs/SM, so the pipelined
+    // footprint must fit three times into the SM's shared memory. True on
+    // every part at D=64 (3x24KB) and on A100/H100/B200 at D=128 (3x48KB
+    // <= 164/228KB); false on 100KB/SM parts (sm_86/89, consumer Blackwell)
+    // at D=128, where losing a CTA costs more than the overlap buys.
+    auto pipeline_fits = [&](size_t fwd_bytes) {
+        return 3 * fwd_bytes <= get_smem_per_multiprocessor();
+    };
+
     auto launch_single = [&](auto HeadDimTag) {
         constexpr int kHeadDim = decltype(HeadDimTag)::value;
         using Traits = K3Traits<kHeadDim, scalar_t>;
         dim3 grid(BH);
         dim3 block(Traits::kNThreads);
-        size_t smem = Traits::kSmemBytes;
-        if (smem > 48 * 1024) {
-            FN_CHECK(smem <= get_max_smem_per_block(), "kernel3: insufficient smem");
-            FN_CUDA_CHECK(cudaFuncSetAttribute(kernel3_fused_tc<Traits>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-        }
-        kernel3_fused_tc<Traits><<<grid, block, smem, stream>>>(
-            q_tilde, k, v, kernel2_inv, step2, b_out, softmax3_lse, N, D, m);
+        BOOL_SWITCH(pipeline_fits(Traits::kSmemFwdBytes), kPipelined, [&] {
+            size_t smem = kPipelined ? Traits::kSmemFwdBytes : Traits::kSmemBytes;
+            if (smem > 48 * 1024) {
+                FN_CHECK(smem <= get_max_smem_per_block(), "kernel3: insufficient smem");
+                FN_CUDA_CHECK(cudaFuncSetAttribute((kernel3_fused_tc<Traits, kPipelined>),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+            }
+            kernel3_fused_tc<Traits, kPipelined><<<grid, block, smem, stream>>>(
+                q_tilde, k, v, kernel2_inv, step2, b_out, softmax3_lse, N, D, m);
+        });
     };
 
     auto launch_split = [&](auto HeadDimTag) {
@@ -959,15 +1022,17 @@ void launch_kernel3_output_fused(
         // Phase A: partials.
         dim3 gridA(num_splits, BH);
         dim3 blockA(Traits::kNThreads);
-        size_t smemA = Traits::kSmemBytes;
-        if (smemA > 48 * 1024) {
-            FN_CHECK(smemA <= get_max_smem_per_block(), "kernel3 partial: insufficient smem");
-            FN_CUDA_CHECK(cudaFuncSetAttribute(kernel3_partial_tc<Traits>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemA)));
-        }
-        kernel3_partial_tc<Traits><<<gridA, blockA, smemA, stream>>>(
-            q_tilde, k, v, sc.partial_o, sc.partial_max, sc.partial_sum,
-            N, D, m, num_splits);
+        BOOL_SWITCH(pipeline_fits(Traits::kSmemFwdBytes), kPipelined, [&] {
+            size_t smemA = kPipelined ? Traits::kSmemFwdBytes : Traits::kSmemBytes;
+            if (smemA > 48 * 1024) {
+                FN_CHECK(smemA <= get_max_smem_per_block(), "kernel3 partial: insufficient smem");
+                FN_CUDA_CHECK(cudaFuncSetAttribute((kernel3_partial_tc<Traits, kPipelined>),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemA)));
+            }
+            kernel3_partial_tc<Traits, kPipelined><<<gridA, blockA, smemA, stream>>>(
+                q_tilde, k, v, sc.partial_o, sc.partial_max, sc.partial_sum,
+                N, D, m, num_splits);
+        });
         FN_CUDA_KERNEL_CHECK();
 
         // Phase B: combine.

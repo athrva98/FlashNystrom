@@ -102,6 +102,24 @@ inline size_t get_max_smem_per_block() {
     return cached;
 }
 
+// Total shared memory per multiprocessor (164KB on sm_80, 100KB on sm_86/89
+// and consumer Blackwell, 228KB on sm_90/100). Used by launch-time dispatch
+// to decide whether a larger SMEM footprint would cost resident CTAs (e.g.
+// the pipelined kernel3 forward needs 3 CTAs x kSmemFwdBytes to keep the
+// occupancy that __launch_bounds__(kNThreads, 3) targets). Cached.
+inline size_t get_smem_per_multiprocessor() {
+    static size_t cached = 0;
+    if (cached == 0) {
+        int device = -1;
+        FN_CUDA_CHECK(cudaGetDevice(&device));
+        int val = 0;
+        FN_CUDA_CHECK(cudaDeviceGetAttribute(
+            &val, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device));
+        cached = static_cast<size_t>(val);
+    }
+    return cached;
+}
+
 // SM count for the current device. Used by launch-time dispatch to decide
 // whether a grid is large enough to fill the GPU (e.g. grid(BH) starves a
 // 108-SM A100 when BH is 4). Cached after first query.

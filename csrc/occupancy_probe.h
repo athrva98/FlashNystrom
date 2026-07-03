@@ -171,15 +171,19 @@ inline std::vector<OccupancyRow> probe_all(
             using Tk3 = K3Traits<64, Element>;
             rows.push_back(probe("kernel1_fused_tc<D=64," + tag + ">",
                 kernel1_fused_tc<Tk1>, Tk1::kNThreads, Tk1::kSmemBytes, lim));
-            rows.push_back(probe("kernel3_fused_tc<D=64," + tag + ">",
-                kernel3_fused_tc<Tk3>, Tk3::kNThreads, Tk3::kSmemBytes, lim));
+            rows.push_back(probe("kernel3_fused_tc<D=64,pipe," + tag + ">",
+                kernel3_fused_tc<Tk3, true>, Tk3::kNThreads, Tk3::kSmemFwdBytes, lim));
+            rows.push_back(probe("kernel3_fused_tc<D=64,sync," + tag + ">",
+                kernel3_fused_tc<Tk3, false>, Tk3::kNThreads, Tk3::kSmemBytes, lim));
         } else if (D == 128) {
             using Tk1 = K1Traits<128, Element>;
             using Tk3 = K3Traits<128, Element>;
             rows.push_back(probe("kernel1_fused_tc<D=128," + tag + ">",
                 kernel1_fused_tc<Tk1>, Tk1::kNThreads, Tk1::kSmemBytes, lim));
-            rows.push_back(probe("kernel3_fused_tc<D=128," + tag + ">",
-                kernel3_fused_tc<Tk3>, Tk3::kNThreads, Tk3::kSmemBytes, lim));
+            rows.push_back(probe("kernel3_fused_tc<D=128,pipe," + tag + ">",
+                kernel3_fused_tc<Tk3, true>, Tk3::kNThreads, Tk3::kSmemFwdBytes, lim));
+            rows.push_back(probe("kernel3_fused_tc<D=128,sync," + tag + ">",
+                kernel3_fused_tc<Tk3, false>, Tk3::kNThreads, Tk3::kSmemBytes, lim));
         }
 
         // Backward
