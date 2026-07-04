@@ -28,8 +28,63 @@ namespace flash_nystrom {
 // The backward consistency does NOT require convergence — autograd-through-NS
 // gives correct gradients of the actual approximation regardless.
 
+// One SMEM m x m matmul phase of the NS loop: dst = scale * A @ f(B), where
+// f is an optional on-the-fly diagonal transform (diag_c > 0 selects
+// B'[k,j] = (k==j ? diag_c : 0) - B[k,j], fusing the "cI - X" elementwise
+// phases into the consuming matmul and saving their barriers). Each thread
+// owns kCells consecutive cells of one row: A[row,k] is loaded once per k
+// and broadcast across the cells, and the kCells independent accumulators
+// give the 64-long dependent FMA chains 4-way ILP. The per-cell summation
+// order over k is unchanged from the naive form, so each output cell is
+// bitwise identical to the one-cell-per-thread version.
+__device__ __forceinline__ void ns_matmul_phase(
+    float* __restrict__ dst, const float* __restrict__ A,
+    const float* __restrict__ B, int m, int tid, int nthreads,
+    float diag_c, float scale
+) {
+    constexpr int kCells = 4;
+    const int mm = m * m;
+    for (int base = tid * kCells; base < mm; base += nthreads * kCells) {
+        const int row = base / m;
+        const int col0 = base - row * m;
+        if (col0 + kCells <= m) {   // always taken when kCells divides m
+            float acc[kCells] = {0.f, 0.f, 0.f, 0.f};
+            const float* arow = A + row * m;
+            for (int k = 0; k < m; k++) {
+                const float a = arow[k];
+                // one 16-byte load for the 4 consecutive B cells (base is a
+                // multiple of kCells and m % kCells == 0, so brow is 16B
+                // aligned); the LSU instruction count is what binds this
+                // kernel, not bandwidth.
+                const float4 b4 =
+                    *reinterpret_cast<const float4*>(B + k * m + col0);
+                float bv[kCells] = {b4.x, b4.y, b4.z, b4.w};
+                #pragma unroll
+                for (int c = 0; c < kCells; c++) {
+                    float b = bv[c];
+                    if (diag_c > 0.0f) b = ((k == col0 + c) ? diag_c : 0.0f) - b;
+                    acc[c] += a * b;
+                }
+            }
+            #pragma unroll
+            for (int c = 0; c < kCells; c++) dst[base + c] = scale * acc[c];
+        } else {                    // row-straddling tail for m % kCells != 0
+            for (int cell = base; cell < base + kCells && cell < mm; cell++) {
+                const int r = cell / m, col = cell - r * m;
+                float acc = 0.0f;
+                for (int k = 0; k < m; k++) {
+                    float b = B[k * m + col];
+                    if (diag_c > 0.0f) b = ((k == col) ? diag_c : 0.0f) - b;
+                    acc += A[r * m + k] * b;
+                }
+                dst[cell] = scale * acc;
+            }
+        }
+    }
+}
+
 template <typename scalar_t, bool kSetupOnly = false>
-__global__ void kernel2_inv_kernel(
+__global__ void __launch_bounds__(1024, 1) kernel2_inv_kernel(
     const scalar_t* __restrict__ q_tilde,    // (B*H, m, D)
     const scalar_t* __restrict__ k_tilde,    // (B*H, m, D)
     float* __restrict__ kernel2_inv_out,      // (B*H, m, m) FP32 — final K2_inv = Z_J
@@ -58,44 +113,85 @@ __global__ void kernel2_inv_kernel(
     const scalar_t* qt = q_tilde + bh * m * D;
     const scalar_t* kt = k_tilde + bh * m * D;
 
-    // Step 1: K2_logits = Q_tilde @ K_tilde^T (FP32 accumulation)
-    for (int idx = tid; idx < mm; idx += nthreads) {
-        int i = idx / m;
-        int j = idx % m;
-        float acc = 0.0f;
-        for (int d = 0; d < D; d++) {
-            acc += to_float(qt[i * D + d]) * to_float(kt[j * D + d]);
+    // Step 1: K2_logits = Q_tilde @ K_tilde^T (FP32 accumulation).
+    // Row-blocked (4 consecutive cells share the Q row) with 16-byte input
+    // loads: the element-wise form issued ~1K scalar 2-byte loads per
+    // thread and saturated the LSU pipe (this kernel is load-instruction
+    // bound, 98.8% L1 hit). Per-cell accumulation order over d unchanged.
+    {
+        constexpr int kEpt = 16 / (int)sizeof(scalar_t);  // elems per 16B
+        for (int base = tid * 4; base < mm; base += nthreads * 4) {
+            const int i = base / m;
+            const int col0 = base - i * m;
+            if (col0 + 4 <= m && (D % kEpt) == 0) {
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                for (int d0 = 0; d0 < D; d0 += kEpt) {
+                    scalar_t qv[kEpt], kv[4][kEpt];
+                    *reinterpret_cast<uint4*>(qv) =
+                        *reinterpret_cast<const uint4*>(qt + i * D + d0);
+                    #pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        *reinterpret_cast<uint4*>(kv[c]) =
+                            *reinterpret_cast<const uint4*>(
+                                kt + (col0 + c) * D + d0);
+                    }
+                    #pragma unroll
+                    for (int e = 0; e < kEpt; e++) {
+                        const float qf = to_float(qv[e]);
+                        #pragma unroll
+                        for (int c = 0; c < 4; c++) {
+                            acc[c] += qf * to_float(kv[c][e]);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (int c = 0; c < 4; c++) K2[base + c] = acc[c];
+            } else {
+                for (int cell = base; cell < base + 4 && cell < mm; cell++) {
+                    const int r = cell / m, j = cell - r * m;
+                    float acc = 0.0f;
+                    for (int d = 0; d < D; d++) {
+                        acc += to_float(qt[r * D + d]) * to_float(kt[j * D + d]);
+                    }
+                    K2[cell] = acc;
+                }
+            }
         }
-        K2[idx] = acc;
     }
     __syncthreads();
 
-    // Step 2: Row-wise softmax on K2, save LSE
+    // Step 2: Row-wise softmax on K2, save LSE. One WARP per row: the rows
+    // are independent, so the reductions run as warp shuffles with no block
+    // barriers. The previous block-per-row form serialized m rows behind
+    // ~500 block-wide barriers (2 block_reduces x ~4 __syncthreads each per
+    // row) and was the dominant flat cost of the whole kernel on a B200.
     float* lse_out = softmax_lse_out + bh * m;
+    {
+        const int lane = tid % 32;
+        const int warp = tid / 32;
+        const int nwarps = nthreads / 32;
+        for (int row = warp; row < m; row += nwarps) {
+            float local_max = -FLT_MAX;
+            for (int j = lane; j < m; j += 32) {
+                local_max = fmaxf(local_max, K2[row * m + j]);
+            }
+            float row_max = warp_reduce_max(local_max);
 
-    for (int row = 0; row < m; row++) {
-        float local_max = -FLT_MAX;
-        for (int j = tid; j < m; j += nthreads) {
-            local_max = fmaxf(local_max, K2[row * m + j]);
-        }
-        float row_max = block_reduce_max(local_max, scratch);
+            float local_sum = 0.0f;
+            for (int j = lane; j < m; j += 32) {
+                float val = expf(K2[row * m + j] - row_max);
+                K2[row * m + j] = val;
+                local_sum += val;
+            }
+            float row_sum = warp_reduce_sum(local_sum);
 
-        float local_sum = 0.0f;
-        for (int j = tid; j < m; j += nthreads) {
-            float val = expf(K2[row * m + j] - row_max);
-            K2[row * m + j] = val;
-            local_sum += val;
-        }
-        float row_sum = block_reduce_sum(local_sum, scratch);
-
-        float inv_sum = 1.0f / (row_sum + 1e-12f);
-        for (int j = tid; j < m; j += nthreads) {
-            K2[row * m + j] *= inv_sum;
-        }
-        __syncthreads();
-
-        if (tid == 0) {
-            lse_out[row] = row_max + logf(row_sum + 1e-12f);
+            float inv_sum = 1.0f / (row_sum + 1e-12f);
+            for (int j = lane; j < m; j += 32) {
+                K2[row * m + j] *= inv_sum;
+            }
+            if (lane == 0) {
+                lse_out[row] = row_max + logf(row_sum + 1e-12f);
+            }
         }
     }
     __syncthreads();
@@ -203,68 +299,31 @@ __global__ void kernel2_inv_kernel(
     // Step 4: Newton-Schulz iterations (third order Higham)
     // Z_{j+1} = 0.25 * Z_j * (13I - K2*Z_j * (15I - K2*Z_j * (7I - K2*Z_j)))
     //
+    // Each iteration is four ns_matmul_phase calls with the "cI - X"
+    // elementwise transforms fused into the consuming matmul's B operand
+    // (same fp32 values, three fewer barriers) and Z advanced by pointer
+    // swap instead of a Zold copy. Buffers rotate through the same four
+    // SMEM slots the naive form used. Per-cell sums are bitwise identical
+    // to the naive form; only phase count and thread-to-cell mapping differ.
+    //
     // Save each iterate Z_{j+1} to GMEM (index j+1).
+    {
+    float* W = Zold;
     for (int iter = 0; iter < newton_iter; iter++) {
-        // Save Zold = Z (we'll need it for the final 0.25 * Z * (...) multiply)
-        for (int idx = tid; idx < mm; idx += nthreads) Zold[idx] = Z[idx];
+        // T1 = M = K2 @ Z_j
+        ns_matmul_phase(T1, K2, Z, m, tid, nthreads, 0.0f, 1.0f);
         __syncthreads();
-
-        // T1 = K2 @ Zold = M
-        for (int idx = tid; idx < mm; idx += nthreads) {
-            int row = idx / m, col = idx % m;
-            float acc = 0.0f;
-            for (int kk = 0; kk < m; kk++) acc += K2[row * m + kk] * Zold[kk * m + col];
-            T1[idx] = acc;
-        }
+        // T2 = M @ (7I - M)
+        ns_matmul_phase(T2, T1, T1, m, tid, nthreads, 7.0f, 1.0f);
         __syncthreads();
-
-        // T2 = 7I - M
-        for (int idx = tid; idx < mm; idx += nthreads) {
-            int row = idx / m, col = idx % m;
-            T2[idx] = ((row == col) ? 7.0f : 0.0f) - T1[idx];
-        }
+        // W = M @ (15I - T2)
+        ns_matmul_phase(W, T1, T2, m, tid, nthreads, 15.0f, 1.0f);
         __syncthreads();
-
-        // Z = M @ T2 = M*(7I - M)
-        for (int idx = tid; idx < mm; idx += nthreads) {
-            int row = idx / m, col = idx % m;
-            float acc = 0.0f;
-            for (int kk = 0; kk < m; kk++) acc += T1[row * m + kk] * T2[kk * m + col];
-            Z[idx] = acc;
-        }
+        // T2 = 0.25 * Z_j @ (13I - W)   (Z_j still intact; no Zold copy)
+        ns_matmul_phase(T2, Z, W, m, tid, nthreads, 13.0f, 0.25f);
         __syncthreads();
-
-        // T2 = 15I - Z = 15I - M*(7I - M)
-        for (int idx = tid; idx < mm; idx += nthreads) {
-            int row = idx / m, col = idx % m;
-            T2[idx] = ((row == col) ? 15.0f : 0.0f) - Z[idx];
-        }
-        __syncthreads();
-
-        // Z = M @ T2 = M*(15I - M*(7I - M))
-        for (int idx = tid; idx < mm; idx += nthreads) {
-            int row = idx / m, col = idx % m;
-            float acc = 0.0f;
-            for (int kk = 0; kk < m; kk++) acc += T1[row * m + kk] * T2[kk * m + col];
-            Z[idx] = acc;
-        }
-        __syncthreads();
-
-        // T2 = 13I - Z = 13I - M*(15I - M*(7I - M))
-        for (int idx = tid; idx < mm; idx += nthreads) {
-            int row = idx / m, col = idx % m;
-            T2[idx] = ((row == col) ? 13.0f : 0.0f) - Z[idx];
-        }
-        __syncthreads();
-
-        // Z = 0.25 * Zold @ T2 = (1/4) * Z_old * (13I - M*(15I - M*(7I - M)))
-        for (int idx = tid; idx < mm; idx += nthreads) {
-            int row = idx / m, col = idx % m;
-            float acc = 0.0f;
-            for (int kk = 0; kk < m; kk++) acc += Zold[row * m + kk] * T2[kk * m + col];
-            Z[idx] = 0.25f * acc;
-        }
-        __syncthreads();
+        // advance the iterate by pointer swap (uniform across the block)
+        float* t = Z; Z = T2; T2 = t;
 
         // Save Z_{iter+1} to GMEM (index iter+1)
         if (ns_iterates_out != nullptr) {
@@ -272,6 +331,7 @@ __global__ void kernel2_inv_kernel(
             for (int idx = tid; idx < mm; idx += nthreads) iter_out[idx] = Z[idx];
             __syncthreads();
         }
+    }
     }
 
     // Step 5: Write final K2_inv for kernel3.
@@ -308,9 +368,18 @@ void launch_kernel2_inv(
     FN_CHECK(m > 0 && m <= kMaxLandmarks, "launch_kernel2_inv: m out of range");
 
     dim3 grid(BH);
-    dim3 block(256);
+    // 1024 threads: the NS matmuls give each thread mm/blockDim serial
+    // 64-long dot products; at 256 threads the kernel ran 8 warps/SM (96KB
+    // smem -> 1 CTA/SM) and was latency-bound at a flat ~0.86 ms on a B200,
+    // 62% of the high-BH forward at N=4096. 1024 threads quarter the
+    // per-thread chain and quadruple the warps available to hide smem
+    // latency. Per-cell dot-product order is unchanged (same fp32 results
+    // cell-by-cell); only the block-reduce tree shape differs (~1 ulp on
+    // the softmax row sums and norm scalars).
+    dim3 block(1024);
 
-    size_t smem_bytes = (5 * m * m + 8) * sizeof(float);
+    // scratch: blockDim/32 floats for the block reductions
+    size_t smem_bytes = (5 * m * m + 32) * sizeof(float);
 
     size_t max_smem = get_max_smem_per_block();
     if (smem_bytes > 48 * 1024) {
@@ -341,8 +410,8 @@ void launch_kernel2_inv_setup(
     int BH, int D, int m, int newton_iter, cudaStream_t stream, float kappa_star
 ) {
     FN_CHECK(m > 0 && m <= kMaxLandmarks, "launch_kernel2_inv_setup: m out of range");
-    dim3 grid(BH), block(256);
-    size_t smem_bytes = (5 * m * m + 8) * sizeof(float);
+    dim3 grid(BH), block(1024);   // see launch_kernel2_inv
+    size_t smem_bytes = (5 * m * m + 32) * sizeof(float);
     if (smem_bytes > 48 * 1024) {
         FN_CHECK(smem_bytes <= get_max_smem_per_block(),
                  "kernel2_inv_setup: m too large for available shared memory");

@@ -562,6 +562,48 @@ def bench_point_b200():
 
 
 @app.function(gpu="B200", timeout=3600)
+def bench_fwd_profile_b200():
+    """Per-kernel FORWARD profile at the high-BH sweep shapes (sm80 path).
+
+    The high-BH forward is the one remaining sub-1.0 metric on B200
+    (0.64-0.99x vs cuBLAS); this shows which forward kernel to port first.
+    """
+    import os
+    import subprocess
+    script = r"""
+import torch, sys
+from flash_nystrom import flash_nystrom_attention
+B, H, N, D, m = (int(x) for x in sys.argv[1:6])
+q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k = torch.randn_like(q)
+v = torch.randn_like(q)
+with torch.no_grad():
+    for _ in range(8):
+        out = flash_nystrom_attention(q, k, v, num_landmarks=m)
+torch.cuda.synchronize()
+"""
+    shapes = [
+        (4, 16, 4096, 128, 64),     # fwd 0.64x row
+        (4, 16, 16384, 128, 64),    # fwd 0.76x row
+        (4, 16, 131072, 128, 64),   # fwd 0.99x row
+    ]
+    env = dict(os.environ, FLASH_NYSTROM_PROFILE="1")
+    for shape in shapes:
+        r = subprocess.run(
+            ["python", "-c", script] + [str(x) for x in shape],
+            env=env, capture_output=True, text=True, cwd="/root/FlashNystrom")
+        out = (r.stdout + r.stderr).splitlines()
+        idxs = [i for i, l in enumerate(out) if "forward (FP16" in l]
+        print(f"=== B,H,N,D,m = {shape} (rc={r.returncode}) ===")
+        if idxs:
+            for l in out[idxs[-1]:idxs[-1] + 9]:
+                print(l)
+        else:
+            for l in out[-8:]:
+                print(l)
+
+
+@app.function(gpu="B200", timeout=3600)
 def bench_bwd_profile_b200():
     """Full per-kernel backward profile at the gap-sweep shapes (sm80 path).
 
