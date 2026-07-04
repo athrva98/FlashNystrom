@@ -174,4 +174,18 @@ void reset_kernel3_caches();
 // flash_nystrom_kernels.cu.
 void reset_k2inv_tc_caches();
 
+// Blackwell-native kernel3_bwd hook. The sm_100a kernels live in the separate
+// flash_nystrom._C_sm100 extension (this module is multi-arch and cannot carry
+// tcgen05 code); at import time the Python package passes the sm100 launcher's
+// address to _register_sm100_kernel3_bwd, and launch_kernel3_bwd tries it
+// before the sm80 path. The hook returns false when it cannot handle the
+// shape (m != 64, N % 128 != 0, D not in {64, 128}) and the caller falls
+// back. FP16 tensors only; dV/dK/dQ_tilde must be zero-initialized.
+using Kernel3BwdSm100Fn = bool (*)(
+    const void* q_tilde, const void* k_s, const void* v,
+    const float* lse3, const float* d3, const void* do3,
+    void* dV, void* dK_s, float* dQ_tilde,
+    int BH, int N, int D, int m, cudaStream_t stream);
+extern Kernel3BwdSm100Fn g_kernel3_bwd_sm100_hook;
+
 } // namespace flash_nystrom

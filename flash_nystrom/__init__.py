@@ -44,3 +44,16 @@ except ImportError:
         UserWarning,
         stacklevel=1,
     )
+else:
+    # Blackwell-native kernels live in a separate sm_100a-only extension
+    # (the main module is multi-arch and cannot carry tcgen05 code). On a
+    # Blackwell datacenter GPU, hand its raw launcher to the main module;
+    # launch_kernel3_bwd tries it before the sm80 path and falls back for
+    # unsupported shapes. FLASH_NYSTROM_SM100=0 disables at kernel level.
+    try:
+        import flash_nystrom._C_sm100 as _C_sm100
+        if _C_sm100.available():
+            flash_nystrom._C._register_sm100_kernel3_bwd(
+                _C_sm100._kernel3_bwd_hook_ptr())
+    except ImportError:
+        pass

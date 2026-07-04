@@ -409,4 +409,57 @@ kernel3_bwd_sm100_kernel(
     }
 }
 
+// Raw-pointer launcher shared by the pybind test entry and the main-module
+// hook. Returns false (without launching) for shapes v1 cannot handle so the
+// caller falls back to the sm80 path. dV/dK are fully overwritten for every
+// covered row; dQ_tilde is accumulated with atomicAdd (caller zero-inits).
+template <int kHeadDim>
+inline void launch_kernel3_bwd_sm100_impl(
+    const void* q_tilde, const void* k_s, const void* v,
+    const float* lse3, const float* d3, const void* do3,
+    void* dV, void* dK_s, float* dQ_tilde,
+    int BH, int N, cudaStream_t stream
+) {
+    using Traits = K3BwdSm100Traits<kHeadDim>;
+    using Element = typename Traits::Element;
+    constexpr size_t smem = sizeof(typename Traits::SharedStorage);
+    auto* kernel = kernel3_bwd_sm100_kernel<Traits>;
+    static const bool smem_set = [kernel] {
+        if (smem > 48 * 1024) {
+            cudaFuncSetAttribute(kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(smem));
+        }
+        return true;
+    }();
+    (void)smem_set;
+    dim3 grid((unsigned)(N / Traits::kTileK), (unsigned)BH);
+    kernel<<<grid, Traits::kNumThreads, smem, stream>>>(
+        static_cast<const Element*>(q_tilde),
+        static_cast<const Element*>(k_s),
+        static_cast<const Element*>(v),
+        lse3, d3,
+        static_cast<const Element*>(do3),
+        static_cast<Element*>(dV),
+        static_cast<Element*>(dK_s),
+        dQ_tilde, N);
+}
+
+inline bool kernel3_bwd_sm100_try_launch(
+    const void* q_tilde, const void* k_s, const void* v,
+    const float* lse3, const float* d3, const void* do3,
+    void* dV, void* dK_s, float* dQ_tilde,
+    int BH, int N, int D, int m, cudaStream_t stream
+) {
+    if (m != 64 || N % 128 != 0 || !(D == 64 || D == 128)) return false;
+    if (D == 64) {
+        launch_kernel3_bwd_sm100_impl<64>(q_tilde, k_s, v, lse3, d3, do3,
+                                          dV, dK_s, dQ_tilde, BH, N, stream);
+    } else {
+        launch_kernel3_bwd_sm100_impl<128>(q_tilde, k_s, v, lse3, d3, do3,
+                                           dV, dK_s, dQ_tilde, BH, N, stream);
+    }
+    return true;
+}
+
 }  // namespace flash_nystrom_sm100

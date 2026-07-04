@@ -539,25 +539,14 @@ std::vector<torch::Tensor> run_kernel3_bwd(
     auto dqt = torch::zeros({BH, 64, (int64_t)kHeadDim},
                             qt.options().dtype(torch::kFloat32));
 
-    constexpr size_t smem = sizeof(typename Traits::SharedStorage);
-    auto* kernel = kernel3_bwd_sm100_kernel<Traits>;
-    if (smem > 48 * 1024) {
-        cudaFuncSetAttribute(kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(smem));
-    }
-    dim3 grid((unsigned)(N / Traits::kTileK), (unsigned)BH);
-    kernel<<<grid, Traits::kNumThreads, smem, stream>>>(
-        reinterpret_cast<const typename Traits::Element*>(qt.data_ptr()),
-        reinterpret_cast<const typename Traits::Element*>(k.data_ptr()),
-        reinterpret_cast<const typename Traits::Element*>(v.data_ptr()),
+    launch_kernel3_bwd_sm100_impl<kHeadDim>(
+        qt.data_ptr(), k.data_ptr(), v.data_ptr(),
         static_cast<const float*>(lse3.data_ptr()),
         static_cast<const float*>(d3.data_ptr()),
-        reinterpret_cast<const typename Traits::Element*>(do3.data_ptr()),
-        reinterpret_cast<typename Traits::Element*>(dv.data_ptr()),
-        reinterpret_cast<typename Traits::Element*>(dk.data_ptr()),
+        do3.data_ptr(),
+        dv.data_ptr(), dk.data_ptr(),
         static_cast<float*>(dqt.data_ptr()),
-        (int)N);
+        (int)BH, (int)N, stream);
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess,
                 "kernel3_bwd_sm100 launch failed: ", cudaGetErrorString(err));
@@ -617,6 +606,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "CP-B2 shape smoke: C2[128xD] = P @ E and C3[64xD] = P^T @ K via "
           "MN-major union views + M=64 TMEM_LOAD",
           py::arg("p"), py::arg("e"), py::arg("k"));
+    m.def("_kernel3_bwd_hook_ptr", []() {
+              return reinterpret_cast<uintptr_t>(
+                  &flash_nystrom_sm100::kernel3_bwd_sm100_try_launch);
+          },
+          "Internal: address of the raw kernel3_bwd launcher, passed to "
+          "flash_nystrom._C._register_sm100_kernel3_bwd by the package "
+          "__init__.");
     m.def("kernel3_bwd", &flash_nystrom_sm100::kernel3_bwd,
           "Blackwell-native kernel3 backward (v1: m=64, N%128==0): "
           "returns (dV, dK_s, dQ_tilde)",

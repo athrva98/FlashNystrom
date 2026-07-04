@@ -5,6 +5,7 @@
 #pragma once
 #include "utils.h"
 #include "nystrom_utils.h"
+#include "flash_nystrom.h"   // g_kernel3_bwd_sm100_hook
 #include "kernels/kernel3_output_fused.cuh"
 
 #include <cute/tensor.hpp>
@@ -659,6 +660,25 @@ void launch_kernel3_bwd(
         // FP16/BF16: tensor core, multi-CTA
         FN_CHECK(D == 64 || D == 128, "kernel3_bwd: D must be 64 or 128");
         FN_CHECK(dO3 != nullptr, "kernel3_bwd TC requires precomputed dO3");
+
+        // Blackwell-native path (fp16 only). The hook is registered by the
+        // sm100 extension at import time on sm_100 devices and validates the
+        // shape itself (m == 64, N % 128 == 0), returning false to fall
+        // back. It writes dV/dK directly and atomicAdds dQ_tilde, so the
+        // split+reduce below is skipped. FLASH_NYSTROM_SM100=0 disables.
+        if constexpr (std::is_same_v<scalar_t, cutlass::half_t>) {
+            static const bool sm100_enabled = [] {
+                const char* env = std::getenv("FLASH_NYSTROM_SM100");
+                return env == nullptr || env[0] != '0';
+            }();
+            if (sm100_enabled && g_kernel3_bwd_sm100_hook != nullptr &&
+                g_kernel3_bwd_sm100_hook(q_tilde, k_s, v, lse3, D3, dO3,
+                                         dV, dK_s, dQ_tilde,
+                                         BH, N, D, m, stream)) {
+                FN_CUDA_KERNEL_CHECK();
+                return;
+            }
+        }
         const bool use_split_k = (dQ_tilde_split != nullptr && num_splits > 0);
         float* dqt_target = use_split_k ? dQ_tilde_split : dQ_tilde;
         int    eff_num_splits = use_split_k ? num_splits : 0;

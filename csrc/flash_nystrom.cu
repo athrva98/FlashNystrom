@@ -27,6 +27,10 @@
 
 namespace flash_nystrom {
 
+// Registered at import time by flash_nystrom/__init__.py when the sm100
+// extension is present and the device is Blackwell (see flash_nystrom.h).
+Kernel3BwdSm100Fn g_kernel3_bwd_sm100_hook = nullptr;
+
 std::vector<torch::Tensor> nystrom_fwd(
     torch::Tensor q,
     torch::Tensor k,
@@ -655,6 +659,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q_tilde"), py::arg("k_tilde"), py::arg("K2_softmax"),
           py::arg("ns_iterates"), py::arg("dK2_inv_in"), py::arg("newton_iter"),
           py::arg("kappa_star") = 0.0);
+    m.def("_register_sm100_kernel3_bwd", [](uintptr_t fn_addr) {
+              flash_nystrom::g_kernel3_bwd_sm100_hook =
+                  reinterpret_cast<flash_nystrom::Kernel3BwdSm100Fn>(fn_addr);
+          },
+          "Internal: register the Blackwell-native kernel3_bwd launcher from "
+          "flash_nystrom._C_sm100 (called by the package __init__).",
+          py::arg("fn_addr"));
     m.def("reset_caches", []() {
               flash_nystrom::reset_ns_bwd_caches();
               flash_nystrom::reset_kernel3_caches();
