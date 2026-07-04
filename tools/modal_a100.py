@@ -410,6 +410,52 @@ def bench_gaps_h200():
     _run_bench_gaps()
 
 
+@app.function(gpu="B200", timeout=3600)
+def bench_bwd_profile_b200():
+    """Full per-kernel backward profile at the gap-sweep shapes (sm80 path).
+
+    Shows which backward kernels dominate the rows where FN loses to cuBLAS
+    on B200, to direct the Blackwell-native porting order.
+    """
+    import os
+    import subprocess
+    script = r"""
+import torch, sys
+from flash_nystrom import flash_nystrom_attention
+B, H, N, D, m = (int(x) for x in sys.argv[1:6])
+q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True)
+k = torch.randn_like(q).requires_grad_(True)
+v = torch.randn_like(q).requires_grad_(True)
+do = torch.randn_like(q)
+for _ in range(8):
+    out = flash_nystrom_attention(q, k, v, num_landmarks=m)
+    out.backward(do)
+    q.grad = k.grad = v.grad = None
+torch.cuda.synchronize()
+"""
+    shapes = [
+        (4, 16, 16384, 128, 64),    # high-BH row (tot 0.72x)
+        (1, 4, 524288, 64, 32),     # long-context row (tot 0.55x)
+        (1, 4, 2097152, 64, 32),    # longest row (tot 0.78x)
+    ]
+    env = dict(os.environ, FLASH_NYSTROM_PROFILE="1")
+    for shape in shapes:
+        r = subprocess.run(
+            ["python", "-c", script] + [str(x) for x in shape],
+            env=env, capture_output=True, text=True, cwd="/root/FlashNystrom")
+        out = (r.stdout + r.stderr).splitlines()
+        # print the LAST backward profile block (steady state)
+        idxs = [i for i, l in enumerate(out) if "backward (FP16" in l]
+        print(f"=== B,H,N,D,m = {shape} (rc={r.returncode}) ===")
+        if idxs:
+            i = idxs[-1]
+            for l in out[i:i + 12]:
+                print(l)
+        else:
+            for l in out[-8:]:
+                print(l)
+
+
 @app.function(gpu="B200", timeout=5400)
 def bench_gaps_b200():
     """Extended high-BH + long-context sweep on a B200 (sm_100, Blackwell)."""
