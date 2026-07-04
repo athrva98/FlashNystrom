@@ -49,7 +49,8 @@ else:
     # (the main module is multi-arch and cannot carry tcgen05 code). On a
     # Blackwell datacenter GPU, hand its raw launcher to the main module;
     # launch_kernel3_bwd tries it before the sm80 path and falls back for
-    # unsupported shapes. FLASH_NYSTROM_SM100=0 disables at kernel level.
+    # unsupported shapes. Currently OPT-IN via FLASH_NYSTROM_SM100=1 (the
+    # v1 kernel does not beat the sm80 path yet; see kernel3_bwd.cuh).
     try:
         import flash_nystrom._C_sm100 as _C_sm100
         if _C_sm100.available():

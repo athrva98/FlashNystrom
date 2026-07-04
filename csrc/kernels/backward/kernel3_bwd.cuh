@@ -665,11 +665,16 @@ void launch_kernel3_bwd(
         // sm100 extension at import time on sm_100 devices and validates the
         // shape itself (m == 64, N % 128 == 0), returning false to fall
         // back. It writes dV/dK directly and atomicAdds dQ_tilde, so the
-        // split+reduce below is skipped. FLASH_NYSTROM_SM100=0 disables.
+        // split+reduce below is skipped.
+        //
+        // OPT-IN (FLASH_NYSTROM_SM100=1) until it beats the sm80 path: the
+        // v1 kernel measured 6.49 ms vs 1.37 ms sm80 on a B200 at BH=64,
+        // N=16384, D=128 (bench_k3bwd_ab_b200). Flip the default once the
+        // TMA + TS + occupancy work lands and the A/B favors it.
         if constexpr (std::is_same_v<scalar_t, cutlass::half_t>) {
             static const bool sm100_enabled = [] {
                 const char* env = std::getenv("FLASH_NYSTROM_SM100");
-                return env == nullptr || env[0] != '0';
+                return env != nullptr && env[0] == '1';
             }();
             if (sm100_enabled && g_kernel3_bwd_sm100_hook != nullptr &&
                 g_kernel3_bwd_sm100_hook(q_tilde, k_s, v, lse3, D3, dO3,

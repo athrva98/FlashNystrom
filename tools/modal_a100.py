@@ -472,6 +472,49 @@ def smoke_sm100():
     print("sm100 smoke PASSED")
 
 
+@app.function(gpu="B200", timeout=3600)
+def bench_k3bwd_ab_b200():
+    """A/B the sm100 kernel3_bwd hook vs the sm80 path (per-kernel profile).
+
+    FLASH_NYSTROM_SM100 is latched once per process, so each arm runs in a
+    subprocess with FLASH_NYSTROM_PROFILE=1 and we surface the kernel3_bwd
+    profile line plus the backward wall time.
+    """
+    import os
+    import subprocess
+    script = r"""
+import torch, time
+from flash_nystrom import flash_nystrom_attention
+B, H, N, D, m = 4, 16, 16384, 128, 64
+q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True)
+k = torch.randn_like(q).requires_grad_(True)
+v = torch.randn_like(q).requires_grad_(True)
+do = torch.randn_like(q)
+for _ in range(5):
+    out = flash_nystrom_attention(q, k, v, num_landmarks=m)
+    out.backward(do)
+    q.grad = k.grad = v.grad = None
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+for _ in range(20):
+    out = flash_nystrom_attention(q, k, v, num_landmarks=m)
+    out.backward(do)
+    q.grad = k.grad = v.grad = None
+torch.cuda.synchronize()
+print(f"fwd+bwd wall: {(time.perf_counter()-t0)/20*1000:.3f} ms")
+"""
+    for arm in ("0", "1"):
+        env = dict(os.environ, FLASH_NYSTROM_SM100=arm, FLASH_NYSTROM_PROFILE="1")
+        r = subprocess.run(["python", "-c", script], env=env,
+                           capture_output=True, text=True, cwd="/root/FlashNystrom")
+        lines = [l for l in (r.stdout + r.stderr).splitlines()
+                 if "kernel3_bwd" in l or "wall" in l or "backward" in l]
+        print(f"--- FLASH_NYSTROM_SM100={arm} (rc={r.returncode}) ---")
+        # keep only the last profile block (steady state)
+        for l in lines[-12:]:
+            print(l)
+
+
 @app.function(gpu="B200", timeout=5400)
 def bench_gaps_b200():
     """Extended high-BH + long-context sweep on a B200 (sm_100, Blackwell)."""
