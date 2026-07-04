@@ -410,6 +410,31 @@ def bench_gaps_h200():
     _run_bench_gaps()
 
 
+@app.function(gpu="A100", timeout=5400)
+def scaling_a100():
+    """Training-throughput scaling sweep on A100 (profile_scaling.py).
+
+    Source data for the paper's throughput-crossover figure: K tokens/s
+    (fwd+bwd, largest batch that fits per backend) versus N for SDPA,
+    FlashNystrom, and the cuBLAS Nystrom reference. Prints the JSON so the
+    caller can regenerate the figure locally.
+    """
+    import subprocess
+    r = subprocess.run(
+        ["python", "benchmarks/profile_scaling.py",
+         "--backends", "sdpa", "flash_nystrom", "nystrom_reference",
+         "--Ns", "256", "512", "1024", "2048", "4096", "8192", "16384",
+         "--json", "/tmp/scaling.json"],
+        capture_output=True, text=True, cwd="/root/FlashNystrom")
+    print(r.stdout[-4000:])
+    if r.returncode != 0:
+        print(r.stderr[-4000:])
+        raise RuntimeError("profile_scaling failed")
+    print("===SCALING_JSON_BEGIN===")
+    print(open("/tmp/scaling.json").read())
+    print("===SCALING_JSON_END===")
+
+
 @app.function(gpu="B200", timeout=3600)
 def bench_bwd_profile_b200():
     """Full per-kernel backward profile at the gap-sweep shapes (sm80 path).
