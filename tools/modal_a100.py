@@ -562,6 +562,37 @@ def bench_point_b200():
 
 
 @app.function(gpu="B200", timeout=3600)
+def bench_k3_splits_b200():
+    """Sweep FLASH_NYSTROM_KERNEL3_SPLITS at the high-BH fwd-losing shapes."""
+    import os
+    import subprocess
+    script = r"""
+import torch, sys
+from flash_nystrom import flash_nystrom_attention
+B, H, N, D, m = (int(x) for x in sys.argv[1:6])
+q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+k, v = torch.randn_like(q), torch.randn_like(q)
+with torch.no_grad():
+    for _ in range(8):
+        flash_nystrom_attention(q, k, v, num_landmarks=m)
+torch.cuda.synchronize()
+"""
+    for shape in [(4, 16, 4096, 128, 64), (4, 16, 16384, 128, 64)]:
+        for sp in ("auto", "1", "2", "4", "8", "16"):
+            env = dict(os.environ, FLASH_NYSTROM_PROFILE="1")
+            if sp != "auto":
+                env["FLASH_NYSTROM_KERNEL3_SPLITS"] = sp
+            r = subprocess.run(
+                ["python", "-c", script] + [str(x) for x in shape],
+                env=env, capture_output=True, text=True,
+                cwd="/root/FlashNystrom")
+            out = (r.stdout + r.stderr).splitlines()
+            k3 = [l for l in out if "kernel3_output_fused" in l]
+            val = k3[-1].split()[-2] if k3 else "?"
+            print(f"shape={shape} splits={sp:>4}: kernel3 {val} ms (rc={r.returncode})")
+
+
+@app.function(gpu="B200", timeout=3600)
 def bench_fwd_profile_b200():
     """Per-kernel FORWARD profile at the high-BH sweep shapes (sm80 path).
 
