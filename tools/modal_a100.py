@@ -435,6 +435,27 @@ def scaling_a100():
     print("===SCALING_JSON_END===")
 
 
+@app.function(gpu="B200", timeout=1800)
+def bench_point_b200():
+    """One fwd+bwd latency point on B200: B=1, H=4, N=16384, D=64, m=32."""
+    import torch, time
+    from flash_nystrom import flash_nystrom_attention
+    B, H, N, D, m = 1, 4, 16384, 64, 32
+    q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn_like(q).requires_grad_(True)
+    v = torch.randn_like(q).requires_grad_(True)
+    do = torch.randn_like(q)
+    for _ in range(10):
+        out = flash_nystrom_attention(q, k, v, num_landmarks=m)
+        out.backward(do); q.grad = k.grad = v.grad = None
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    for _ in range(50):
+        out = flash_nystrom_attention(q, k, v, num_landmarks=m)
+        out.backward(do); q.grad = k.grad = v.grad = None
+    torch.cuda.synchronize()
+    print(f"POINT fwd+bwd: {(time.perf_counter()-t0)/50*1000:.3f} ms")
+
+
 @app.function(gpu="B200", timeout=3600)
 def bench_bwd_profile_b200():
     """Full per-kernel backward profile at the gap-sweep shapes (sm80 path).
