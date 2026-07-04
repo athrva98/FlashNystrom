@@ -20,6 +20,13 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
 
+# cs.toronto.edu throttles CIFAR-10 downloads to ~10 kB/s (hours for 170 MB).
+# The PyTorch CI mirror serves the identical tarball (same md5) at full speed.
+# torchvision verifies the md5 of an existing tarball before downloading, so a
+# pre-placed or cached file always skips the download entirely.
+torchvision.datasets.CIFAR10.url = (
+    "https://ossci-datasets.s3.amazonaws.com/cifar-10-python.tar.gz")
+
 from flash_nystrom import FlashNystromAttention, NystromConfig
 from flash_nystrom.reference import nystrom_attention_reference
 
