@@ -129,23 +129,28 @@ struct K3BwdSm100Traits {
         alignas(128) cute::array<Element, kTileK * kTileM> smem_stage_ds;
         alignas(16) typename PipelineS::SharedStorage pipeline_s;   // GEMM1+2
         alignas(16) typename PipelineS::SharedStorage pipeline_d;   // GEMM3-5
+        alignas(16) cute::uint64_t tma_barrier;
         uint32_t tmem_base_ptr;
     };
+
+    // K/V and Qt/dO3 tiles loaded by one TMA transaction each per CTA.
+    static constexpr int kTmaBytes =
+        (2 * kTileK * kHeadDim + 2 * kTileM * kHeadDim) * (int)sizeof(Element);
 };
 
-template <class Traits>
+template <class Traits, class TmaKV, class TmaQD>
 __global__ void __launch_bounds__(Traits::kNumThreads, 1)
 kernel3_bwd_sm100_kernel(
-    const typename Traits::Element* __restrict__ q_tilde_ptr,  // (BH, 64, D)
-    const typename Traits::Element* __restrict__ k_s_ptr,      // (BH, N, D)
-    const typename Traits::Element* __restrict__ v_ptr,        // (BH, N, D)
-    const float*                    __restrict__ lse3_ptr,     // (BH, 64)
-    const float*                    __restrict__ d3_ptr,       // (BH, 64)
-    const typename Traits::Element* __restrict__ do3_ptr,      // (BH, 64, D)
-    typename Traits::Element*       __restrict__ dv_ptr,       // (BH, N, D)
-    typename Traits::Element*       __restrict__ dk_ptr,       // (BH, N, D)
-    float*                          __restrict__ dqt_ptr,      // (BH, 64, D)
-    int N
+    CUTE_GRID_CONSTANT TmaKV const tma_k,    // (BH*N, D) K_s
+    CUTE_GRID_CONSTANT TmaKV const tma_v,    // (BH*N, D) V
+    CUTE_GRID_CONSTANT TmaQD const tma_qt,   // (BH*64, D) Q_tilde
+    CUTE_GRID_CONSTANT TmaQD const tma_do3,  // (BH*64, D) dO3
+    const float*              __restrict__ lse3_ptr,   // (BH, 64)
+    const float*              __restrict__ d3_ptr,     // (BH, 64)
+    typename Traits::Element* __restrict__ dv_ptr,     // (BH, N, D)
+    typename Traits::Element* __restrict__ dk_ptr,     // (BH, N, D)
+    float*                    __restrict__ dqt_ptr,    // (BH, 64, D)
+    int BH, int N
 ) {
     using Element = typename Traits::Element;
     constexpr int kBc = Traits::kTileK;    // 128
@@ -161,35 +166,59 @@ kernel3_bwd_sm100_kernel(
     const int tidx = threadIdx.x;
     const int warp_idx = tidx / 32;
 
-    // ---- stage K, V, Qt, dO3 through the writer (K-major) layouts
-    Tensor mK   = make_tensor(make_gmem_ptr(k_s_ptr + (int64_t)bh*N*kD + (int64_t)tile_start*kD),
-                              make_shape(Int<kBc>{}, Int<kD>{}), make_stride(Int<kD>{}, _1{}));
-    Tensor mV   = make_tensor(make_gmem_ptr(v_ptr + (int64_t)bh*N*kD + (int64_t)tile_start*kD),
-                              make_shape(Int<kBc>{}, Int<kD>{}), make_stride(Int<kD>{}, _1{}));
-    Tensor mQt  = make_tensor(make_gmem_ptr(q_tilde_ptr + (int64_t)bh*kM*kD),
-                              make_shape(Int<kM>{}, Int<kD>{}), make_stride(Int<kD>{}, _1{}));
-    Tensor mDO3 = make_tensor(make_gmem_ptr(do3_ptr + (int64_t)bh*kM*kD),
-                              make_shape(Int<kM>{}, Int<kD>{}), make_stride(Int<kD>{}, _1{}));
-    {
-        Tensor sK   = make_tensor(make_smem_ptr(storage.smem_k.begin()),
-                                  typename Traits::SmemLayoutKV{});
-        Tensor sV   = make_tensor(make_smem_ptr(storage.smem_v.begin()),
-                                  typename Traits::SmemLayoutKV{});
-        Tensor sQt  = make_tensor(make_smem_ptr(storage.smem_qt.begin()),
-                                  typename Traits::SmemLayoutQD{});
-        Tensor sDO3 = make_tensor(make_smem_ptr(storage.smem_do3.begin()),
-                                  typename Traits::SmemLayoutQD{});
-        auto mma_kq = typename Traits::CollectiveKQ::TiledMma{}.get_slice(0);
-        cooperative_copy<Traits::kNumThreads>(tidx, mma_kq.partition_A(mK),
-                                              sK(_, _, _, _0{}));
-        cooperative_copy<Traits::kNumThreads>(tidx, mma_kq.partition_A(mV),
-                                              sV(_, _, _, _0{}));
-        cooperative_copy<Traits::kNumThreads>(tidx, mma_kq.partition_B(mQt),
-                                              sQt(_, _, _, _0{}));
-        cooperative_copy<Traits::kNumThreads>(tidx, mma_kq.partition_B(mDO3),
-                                              sDO3(_, _, _, _0{}));
+    // ---- TMA-load K, V, Qt, dO3 into the writer (K-major) layouts.
+    // The gmem tensors are flattened to (BH*rows, D); the K/V tile row
+    // coordinate is bh*(N/128) + blockIdx.x, the Qt/dO3 coordinate is bh.
+    // One transaction barrier tracks all four loads (tutorial 02 idiom).
+    if (tidx == 0) {
+        cute::initialize_barrier(storage.tma_barrier, /*num_threads=*/1);
     }
     __syncthreads();
+    {
+        Tensor sK   = make_tensor(make_smem_ptr(storage.smem_k.begin()),
+                                  typename Traits::SmemLayoutKV{})(_, _, _, _0{});
+        Tensor sV   = make_tensor(make_smem_ptr(storage.smem_v.begin()),
+                                  typename Traits::SmemLayoutKV{})(_, _, _, _0{});
+        Tensor sQt  = make_tensor(make_smem_ptr(storage.smem_qt.begin()),
+                                  typename Traits::SmemLayoutQD{})(_, _, _, _0{});
+        Tensor sDO3 = make_tensor(make_smem_ptr(storage.smem_do3.begin()),
+                                  typename Traits::SmemLayoutQD{})(_, _, _, _0{});
+        Tensor mK_t   = tma_k.get_tma_tensor(make_shape(BH * N, Int<kD>{}));
+        Tensor mV_t   = tma_v.get_tma_tensor(make_shape(BH * N, Int<kD>{}));
+        Tensor mQt_t  = tma_qt.get_tma_tensor(make_shape(BH * kM, Int<kD>{}));
+        Tensor mDO3_t = tma_do3.get_tma_tensor(make_shape(BH * kM, Int<kD>{}));
+        const int kv_tile = bh * (N / kBc) + blockIdx.x;
+        Tensor gK   = local_tile(mK_t,   Shape<Int<kBc>, Int<kD>>{},
+                                 make_coord(kv_tile, _0{}));
+        Tensor gV   = local_tile(mV_t,   Shape<Int<kBc>, Int<kD>>{},
+                                 make_coord(kv_tile, _0{}));
+        Tensor gQt  = local_tile(mQt_t,  Shape<Int<kM>, Int<kD>>{},
+                                 make_coord(bh, _0{}));
+        Tensor gDO3 = local_tile(mDO3_t, Shape<Int<kM>, Int<kD>>{},
+                                 make_coord(bh, _0{}));
+        auto cta_kq = typename Traits::CollectiveKQ::TiledMma{}.get_slice(0);
+        Tensor tCgK   = cta_kq.partition_A(gK);
+        Tensor tCgV   = cta_kq.partition_A(gV);
+        Tensor tCgQt  = cta_kq.partition_B(gQt);
+        Tensor tCgDO3 = cta_kq.partition_B(gDO3);
+        auto [tKgK, tKsK] = tma_partition(tma_k, Int<0>{}, Layout<_1>{},
+            group_modes<0, 3>(sK), group_modes<0, 3>(tCgK));
+        auto [tVgV, tVsV] = tma_partition(tma_v, Int<0>{}, Layout<_1>{},
+            group_modes<0, 3>(sV), group_modes<0, 3>(tCgV));
+        auto [tQgQ, tQsQ] = tma_partition(tma_qt, Int<0>{}, Layout<_1>{},
+            group_modes<0, 3>(sQt), group_modes<0, 3>(tCgQt));
+        auto [tDgD, tDsD] = tma_partition(tma_do3, Int<0>{}, Layout<_1>{},
+            group_modes<0, 3>(sDO3), group_modes<0, 3>(tCgDO3));
+        if (tidx == 0) {
+            cute::set_barrier_transaction_bytes(storage.tma_barrier,
+                                                Traits::kTmaBytes);
+            copy(tma_k.with(storage.tma_barrier),   tKgK, tKsK);
+            copy(tma_v.with(storage.tma_barrier),   tVgV, tVsV);
+            copy(tma_qt.with(storage.tma_barrier),  tQgQ, tQsQ);
+            copy(tma_do3.with(storage.tma_barrier), tDgD, tDsD);
+        }
+    }
+    cute::wait_barrier(storage.tma_barrier, /*phase=*/0);
 
     // ---- TMEM allocation + the two UMMA completion pipelines
     typename Traits::TmemAllocator tmem_allocator;
@@ -422,8 +451,33 @@ inline void launch_kernel3_bwd_sm100_impl(
 ) {
     using Traits = K3BwdSm100Traits<kHeadDim>;
     using Element = typename Traits::Element;
+    constexpr int kBc = Traits::kTileK;
+    constexpr int kM  = Traits::kTileM;
+
+    // Host-side TMA descriptors (per-launch; encode the tensor pointers).
+    auto layout_kv = make_layout(make_shape(BH * N, Int<kHeadDim>{}),
+                                 make_stride(Int<kHeadDim>{}, _1{}));
+    auto layout_qd = make_layout(make_shape(BH * kM, Int<kHeadDim>{}),
+                                 make_stride(Int<kHeadDim>{}, _1{}));
+    Tensor mK   = make_tensor(make_gmem_ptr(static_cast<const Element*>(k_s)), layout_kv);
+    Tensor mV   = make_tensor(make_gmem_ptr(static_cast<const Element*>(v)), layout_kv);
+    Tensor mQt  = make_tensor(make_gmem_ptr(static_cast<const Element*>(q_tilde)), layout_qd);
+    Tensor mDO3 = make_tensor(make_gmem_ptr(static_cast<const Element*>(do3)), layout_qd);
+    auto smem_kv = typename Traits::SmemLayoutKV{}(_, _, _, _0{});
+    auto smem_qd = typename Traits::SmemLayoutQD{}(_, _, _, _0{});
+    auto tma_k   = make_tma_atom(SM90_TMA_LOAD{}, mK, smem_kv,
+                                 Shape<Int<kBc>, Int<kHeadDim>>{});
+    auto tma_v   = make_tma_atom(SM90_TMA_LOAD{}, mV, smem_kv,
+                                 Shape<Int<kBc>, Int<kHeadDim>>{});
+    auto tma_qt  = make_tma_atom(SM90_TMA_LOAD{}, mQt, smem_qd,
+                                 Shape<Int<kM>, Int<kHeadDim>>{});
+    auto tma_do3 = make_tma_atom(SM90_TMA_LOAD{}, mDO3, smem_qd,
+                                 Shape<Int<kM>, Int<kHeadDim>>{});
+    using TmaKV = decltype(tma_k);
+    using TmaQD = decltype(tma_qt);
+
     constexpr size_t smem = sizeof(typename Traits::SharedStorage);
-    auto* kernel = kernel3_bwd_sm100_kernel<Traits>;
+    auto* kernel = kernel3_bwd_sm100_kernel<Traits, TmaKV, TmaQD>;
     static const bool smem_set = [kernel] {
         if (smem > 48 * 1024) {
             cudaFuncSetAttribute(kernel,
@@ -433,16 +487,13 @@ inline void launch_kernel3_bwd_sm100_impl(
         return true;
     }();
     (void)smem_set;
-    dim3 grid((unsigned)(N / Traits::kTileK), (unsigned)BH);
+    dim3 grid((unsigned)(N / kBc), (unsigned)BH);
     kernel<<<grid, Traits::kNumThreads, smem, stream>>>(
-        static_cast<const Element*>(q_tilde),
-        static_cast<const Element*>(k_s),
-        static_cast<const Element*>(v),
+        tma_k, tma_v, tma_qt, tma_do3,
         lse3, d3,
-        static_cast<const Element*>(do3),
         static_cast<Element*>(dV),
         static_cast<Element*>(dK_s),
-        dQ_tilde, N);
+        dQ_tilde, BH, N);
 }
 
 inline bool kernel3_bwd_sm100_try_launch(

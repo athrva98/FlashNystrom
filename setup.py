@@ -135,7 +135,10 @@ def _build_ext_modules():
     #   MSVC C4505/C4100: unused static / unused param, fired by CUTLASS.
     #   MSVC C4127: conditional expression constant, fired by CUTLASS unroll
     #   macros.
-    third_party_suppressions_msvc = ["/wd4996", "/wd4505", "/wd4100", "/wd4127"]
+    #   MSVC C4172: "returning address of local or temporary", a false
+    #   positive in cute/numeric/arithmetic_tuple.hpp (TMA ArithTuple).
+    third_party_suppressions_msvc = ["/wd4996", "/wd4505", "/wd4100", "/wd4127",
+                                     "/wd4172"]
     third_party_suppressions_gcc = [
         "-Wno-deprecated-declarations",
         "-Wno-unused-function",
