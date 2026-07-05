@@ -157,10 +157,15 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
         print(f"  autobatch: batch_size={batch_size}")
 
     norm = T.Normalize((0.5,) * 3, (0.5,) * 3)
-    transform = T.Compose([T.RandomHorizontalFlip(),
-                           T.RandomCrop(img_size, padding=img_size // 8),
-                           T.ToTensor(), norm])
-    transform_test = T.Compose([T.ToTensor(), norm])
+    # Native dataset resolution; when img_size exceeds it (e.g. STL-10
+    # upscaled to 180px for the N=32K conditioning experiment), resize
+    # BEFORE the random crop (RandomCrop cannot exceed image + padding).
+    native = 96 if dataset == "stl10" else 32
+    pre = [T.Resize(img_size)] if img_size != native else []
+    transform = T.Compose(pre + [T.RandomHorizontalFlip(),
+                                 T.RandomCrop(img_size, padding=img_size // 8),
+                                 T.ToTensor(), norm])
+    transform_test = T.Compose(pre + [T.ToTensor(), norm])
     if dataset == "stl10":
         # 96x96 native real images, 10 classes, 5000 labeled train -> cheap, large N.
         trainset = torchvision.datasets.STL10(
@@ -304,10 +309,13 @@ def main():
                     help="cifar10 (32x32) or stl10 (96x96 native -> larger N, cheap)")
     ap.add_argument("--patch_size", type=int, default=4,
                     help="tokens = (img_size/patch_size)^2 + 1; patch_size=1 = pixel tokens")
+    ap.add_argument("--img_size", type=int, default=0,
+                    help="input resolution; 0 = dataset native (32 cifar / 96 stl10). "
+                         "Larger values upscale (e.g. 180 -> N=32401 pixel tokens on stl10)")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--num_landmarks", type=int, default=64)
     ap.add_argument("--newton_iter", type=int, default=6)
-    ap.add_argument("--kappa_star", type=float, default=1.0e3,
+    ap.add_argument("--kappa_star", type=float, default=0.0,
                     help="Tikhonov ridge target cond(M) for the pinv, threaded "
                          "identically to FN and the reference. 0 = no ridge "
                          "(vanilla Nystromformer). Use 0 at small N (CIFAR), "
@@ -329,7 +337,7 @@ def main():
                     help="where to write the structured per-backend results")
     a = ap.parse_args()
     m, ni, fdk = a.num_landmarks, a.newton_iter, a.fast_dk2inv
-    img_size = 96 if a.dataset == "stl10" else 32
+    img_size = a.img_size or (96 if a.dataset == "stl10" else 32)
     kw = dict(epochs=a.epochs, patch_size=a.patch_size, grad_clip=a.grad_clip,
               autobatch=a.autobatch, autobatch_cap=a.autobatch_cap,
               dataset=a.dataset, img_size=img_size, instrument=a.instrument,

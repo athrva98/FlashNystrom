@@ -45,24 +45,26 @@ class NystromConfig:
     scalar fallback regardless of this flag (the TC atom requires
     16-bit operands)."""
 
-    kappa_star: float = 1.0e3
+    kappa_star: float = 0.0
     """Tikhonov ridge target condition number for the pseudoinverse.
 
-    The pinv inverts M = K2^T K2 + lambda*I with
+    When > 0, the pinv inverts M = K2^T K2 + lambda*I with
     lambda = (||K2||_1 ||K2||_inf) / kappa_star, guaranteeing cond(M) <=
-    kappa_star and keeping the Newton-Schulz iteration well-conditioned even
-    when the landmark Gram matrix K2 is near-singular (which it becomes as N
-    grows, since segment-mean landmarks regress toward the global mean).
+    kappa_star regardless of how ill-conditioned the landmark Gram matrix
+    K2 becomes (cond(K2) grows with N, since segment-mean landmarks regress
+    toward the global mean).
 
-    Default 1e3: a weak ridge that is safe at any N. It barely perturbs the
-    pseudoinverse when K2 is well-conditioned (small N) yet bounds cond(M) <= 1e3
-    when cond(K2) explodes to ~1e7-1e11 at large N, keeping Newton-Schulz
-    convergent (a stronger ridge like the old 5.0 over-regularizes and costs
-    accuracy). Set 0.0 to disable the ridge and invert the raw K2 (the original
-    Nystromformer formulation; only safe when K2 is well-conditioned, e.g. small
-    N). Threaded identically to the kernel and the reference so both compute the
-    same regularized pseudoinverse — this replaces the old FN_KAPPA_STAR
-    environment variable."""
+    Default 0.0 (no ridge, the original Nystromformer formulation). The
+    2026-07 three-seed sweeps found end-task accuracy insensitive to (STL-10 at
+    N=9216, cond(K2) ~1e13) or hurt by (STL-10 at N=2304: -2.6 points; MQAR:
+    -11 points recall) a kappa_star=1e3 ridge, and never helped by it. This
+    is expected from the exact unrolled Newton-Schulz backward: a
+    non-converged pinv is still a deterministic operator with exact
+    gradients, so trainability does not depend on conditioning. Set a
+    finite kappa_star (e.g. 1e3) only when the application needs a
+    well-conditioned operator per se (e.g. operator fidelity to exact
+    attention at large N). Threaded identically to the kernel and the
+    reference so both compute the same (un)regularized pseudoinverse."""
 
     use_tc_pinv: bool = False
     """Route the pseudoinverse through the tf32 tensor-core Newton-Schulz chain.
