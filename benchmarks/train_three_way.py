@@ -349,12 +349,23 @@ def main():
         "nystrom_reference": ("Nystrom-Ref",
             lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni,
                                              conv_kernel_size=0, kappa_star=ks)),
-        # Vanilla Nystromformer: the reference with NO ridge (kappa=0), regardless of
-        # --kappa_star. At large N its landmark Gram K2 is near-singular, so this arm
-        # exposes the conditioning failure that the ridge (in FN/Nystrom-Ref) fixes.
+        # *_vanilla arms: identical backend with the ridge forced OFF (kappa=0),
+        # regardless of --kappa_star. Paired with the ridged arm they isolate
+        # the Tikhonov ridge's effect per backend (the 2026-07 sweeps found the
+        # ridge never helps training and sometimes hurts).
         "nystrom_vanilla": ("Nystrom-Vanilla",
             lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni,
                                              conv_kernel_size=0, kappa_star=0.0)),
+        "flash_nystrom_vanilla": ("FlashNystrom-V",
+            lambda d, h: FlashNystromAttention(
+                d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
+                                    kappa_star=0.0, use_tc_pinv=False,
+                                    conv_kernel_size=0, use_conv_residual=False))),
+        "flash_nystrom_tc_vanilla": ("FlashNystrom-TC-V",
+            lambda d, h: FlashNystromAttention(
+                d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
+                                    kappa_star=0.0, use_tc_pinv=True,
+                                    conv_kernel_size=0, use_conv_residual=False))),
         # flash_nystrom = the faithful scalar fp32 Newton-Schulz pinv (default path).
         "flash_nystrom": ("FlashNystrom",
             lambda d, h: FlashNystromAttention(
