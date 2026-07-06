@@ -324,6 +324,10 @@ def main():
     ap.add_argument("--no-fast-dk2inv", dest="fast_dk2inv", action="store_false",
                     help="use the FP32 reference-consistent dk2inv backward "
                          "(default: FP16 tensor-core fast path)")
+    ap.add_argument("--batch_size", type=int, default=128,
+                    help="fixed batch size (ignored when --autobatch is set). "
+                         "Use an explicit value at very large N where autobatch's "
+                         "single-shot probe overshoots and OOMs.")
     ap.add_argument("--autobatch", action="store_true")
     ap.add_argument("--autobatch_cap", type=int, default=2048)
     ap.add_argument("--backends", nargs="+",
@@ -338,10 +342,10 @@ def main():
     a = ap.parse_args()
     m, ni, fdk = a.num_landmarks, a.newton_iter, a.fast_dk2inv
     img_size = a.img_size or (96 if a.dataset == "stl10" else 32)
-    kw = dict(epochs=a.epochs, patch_size=a.patch_size, grad_clip=a.grad_clip,
-              autobatch=a.autobatch, autobatch_cap=a.autobatch_cap,
-              dataset=a.dataset, img_size=img_size, instrument=a.instrument,
-              seed=a.seed)
+    kw = dict(epochs=a.epochs, batch_size=a.batch_size, patch_size=a.patch_size,
+              grad_clip=a.grad_clip, autobatch=a.autobatch,
+              autobatch_cap=a.autobatch_cap, dataset=a.dataset, img_size=img_size,
+              instrument=a.instrument, seed=a.seed)
 
     ks = a.kappa_star
     factories = {
