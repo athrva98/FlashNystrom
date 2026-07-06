@@ -131,7 +131,7 @@ class TinyViT(nn.Module):
 def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
               patch_size=4, dim=256, heads=4, grad_clip=1.0,
               autobatch=False, autobatch_cap=2048, dataset="cifar10", img_size=32,
-              instrument=False, seed=42):
+              instrument=False, seed=42, amp=True):
     if autobatch and torch.cuda.is_available():
         from autobatch import search_and_profile
 
@@ -144,7 +144,7 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
 
             def run():
                 o.zero_grad(set_to_none=True)
-                with torch.amp.autocast("cuda", dtype=torch.float16):
+                with _amp_ctx():
                     loss = F.cross_entropy(m(x), yb)
                 loss.backward()
                 o.step()
@@ -217,6 +217,15 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
     n_tokens = (img_size // patch_size) ** 2 + 1
     print(f"\n{label}: {nparams/1e6:.2f}M params, N={n_tokens} tokens")
 
+    # amp=False runs the whole step in fp32 (no autocast, GradScaler is a no-op).
+    # Used by the nystrom_reference_fp32 arm to confirm that the reference's
+    # large-N accuracy collapse is fp16 precision, not the algorithm: the length-N
+    # softmax probabilities ~1/N fall below the fp16 normal floor (6.1e-5) at
+    # N > ~16K, so its autograd softmax-Jacobian underflows. FlashNystrom keeps
+    # that Jacobian in fp32 by construction and does not collapse.
+    import contextlib
+    _amp_ctx = (lambda: torch.amp.autocast("cuda", dtype=torch.float16)) if amp         else contextlib.nullcontext
+
     # FP16 loss scaling. Without it, the backward gradients (dO ~ 1e-3 and
     # everything downstream) sit below the FP16 normal floor (6.1e-5) and the
     # FP16 gradient stores flush to zero; see measure_bwd_ranges.py. The
@@ -232,7 +241,7 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
         total_loss, correct, total = 0.0, 0, 0
         for imgs, labels in trainloader:
             imgs, labels = imgs.cuda(non_blocking=True), labels.cuda(non_blocking=True)
-            with torch.amp.autocast("cuda", dtype=torch.float16):
+            with _amp_ctx():
                 logits = model(imgs)
                 loss = criterion(logits, labels)
             optimizer.zero_grad(set_to_none=True)
@@ -284,7 +293,7 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
     with torch.no_grad():
         for imgs, labels in testloader:
             imgs, labels = imgs.cuda(non_blocking=True), labels.cuda(non_blocking=True)
-            with torch.amp.autocast("cuda", dtype=torch.float16):
+            with _amp_ctx():
                 logits = model(imgs)
             correct += (logits.argmax(1) == labels).sum().item()
             total += imgs.size(0)
@@ -353,6 +362,12 @@ def main():
         "nystrom_reference": ("Nystrom-Ref",
             lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni,
                                              conv_kernel_size=0, kappa_star=ks)),
+        # Same reference, but trained in full fp32 (amp forced off in the loop
+        # below). Confirms the large-N reference collapse is fp16 precision, not
+        # the algorithm: this arm should recover to ~FlashNystrom accuracy at 32K.
+        "nystrom_reference_fp32": ("Nystrom-Ref-FP32",
+            lambda d, h: NystromRefAttention(d, h, num_landmarks=m, newton_iter=ni,
+                                             conv_kernel_size=0, kappa_star=ks)),
         # *_vanilla arms: identical backend with the ridge forced OFF (kappa=0),
         # regardless of --kappa_star. Paired with the ridged arm they isolate
         # the Tikhonov ridge's effect per backend (the 2026-07 sweeps found the
@@ -393,7 +408,8 @@ def main():
     for backend in a.backends:
         label, fac = factories[backend]
         print(f"\n--- {label} ---")
-        results.append(train_one(label, fac, **kw))
+        results.append(train_one(label, fac,
+                                  amp=(backend != "nystrom_reference_fp32"), **kw))
 
     print("\n" + "=" * 70)
     print("Summary:")
