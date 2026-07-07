@@ -45,6 +45,25 @@ from flash_nystrom import FlashNystromAttention, NystromConfig
 from flash_nystrom.reference import nystrom_attention_reference
 
 
+def subset_indices(n_full, train_frac, batch_size, seed):
+    """Deterministic training-subset index list for --train_frac.
+
+    Contract (what the test pins down):
+      * seed fully determines the subset: same (n_full, frac, batch, seed) ->
+        identical indices, so every backend arm in a run (all called with the
+        same seed) trains on the *same* images -> apples-to-apples comparison.
+      * different seeds -> different subsets (the 3-seed spread is real, not a
+        relabeling of one subset).
+      * never fewer than one batch; frac>=1.0 means "use everything" (None).
+    """
+    if train_frac >= 1.0:
+        return None
+    n_keep = max(batch_size, int(n_full * train_frac))
+    n_keep = min(n_keep, n_full)
+    g = torch.Generator().manual_seed(seed)
+    return torch.randperm(n_full, generator=g)[:n_keep].tolist()
+
+
 class SDPAAttention(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
@@ -131,7 +150,7 @@ class TinyViT(nn.Module):
 def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
               patch_size=4, dim=256, heads=4, grad_clip=1.0,
               autobatch=False, autobatch_cap=2048, dataset="cifar10", img_size=32,
-              instrument=False, seed=42, amp=True):
+              instrument=False, seed=42, amp=True, train_frac=1.0):
     if autobatch and torch.cuda.is_available():
         from autobatch import search_and_profile
 
@@ -177,6 +196,14 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
             root=_DATA, train=True, download=True, transform=transform)
         testset = torchvision.datasets.CIFAR10(
             root=_DATA, train=False, download=True, transform=transform_test)
+    # Optional deterministic subsample of the training set (test set is left
+    # whole so accuracy stays comparable). Halving train_frac roughly halves the
+    # per-epoch wall-clock at large N; the subset is fixed by seed for reproducibility.
+    idx = subset_indices(len(trainset), train_frac, batch_size, seed)
+    if idx is not None:
+        n_full = len(trainset)
+        trainset = torch.utils.data.Subset(trainset, idx)
+        print(f"  train_frac={train_frac:g} seed={seed}: using {len(idx)}/{n_full} train samples")
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=batch_size, shuffle=True, num_workers=0,
         pin_memory=True, drop_last=True)
@@ -346,6 +373,10 @@ def main():
                          "per-layer dO underflow, NaN origin, collapse onset")
     ap.add_argument("--seed", type=int, default=42,
                     help="seed for weight init + data order (for multi-seed runs)")
+    ap.add_argument("--train_frac", type=float, default=1.0,
+                    help="fraction of the training set to use (deterministic subset). "
+                         "0.5 halves per-epoch time; test set is left whole. "
+                         "Use at large N (e.g. 32K) to cut wall-clock.")
     ap.add_argument("--out_json", type=str, default="three_way_results.json",
                     help="where to write the structured per-backend results")
     a = ap.parse_args()
@@ -354,7 +385,7 @@ def main():
     kw = dict(epochs=a.epochs, batch_size=a.batch_size, patch_size=a.patch_size,
               grad_clip=a.grad_clip, autobatch=a.autobatch,
               autobatch_cap=a.autobatch_cap, dataset=a.dataset, img_size=img_size,
-              instrument=a.instrument, seed=a.seed)
+              instrument=a.instrument, seed=a.seed, train_frac=a.train_frac)
 
     ks = a.kappa_star
     factories = {
