@@ -207,8 +207,14 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=batch_size, shuffle=True, num_workers=0,
         pin_memory=True, drop_last=True)
+    # Eval batch never exceeds the train batch: a forward-only pass at batch b
+    # uses strictly less memory than a train step at batch b, so if training fit,
+    # eval fits. (The old hardcoded 200 OOMs the fp32 reference at N=32K, which
+    # trains fine at batch 12 but dies in eval.) Test accuracy is batch-invariant
+    # -- per-sample argmax, LayerNorm is per-token -- so this changes no result.
+    eval_bs = min(200, batch_size)
     testloader = torch.utils.data.DataLoader(
-        testset, batch_size=200, shuffle=False, num_workers=0,
+        testset, batch_size=eval_bs, shuffle=False, num_workers=0,
         pin_memory=True, drop_last=True)
 
     torch.manual_seed(seed)
