@@ -146,7 +146,13 @@ def _build_ext_modules():
     ]
 
     if os.name == "nt":
-        cxx_flags = ["/O2", "/std:c++17"]
+        # /Zc:__cplusplus makes MSVC report the real standard version in the
+        # __cplusplus macro (it otherwise stays stuck at 199711L). CUTLASS 3.9's
+        # platform.h gates its `using is_unsigned_v` import on raw __cplusplus
+        # while exmy_base.h gates the *use* on _MSVC_LANG; without this flag the
+        # two disagree and the FP-type static_assert fails to find is_unsigned_v.
+        cxx_flags = ["/O2", "/std:c++17", "/Zc:__cplusplus"]
+        nvcc_flags += ["-Xcompiler", "/Zc:__cplusplus"]
         if strict:
             # /permissive- disables MSVC's non-conforming extensions. This
             # is the flag that makes the build refuse the rvalue-to-non-

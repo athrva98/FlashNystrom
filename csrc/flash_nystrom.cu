@@ -13,11 +13,13 @@
 
 #include <algorithm>  // std::min / std::max for the k1 split heuristic
 #include <cstdlib>    // std::getenv / std::atoi for FLASH_NYSTROM_K1_SPLITS
+#include <type_traits> // std::remove_pointer_t for the landmark dtype dispatch
 
 #include "flash_nystrom.h"
 #include "kernels/backward/kernel2_inv_bwd.cuh"  // for debug hooks
 #include "kernels/backward/compute_dk2inv.cuh"   // for debug hooks
 #include "kernels/k2inv_gemm_tc.cuh"             // for the TC GEMM debug hook
+#include "kernels/leverage_landmarks.cuh"        // leverage-seeded Voronoi-mean landmarks
 #include "occupancy_probe.h"                      // for occupancy reporting
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
@@ -607,6 +609,50 @@ std::vector<torch::Tensor> debug_compute_dk2inv(
     return {dK2_inv, D3};
 }
 
+// Debug/standalone entry point for the leverage-seeded Voronoi-mean landmark
+// selector. Takes x = (BH, N, D) and returns x_tilde = (BH, m, D). Not wired
+// into the fused forward yet; used by tests/test_leverage_landmarks.py to
+// validate against a CPU ridge-leverage reference before it replaces the
+// segment-mean landmark path.
+torch::Tensor debug_leverage_landmarks(
+    torch::Tensor x, int64_t m, int64_t seed, int64_t subsample, double scale) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 3, "x must be (BH, N, D)");
+    const int BH = (int)x.size(0), N = (int)x.size(1), D = (int)x.size(2);
+    TORCH_CHECK(D == 64 || D == 128, "head_dim must be 64 or 128");
+    TORCH_CHECK(m >= 1 && m <= LM_TOPM_MAX, "m out of range [1, ", LM_TOPM_MAX, "]");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto x_tilde = torch::empty({(int64_t)BH, (int64_t)m, (int64_t)D}, x.options());
+    const size_t ws_bytes = flash_nystrom::lm_workspace_bytes(BH, N, D, (int)m);
+    auto ws = torch::empty({(int64_t)ws_bytes}, x.options().dtype(torch::kUInt8));
+
+    auto launch = [&](auto* tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        const T* xp = static_cast<const T*>(x.data_ptr());
+        T* op = static_cast<T*>(x_tilde.data_ptr());
+        if (D == 64)
+            flash_nystrom::launch_rls_vmean_landmarks<T, 64>(
+                xp, op, BH, N, (int)m, (float)scale, ws.data_ptr(), ws_bytes,
+                (uint64_t)seed, (int)subsample, stream);
+        else
+            flash_nystrom::launch_rls_vmean_landmarks<T, 128>(
+                xp, op, BH, N, (int)m, (float)scale, ws.data_ptr(), ws_bytes,
+                (uint64_t)seed, (int)subsample, stream);
+    };
+
+    switch (x.scalar_type()) {
+        case torch::kFloat16:  launch((cutlass::half_t*)nullptr); break;
+        case torch::kBFloat16: launch((cutlass::bfloat16_t*)nullptr); break;
+        case torch::kFloat32:  launch((float*)nullptr); break;
+        default: TORCH_CHECK(false, "unsupported dtype for leverage landmarks");
+    }
+    return x_tilde;
+}
+
 } // namespace flash_nystrom
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -657,6 +703,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q_tilde"), py::arg("k_tilde"), py::arg("K2_softmax"),
           py::arg("ns_iterates"), py::arg("dK2_inv_in"), py::arg("newton_iter"),
           py::arg("kappa_star") = 0.0);
+    m.def("debug_leverage_landmarks", &flash_nystrom::debug_leverage_landmarks,
+          "Leverage-seeded Voronoi-mean landmark selection. x=(BH,N,D) -> "
+          "x_tilde=(BH,m,D). Deterministic for a fixed seed. subsample>1 thins "
+          "the assign pass (systematic tile sampling). Standalone; not yet in "
+          "the fused forward.",
+          py::arg("x"), py::arg("m") = 64, py::arg("seed") = 0,
+          py::arg("subsample") = 1, py::arg("scale") = 1.0);
     m.def("reset_caches", []() {
               flash_nystrom::reset_ns_bwd_caches();
               flash_nystrom::reset_kernel3_caches();
