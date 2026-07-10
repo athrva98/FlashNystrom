@@ -434,6 +434,14 @@ def main():
                 d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
                                     kappa_star=ks, use_tc_pinv=True,
                                     conv_kernel_size=0, use_conv_residual=False))),
+        # flash_nystrom_leverage = segment means replaced by leverage-seeded
+        # Voronoi-mean landmarks (landmark_mode=1). Paired with flash_nystrom_vanilla
+        # (both kappa=0, scalar pinv) it isolates the landmark selector alone.
+        "flash_nystrom_leverage": ("FlashNystrom-Lev",
+            lambda d, h: FlashNystromAttention(
+                d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
+                                    kappa_star=0.0, use_tc_pinv=False, landmark_mode=1,
+                                    conv_kernel_size=0, use_conv_residual=False))),
     }
     n_tokens = (img_size // a.patch_size) ** 2 + 1
     print("=" * 70)
