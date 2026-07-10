@@ -82,8 +82,24 @@ class NystromConfig:
     scalar kernel is used otherwise regardless. Replaces the old FN_K2INV_TC
     environment var."""
 
+    landmark_mode: int = 0
+    """Landmark selection. 0 = segment mean (default). 1 = leverage-seeded
+    Voronoi means (leverage_landmarks.cuh): ridge-leverage scores -> Gumbel-top-m
+    seeds -> Euclidean Voronoi partition -> cell means. Backward is
+    straight-through (membership held fixed). Only the custom CUDA path
+    (num_landmarks <= 64, head_dim in {64,128}) supports mode 1."""
+
+    landmark_seed: int = 0
+    """Base RNG seed for mode 1 (Q uses seed, K uses seed+1). Deterministic."""
+
+    landmark_subsample: int = 1
+    """Assign-pass thinning for mode 1 (1 = exact means). >1 systematically
+    subsamples row tiles; use only at very large N."""
+
     def __post_init__(self):
         assert self.num_landmarks > 0, "num_landmarks must be positive"
+        assert self.landmark_mode in (0, 1), "landmark_mode must be 0 or 1"
+        assert self.landmark_subsample >= 1, "landmark_subsample must be >= 1"
         assert self.newton_iter > 0, "newton_iter must be positive"
         assert self.conv_kernel_size >= 0, "conv_kernel_size must be non-negative"
         if self.conv_kernel_size > 0:

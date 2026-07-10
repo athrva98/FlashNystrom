@@ -302,5 +302,8 @@ class FlashNystromAttention(nn.Module):
             fast_dk2inv=self.config.fast_dk2inv,
             kappa_star=self.config.kappa_star,
             use_tc_pinv=self.config.use_tc_pinv,
+            landmark_mode=self.config.landmark_mode,
+            landmark_seed=self.config.landmark_seed,
+            landmark_subsample=self.config.landmark_subsample,
         )
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, N, self.dim))
