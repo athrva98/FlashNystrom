@@ -678,7 +678,7 @@ torch::Tensor debug_leverage_landmarks(
     TORCH_CHECK(D == 64 || D == 128, "head_dim must be 64 or 128");
     TORCH_CHECK(m >= 1 && m <= LM_TOPM_MAX, "m out of range [1, ", LM_TOPM_MAX, "]");
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    const at::cuda::CUDAGuard device_guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream();
 
     auto x_tilde = torch::empty({(int64_t)BH, (int64_t)m, (int64_t)D}, x.options());
