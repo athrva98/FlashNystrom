@@ -55,11 +55,19 @@ def nystrom_attention_reference(  # noqa: C901
     conv_weight: Optional[torch.Tensor] = None,
     conv_kernel_size: int = 0,
     kappa_star: float = 0.0,
+    q_tilde: Optional[torch.Tensor] = None,
+    k_tilde: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Reference nystrom attention — the one that actually does math correctly.
 
     Compute right-to-left: kernel_1 @ kernel_2_inv @ kernel_3 @ V
     so we never materialize an (N, N) matrix. Thats the whole point.
+
+    q_tilde/k_tilde: optional precomputed (B, H, m, D) landmarks, ALREADY scaled
+    (== scale * landmark of the unscaled input). When given, the segment-mean
+    computation is skipped and these are used verbatim -- this is how the
+    leverage-Voronoi landmark path is validated and trained against the same
+    Nystrom math the kernel implements.
     """
     B, H, N, D = q.shape
     m = num_landmarks
@@ -70,30 +78,39 @@ def nystrom_attention_reference(  # noqa: C901
     q_s = q * scale
     k_s = k * scale
 
-    # Segment mean landmarks using floor division (matches CUDA kernel)
-    # First (m-1) segments have floor(N/m) elements.
-    # Last segment absorbs the remainder: [floor(N/m)*(m-1), N)
-    seg_len = N // m
-
-    # First (m-1) landmarks: reshape and mean
-    truncated_N = seg_len * (m - 1)
-    if m > 1:
-        q_first = (
-            q_s[:, :, :truncated_N, :].reshape(B, H, m - 1, seg_len, D).mean(dim=3)
-        )
-        k_first = (
-            k_s[:, :, :truncated_N, :].reshape(B, H, m - 1, seg_len, D).mean(dim=3)
-        )
+    if q_tilde is not None or k_tilde is not None:
+        assert q_tilde is not None and k_tilde is not None, \
+            "provide both q_tilde and k_tilde or neither"
+        # externally supplied landmarks (already scaled); skip segment means
+        goto_landmarks = True
     else:
-        q_first = q_s[:, :, :0, :].reshape(B, H, 0, D)  # empty
-        k_first = k_s[:, :, :0, :].reshape(B, H, 0, D)
+        goto_landmarks = False
 
-    # Last landmark: mean of remaining elements
-    q_last = q_s[:, :, truncated_N:N, :].mean(dim=2, keepdim=True)  # (B, H, 1, D)
-    k_last = k_s[:, :, truncated_N:N, :].mean(dim=2, keepdim=True)
+    if not goto_landmarks:
+        # Segment mean landmarks using floor division (matches CUDA kernel)
+        # First (m-1) segments have floor(N/m) elements.
+        # Last segment absorbs the remainder: [floor(N/m)*(m-1), N)
+        seg_len = N // m
 
-    q_tilde = torch.cat([q_first, q_last], dim=2)  # (B, H, m, D)
-    k_tilde = torch.cat([k_first, k_last], dim=2)
+        # First (m-1) landmarks: reshape and mean
+        truncated_N = seg_len * (m - 1)
+        if m > 1:
+            q_first = (
+                q_s[:, :, :truncated_N, :].reshape(B, H, m - 1, seg_len, D).mean(dim=3)
+            )
+            k_first = (
+                k_s[:, :, :truncated_N, :].reshape(B, H, m - 1, seg_len, D).mean(dim=3)
+            )
+        else:
+            q_first = q_s[:, :, :0, :].reshape(B, H, 0, D)  # empty
+            k_first = k_s[:, :, :0, :].reshape(B, H, 0, D)
+
+        # Last landmark: mean of remaining elements
+        q_last = q_s[:, :, truncated_N:N, :].mean(dim=2, keepdim=True)  # (B, H, 1, D)
+        k_last = k_s[:, :, truncated_N:N, :].mean(dim=2, keepdim=True)
+
+        q_tilde = torch.cat([q_first, q_last], dim=2)  # (B, H, m, D)
+        k_tilde = torch.cat([k_first, k_last], dim=2)
 
     # Three kernel matrices
     kernel_1 = F.softmax(q_s @ k_tilde.transpose(-2, -1), dim=-1)  # (B, H, N, m)

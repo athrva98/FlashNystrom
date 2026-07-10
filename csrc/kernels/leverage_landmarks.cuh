@@ -360,7 +360,7 @@ __device__ __forceinline__ void lm_bitonic_desc(float* v, int* ix, int P2) {
         }
 }
 
-__global__ void lm_topm_stageA_kernel(
+static __global__ void lm_topm_stageA_kernel(
     const float* __restrict__ gscore, // (BH, N)
     float* __restrict__ cand_v,       // (BH, nblocks, m)
     int*   __restrict__ cand_i,       // (BH, nblocks, m)
@@ -391,7 +391,7 @@ __global__ void lm_topm_stageA_kernel(
     for (int e = threadIdx.x; e < m; e += LM_BLK) { cv[e] = sv[e]; ci[e] = si[e]; }
 }
 
-__global__ void lm_topm_stageB_kernel(
+static __global__ void lm_topm_stageB_kernel(
     const float* __restrict__ cand_v, // (BH, nblocks, m)
     const int*   __restrict__ cand_i,
     int* __restrict__ seeds,          // (BH, m)
@@ -475,6 +475,7 @@ __global__ void lm_assign_kernel(
     const float* __restrict__ half_norms,  // (BH, m)
     float* __restrict__ acc,          // (BH, m, D) pre-zeroed
     int*   __restrict__ cnt,          // (BH, m)    pre-zeroed
+    int*   __restrict__ assign_out,   // (BH, N) per-row cell id, or nullptr
     int N, int m, int tile_rows, int subsample
 ) {
     constexpr int K = D / 32;
@@ -548,6 +549,11 @@ __global__ void lm_assign_kernel(
             if (ov > best) { best = ov; bc = oc; }
         }
         bc = __shfl_sync(0xffffffffu, bc, 0);
+
+        // per-row cell id for the straight-through backward (membership fixed).
+        // Only processed tiles are written; unprocessed rows (subsample>1) keep
+        // their -1 init and are skipped by the backward scatter.
+        if (assign_out && lane == 0) assign_out[static_cast<size_t>(bh) * N + r] = bc;
 
         // accumulate row into cell bc
         if (SMEM_ACC) {
@@ -672,7 +678,9 @@ void launch_rls_vmean_landmarks(
     int BH, int N, int m, float scale,
     void* workspace, size_t workspace_bytes,
     uint64_t rng_seed, int subsample,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int* assign_out = nullptr,   // (BH, N) per-row cell id for the backward, or null
+    int* cnt_out = nullptr       // (BH, m) per-cell count for the backward, or null
 ) {
     static_assert(D == 64 || D == 128, "supported head dims: 64, 128");
     FN_CHECK(BH > 0 && N > 0 && m > 0, "launch_rls_vmean_landmarks: invalid dims");
@@ -752,6 +760,11 @@ void launch_rls_vmean_landmarks(
             x, w.seeds, w.seed_rows, w.half_norms, N, m);
         FN_CUDA_KERNEL_CHECK();
 
+        // -1 init so the backward can tell processed rows (subsample>1 leaves
+        // some tiles unwritten). 0xFF bytes == int -1.
+        if (assign_out)
+            FN_CUDA_CHECK(cudaMemsetAsync(assign_out, 0xFF, (size_t)BH * N * 4, stream));
+
         const int tile_rows = 4 * LM_BLK;
         const int ntiles = (N + tile_rows - 1) / tile_rows;
         const int nproc = (ntiles + subsample - 1) / subsample;
@@ -764,16 +777,21 @@ void launch_rls_vmean_landmarks(
                     (const void*)lm_assign_kernel<scalar_t, D, true>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_acc));
             lm_assign_kernel<scalar_t, D, true><<<ga, LM_BLK, smem_acc, stream>>>(
-                x, w.seed_rows, w.half_norms, w.acc, w.cnt, N, m, tile_rows, subsample);
+                x, w.seed_rows, w.half_norms, w.acc, w.cnt, assign_out, N, m, tile_rows, subsample);
         } else {
             if (smem_base > 48u * 1024)
                 FN_CUDA_CHECK(cudaFuncSetAttribute(
                     (const void*)lm_assign_kernel<scalar_t, D, false>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_base));
             lm_assign_kernel<scalar_t, D, false><<<ga, LM_BLK, smem_base, stream>>>(
-                x, w.seed_rows, w.half_norms, w.acc, w.cnt, N, m, tile_rows, subsample);
+                x, w.seed_rows, w.half_norms, w.acc, w.cnt, assign_out, N, m, tile_rows, subsample);
         }
         FN_CUDA_KERNEL_CHECK();
+        // export the final per-cell counts for the backward (counts are >=1:
+        // every seed assigns to its own cell, so no empty cells among seeds).
+        if (cnt_out)
+            FN_CUDA_CHECK(cudaMemcpyAsync(cnt_out, w.cnt, (size_t)BH * m * 4,
+                                          cudaMemcpyDeviceToDevice, stream));
     }
     // ---- 6. finalize (means, empty-cell fallback, fold scale)
     {

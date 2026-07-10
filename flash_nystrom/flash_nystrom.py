@@ -67,25 +67,30 @@ class FlashNystromFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, num_landmarks, newton_iter, fast_dk2inv,
-                kappa_star, use_tc_pinv):
+                kappa_star, use_tc_pinv,
+                landmark_mode=0, landmark_seed=0, landmark_subsample=1):
         assert _C is not None, "CUDA extension not available"
 
         results = _C.forward(q, k, v, num_landmarks, newton_iter,
-                             kappa_star, use_tc_pinv)
+                             kappa_star, use_tc_pinv,
+                             landmark_mode, landmark_seed, landmark_subsample)
         # results: [output, q_s, k_s, q_tilde, k_tilde, k2inv, step2,
-        #           lse1, lse2, lse3, ns_iterates, k2_softmax, b_saved]
+        #           lse1, lse2, lse3, ns_iterates, k2_softmax, b_saved,
+        #           q_assign, k_assign, q_cnt, k_cnt]
         # b_saved = softmax(Q_tilde @ K_s^T) @ V (K_s = scaled K) is reused in
         # the backward so compute_dk2inv skips an O(m*N*D) recomputation pass.
+        # q_assign/k_assign/q_cnt/k_cnt carry the leverage-Voronoi membership for
+        # the straight-through landmark backward (0-element tensors in mode 0).
         output = results[0]
 
-        saved = list(results[1:])  # q_s, k_s, qt, kt, k2inv, step2, lse1, lse2, lse3, ns_iter, k2sm, b_saved
-        saved.append(v)
-        saved.append(output)
+        # 12 fwd saved tensors, then (v, output), then the 4 landmark-bwd tensors
+        saved = list(results[1:13]) + [v, output] + list(results[13:17])
         ctx.save_for_backward(*saved)
         ctx.num_landmarks = num_landmarks
         ctx.newton_iter = newton_iter
         ctx.fast_dk2inv = fast_dk2inv
         ctx.kappa_star = kappa_star
+        ctx.landmark_mode = landmark_mode
 
         return output
 
@@ -99,6 +104,7 @@ class FlashNystromFunction(torch.autograd.Function):
         b_saved = saved[11]
         v = saved[12]
         output = saved[13]
+        q_assign, k_assign, q_cnt, k_cnt = saved[14:18]
 
         dQ, dK, dV = _C.backward(
             grad_output.contiguous(),
@@ -120,11 +126,17 @@ class FlashNystromFunction(torch.autograd.Function):
             ctx.newton_iter,
             ctx.fast_dk2inv,
             ctx.kappa_star,
+            ctx.landmark_mode,
+            q_assign,
+            k_assign,
+            q_cnt,
+            k_cnt,
         )
 
-        # apply() args were (q, k, v, num_landmarks, newton_iter, fast_dk2inv,
-        # kappa_star, use_tc_pinv) → eight grad outputs; only q/k/v differentiable.
-        return dQ, dK, dV, None, None, None, None, None
+        # forward inputs: (q, k, v, num_landmarks, newton_iter, fast_dk2inv,
+        # kappa_star, use_tc_pinv, landmark_mode, landmark_seed,
+        # landmark_subsample) → 11 grad outputs; only q/k/v differentiable.
+        return dQ, dK, dV, None, None, None, None, None, None, None, None
 
 
 # Landmark range gating constants. The custom CUDA kernels only handle m <= 64
@@ -173,6 +185,7 @@ def _check_reference_budget(q, num_landmarks):
 def flash_nystrom_attention(
     q, k, v, num_landmarks=64, newton_iter=6, conv_weight=None, conv_kernel_size=0,
     fast_dk2inv=True, kappa_star=0.0, use_tc_pinv=False,
+    landmark_mode=0, landmark_seed=0, landmark_subsample=1,
 ):
     """main entry point — uses CUDA kernels if available, falls back to pytorch.
 
@@ -208,6 +221,14 @@ def flash_nystrom_attention(
     same regularized pseudoinverse (0 = no ridge). `use_tc_pinv` routes the
     pinv through the tf32 tensor-core path (m == 64 only).
     """
+    if landmark_mode not in (0, 1):
+        raise ValueError("landmark_mode must be 0 (segment mean) or 1 (leverage Voronoi)")
+    if landmark_mode == 1 and num_landmarks > _M_CUSTOM_KERNEL_MAX:
+        raise ValueError(
+            f"landmark_mode=1 (leverage Voronoi) is only implemented on the "
+            f"custom CUDA path (num_landmarks <= {_M_CUSTOM_KERNEL_MAX}); the "
+            f"m>{_M_CUSTOM_KERNEL_MAX} reference uses segment means only."
+        )
     if HAS_CUDA and q.is_cuda:
         if num_landmarks > _M_CUSTOM_KERNEL_MAX:
             # m > 64 -> reference. Memory check first so the user sees a
@@ -227,6 +248,7 @@ def flash_nystrom_attention(
         out = FlashNystromFunction.apply(
             q, k, v, num_landmarks, newton_iter, fast_dk2inv,
             kappa_star, use_tc_pinv,
+            landmark_mode, landmark_seed, landmark_subsample,
         )
         # Add depthwise-conv residual via cuDNN if requested.
         if conv_weight is not None and conv_kernel_size > 0:

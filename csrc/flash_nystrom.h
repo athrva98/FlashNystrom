@@ -59,6 +59,20 @@ struct NystromParams {
     float* __restrict__ ns_iterates_ptr;  // (B, H, newton_iter+1, m, m) FP32 — REQUIRED
     float* __restrict__ k2_softmax_ptr;   // (B, H, m, m) FP32 — REQUIRED for backward
 
+    // Landmark selection. 0 = segment mean (default, launch_landmarks); 1 =
+    // leverage-seeded Voronoi means (launch_rls_vmean_landmarks). Mode 1 needs a
+    // scratch workspace and, for the straight-through backward, writes the
+    // per-row cell assignment and per-cell counts for Q and K.
+    int landmark_mode;            // 0 or 1
+    uint64_t landmark_seed;       // base RNG seed (Q uses seed, K uses seed+1)
+    int landmark_subsample;       // assign-pass thinning (1 = exact)
+    void* __restrict__ lm_workspace_ptr;   // scratch, >= lm_workspace_bytes; mode 1 only
+    size_t lm_workspace_bytes;
+    int* __restrict__ q_assign_ptr;        // (B,H,N) or nullptr
+    int* __restrict__ k_assign_ptr;        // (B,H,N) or nullptr
+    int* __restrict__ q_cnt_ptr;           // (B,H,m) or nullptr
+    int* __restrict__ k_cnt_ptr;           // (B,H,m) or nullptr
+
     cudaStream_t stream;
 
     int BH;
@@ -141,6 +155,15 @@ struct NystromBwdParams {
 
     // Intermediate for TC kernel3_bwd: dO3 = K2_inv^T @ dstep2, stored as elem_type
     void* __restrict__ dO3_ptr;              // (B,H,m,D) FP16/BF16, or nullptr for FP32
+
+    // Landmark backward. Mode 0 = segment-mean scatter (launch_landmark_bwd).
+    // Mode 1 = straight-through Voronoi scatter: consumes the forward's saved
+    // per-row assignment + per-cell counts (membership held fixed).
+    int landmark_mode;                          // 0 or 1
+    const int* __restrict__ q_assign_ptr;       // (B,H,N) or nullptr
+    const int* __restrict__ k_assign_ptr;       // (B,H,N) or nullptr
+    const int* __restrict__ q_cnt_ptr;          // (B,H,m) or nullptr
+    const int* __restrict__ k_cnt_ptr;          // (B,H,m) or nullptr
 
     // No NS-backward workspace pointers here: launch_kernel2_inv_bwd owns
     // its own persistent thread-local NsBwdGraphState cache (workspaces

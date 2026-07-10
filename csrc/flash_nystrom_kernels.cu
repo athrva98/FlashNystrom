@@ -10,6 +10,7 @@
 #include "profile.h"
 #include "static_switch.h"
 #include "kernels/landmark.cuh"
+#include "kernels/leverage_landmarks.cuh"     // leverage-seeded Voronoi-mean landmarks (mode 1)
 #include "kernels/kernel2_inv.cuh"
 #include "kernels/k2inv_gemm_tc.cuh"          // tf32 TC GEMM primitive (forward NS)
 #include "cublas_helpers.cuh"                 // launch_affine_with_identity
@@ -30,6 +31,7 @@
 #include "kernels/backward/compute_dk2inv.cuh"
 #include "kernels/backward/kernel2_inv_bwd.cuh"
 #include "kernels/backward/landmark_bwd.cuh"
+#include "kernels/backward/landmark_bwd_voronoi.cuh"  // straight-through Voronoi scatter (mode 1)
 
 namespace flash_nystrom {
 
@@ -184,6 +186,33 @@ static void run_kernel2_inv(const elem_type* qt, const elem_type* kt,
     }
 }
 
+// Leverage-seeded Voronoi-mean landmarks (mode 1). Runs Q then K through the
+// same scratch workspace (sequential on the stream, so the reuse is safe: Q's
+// landmark + assign/count exports complete before K overwrites the scratch).
+// Q and K use different seeds so their Voronoi partitions differ. head_dim is a
+// compile-time template arg of the kernel, hence the D switch.
+template <typename elem_type, int Dv>
+static void lev_landmarks_qk(NystromParams &p,
+        const elem_type* q_in, const elem_type* k_in, elem_type* qt, elem_type* kt) {
+    launch_rls_vmean_landmarks<elem_type, Dv>(
+        q_in, qt, p.BH, p.seq_len, p.num_landmarks, p.scale,
+        p.lm_workspace_ptr, p.lm_workspace_bytes,
+        p.landmark_seed, p.landmark_subsample, p.stream,
+        p.q_assign_ptr, p.q_cnt_ptr);
+    launch_rls_vmean_landmarks<elem_type, Dv>(
+        k_in, kt, p.BH, p.seq_len, p.num_landmarks, p.scale,
+        p.lm_workspace_ptr, p.lm_workspace_bytes,
+        p.landmark_seed + 1, p.landmark_subsample, p.stream,
+        p.k_assign_ptr, p.k_cnt_ptr);
+}
+
+template <typename elem_type>
+static void run_leverage_landmarks(NystromParams &p,
+        const elem_type* q_in, const elem_type* k_in, elem_type* qt, elem_type* kt) {
+    if (p.head_dim == 64) lev_landmarks_qk<elem_type, 64>(p, q_in, k_in, qt, kt);
+    else                  lev_landmarks_qk<elem_type, 128>(p, q_in, k_in, qt, kt);
+}
+
 // FP16/BF16 path: uses tensor-core kernel1
 template <typename elem_type>
 static void run_nystrom_fwd_half(NystromParams &p) {
@@ -202,8 +231,11 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     int total = p.BH * p.seq_len * p.head_dim;
 
     prof.run("landmarks", [&] {
-        launch_landmarks<elem_type>(q_in, k_in, qt, kt,
-            p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
+        if (p.landmark_mode == 1)
+            run_leverage_landmarks<elem_type>(p, q_in, k_in, qt, kt);
+        else
+            launch_landmarks<elem_type>(q_in, k_in, qt, kt,
+                p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
     });
     // Scaled copy q_in -> q_m, k_in -> k_m (folds the softmax scale into the
     // clone the backward needs anyway, replacing a separate scale_inplace pass).
@@ -251,8 +283,11 @@ static void run_nystrom_fwd_fp32_impl(NystromParams &p) {
     auto* q_m = static_cast<T*>(p.q_ptr);            // scaled Q (dst)
     auto* k_m = static_cast<T*>(p.k_ptr);            // scaled K (dst)
 
-    launch_landmarks<T>(q_in, k_in, qt, kt,
-        p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
+    if (p.landmark_mode == 1)
+        run_leverage_landmarks<T>(p, q_in, k_in, qt, kt);
+    else
+        launch_landmarks<T>(q_in, k_in, qt, kt,
+            p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
 
     int total = p.BH * p.seq_len * p.head_dim;
     launch_scaled_copy<T>(q_in, q_m, total, p.scale, p.stream);
@@ -355,8 +390,13 @@ static void run_nystrom_bwd_impl(NystromBwdParams &p) {
             BH, D, m, p.newton_iter, p.stream, kappa_star_b);
     });
     prof.run("landmark_bwd", [&] {
-        launch_landmark_bwd<elem_type>(p.dQ_tilde_ptr, p.dK_tilde_ptr, dQ, dK,
-            BH, N, D, m, p.stream);
+        if (p.landmark_mode == 1)
+            launch_landmark_bwd_voronoi<elem_type>(p.dQ_tilde_ptr, p.dK_tilde_ptr,
+                p.q_assign_ptr, p.k_assign_ptr, p.q_cnt_ptr, p.k_cnt_ptr,
+                dQ, dK, BH, N, D, m, p.stream);
+        else
+            launch_landmark_bwd<elem_type>(p.dQ_tilde_ptr, p.dK_tilde_ptr, dQ, dK,
+                BH, N, D, m, p.stream);
     });
 
     int total = BH * N * D;

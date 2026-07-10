@@ -36,7 +36,10 @@ std::vector<torch::Tensor> nystrom_fwd(
     int64_t num_landmarks,
     int64_t newton_iter,
     double kappa_star,
-    bool use_tc_pinv
+    bool use_tc_pinv,
+    int64_t landmark_mode,
+    int64_t landmark_seed,
+    int64_t landmark_subsample
 ) {
     // Input validation
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
@@ -116,6 +119,33 @@ std::vector<torch::Tensor> nystrom_fwd(
     // does not need to N-walk to recompute it. m*D per batch-head, so total
     // size B*H*m*D bytes in dtype (typically a few hundred KB).
     auto b_saved      = torch::empty({B, H, m, D}, opts);
+
+    // Landmark selection mode. 0 = segment mean (default). 1 = leverage-seeded
+    // Voronoi means, which needs a scratch workspace and (for the
+    // straight-through backward) exports the per-row Voronoi assignment and
+    // per-cell counts for Q and K. Mode 0 leaves these as 0-element tensors.
+    TORCH_CHECK(landmark_mode == 0 || landmark_mode == 1,
+                "landmark_mode must be 0 (segment mean) or 1 (leverage Voronoi)");
+    TORCH_CHECK(landmark_subsample >= 1, "landmark_subsample must be >= 1");
+    const int BH = static_cast<int>(B * H);
+    auto opts_i32 = opts.dtype(torch::kInt32);
+    auto opts_u8  = opts.dtype(torch::kUInt8);
+    torch::Tensor lm_workspace, q_assign, k_assign, q_cnt, k_cnt;
+    if (landmark_mode == 1) {
+        const size_t ws = flash_nystrom::lm_workspace_bytes(BH, (int)N, (int)D, (int)m);
+        lm_workspace = torch::empty({(int64_t)ws}, opts_u8);
+        q_assign = torch::empty({B, H, N}, opts_i32);
+        k_assign = torch::empty({B, H, N}, opts_i32);
+        q_cnt    = torch::empty({B, H, m}, opts_i32);
+        k_cnt    = torch::empty({B, H, m}, opts_i32);
+    } else {
+        lm_workspace = torch::empty({0}, opts_u8);
+        q_assign = torch::empty({0}, opts_i32);
+        k_assign = torch::empty({0}, opts_i32);
+        q_cnt    = torch::empty({0}, opts_i32);
+        k_cnt    = torch::empty({0}, opts_i32);
+    }
+
     NystromParams params = {};
     params.batch_size = static_cast<int>(B);
     params.num_heads = static_cast<int>(H);
@@ -126,6 +156,17 @@ std::vector<torch::Tensor> nystrom_fwd(
     params.is_bf16 = (dtype == at::ScalarType::BFloat16);
     params.kappa_star = static_cast<float>(kappa_star);
     params.use_tc_pinv = use_tc_pinv;
+    params.landmark_mode = static_cast<int>(landmark_mode);
+    params.landmark_seed = static_cast<uint64_t>(landmark_seed);
+    params.landmark_subsample = static_cast<int>(landmark_subsample);
+    if (landmark_mode == 1) {
+        params.lm_workspace_ptr = lm_workspace.data_ptr();
+        params.lm_workspace_bytes = static_cast<size_t>(lm_workspace.numel());
+        params.q_assign_ptr = q_assign.data_ptr<int>();
+        params.k_assign_ptr = k_assign.data_ptr<int>();
+        params.q_cnt_ptr = q_cnt.data_ptr<int>();
+        params.k_cnt_ptr = k_cnt.data_ptr<int>();
+    }
 
     params.q_in_ptr = q.data_ptr();   // unscaled user Q (landmark + scaled_copy source)
     params.k_in_ptr = k.data_ptr();   // unscaled user K
@@ -153,7 +194,7 @@ std::vector<torch::Tensor> nystrom_fwd(
 
     return {output, q_s, k_s, q_tilde, k_tilde, kernel2_inv, step2,
             softmax1_lse, softmax2_lse, softmax3_lse, ns_iterates, k2_softmax,
-            b_saved};
+            b_saved, q_assign, k_assign, q_cnt, k_cnt};
 }
 
 // -- backward --
@@ -170,7 +211,10 @@ std::vector<torch::Tensor> nystrom_bwd(
     torch::Tensor v, torch::Tensor output,
     int64_t num_landmarks, int64_t newton_iter,
     bool fast_dk2inv,
-    double kappa_star
+    double kappa_star,
+    int64_t landmark_mode,
+    torch::Tensor q_assign, torch::Tensor k_assign,
+    torch::Tensor q_cnt, torch::Tensor k_cnt
 ) {
     // ------------------------------------------------------------------
     // Input validation. Backward gets called from autograd with saved
@@ -366,6 +410,17 @@ std::vector<torch::Tensor> nystrom_bwd(
     params.D1_ptr = D1.data_ptr<float>();
     params.D3_ptr = D3.data_ptr<float>();
     params.dO3_ptr = dO3.data_ptr();
+    params.landmark_mode = static_cast<int>(landmark_mode);
+    if (landmark_mode == 1) {
+        TORCH_CHECK(q_assign.numel() > 0 && k_assign.numel() > 0 &&
+                    q_cnt.numel() > 0 && k_cnt.numel() > 0,
+                    "landmark_mode 1 backward requires the forward's assignment/"
+                    "count tensors (q_assign, k_assign, q_cnt, k_cnt)");
+        params.q_assign_ptr = q_assign.data_ptr<int>();
+        params.k_assign_ptr = k_assign.data_ptr<int>();
+        params.q_cnt_ptr = q_cnt.data_ptr<int>();
+        params.k_cnt_ptr = k_cnt.data_ptr<int>();
+    }
     params.stream = stream;
 
     if (dtype == at::ScalarType::Float || to_fp32) {
@@ -664,7 +719,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("num_landmarks") = 64,
           py::arg("newton_iter") = 6,
           py::arg("kappa_star") = 0.0,
-          py::arg("use_tc_pinv") = false);
+          py::arg("use_tc_pinv") = false,
+          py::arg("landmark_mode") = 0,
+          py::arg("landmark_seed") = 0,
+          py::arg("landmark_subsample") = 1);
     m.def("backward", &flash_nystrom::nystrom_bwd,
           "FlashNystrom backward (CUDA). Pass b_saved = softmax(Q_tilde @ K^T) "
           "@ V from the forward to skip the N-walk in compute_dk2inv. "
@@ -679,7 +737,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("v"), py::arg("output"),
           py::arg("num_landmarks"), py::arg("newton_iter"),
           py::arg("fast_dk2inv") = true,
-          py::arg("kappa_star") = 0.0);
+          py::arg("kappa_star") = 0.0,
+          py::arg("landmark_mode") = 0,
+          py::arg("q_assign") = torch::Tensor(),
+          py::arg("k_assign") = torch::Tensor(),
+          py::arg("q_cnt") = torch::Tensor(),
+          py::arg("k_cnt") = torch::Tensor());
     m.def("debug_k2inv_gemm_nn", &flash_nystrom::debug_k2inv_gemm_nn,
           "Debug: batched tf32 tensor-core GEMM C = A @ B (m x m x m).",
           py::arg("A"), py::arg("B"));
