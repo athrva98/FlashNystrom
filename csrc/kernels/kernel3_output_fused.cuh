@@ -166,7 +166,7 @@ kernel3_fused_tc(
     constexpr int kBlockN  = Traits::kBlockN;
     constexpr int kHeadDim = Traits::kHeadDim;
 
-    const int bh   = blockIdx.x;  // One CTA per (batch, head)
+    const int64_t bh = blockIdx.x;  // One CTA per (batch, head)
     const int tidx = threadIdx.x;
 
     extern __shared__ char smem_[];
@@ -535,7 +535,7 @@ kernel3_partial_tc(
     constexpr int kHeadDim = Traits::kHeadDim;
 
     const int split = blockIdx.x;
-    const int bh    = blockIdx.y;
+    const int64_t bh = blockIdx.y;
     const int tidx  = threadIdx.x;
 
     const int num_tiles = (N + kBlockN - 1) / kBlockN;
@@ -846,7 +846,7 @@ __global__ void kernel3_combine_kernel(
     float*       __restrict__ lse_ptr,          // (BH, m) or nullptr
     int BH, int D, int m, int num_splits
 ) {
-    const int bh   = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tidx = threadIdx.x;
     const int nthreads = blockDim.x;
 

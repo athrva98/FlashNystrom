@@ -53,11 +53,11 @@ std::vector<torch::Tensor> nystrom_fwd(
     const int64_t B = q.size(0), H = q.size(1), N = q.size(2), D = q.size(3);
     const int64_t m = num_landmarks;
 
-    // Overflow check: B*H*N*D must fit in int32 for CUDA kernel indexing
-    TORCH_CHECK(B * H * N * D <= INT32_MAX,
-                "Total tensor elements (", B*H*N*D, ") exceeds int32 range");
-    TORCH_CHECK(B * H <= INT32_MAX / (N * D),
-                "B*H*N*D overflow");
+    // The per-(batch,head) slice base offset is computed in int64 (the slice
+    // index bh is int64_t in every kernel), so B*H*N*D may exceed int32.
+    // Tile-local indexing within one slice stays int32, so N*D must fit int32.
+    TORCH_CHECK(N * D <= INT32_MAX,
+                "per-slice N*D (", N * D, ") exceeds int32 range");
 
     CHECK_SHAPE(k, B, H, N, D);
     CHECK_SHAPE(v, B, H, N, D);
@@ -207,8 +207,10 @@ std::vector<torch::Tensor> nystrom_bwd(
                 "); must match the forward's kappa_star");
     TORCH_CHECK(B > 0 && H > 0,
                 "batch_size and num_heads must be positive (got B=", B, ", H=", H, ")");
-    TORCH_CHECK(B * H * N * D <= INT32_MAX,
-                "Tensor element count overflows int32 (B*H*N*D=", B * H * N * D, ")");
+    // Per-slice N*D must fit int32 (tile-local indexing); the global
+    // B*H*N*D offset is computed in int64 via the int64_t slice index.
+    TORCH_CHECK(N * D <= INT32_MAX,
+                "per-slice N*D (", N * D, ") exceeds int32 range");
 
     auto _ck = [&](const torch::Tensor& t, const char* name,
                    torch::IntArrayRef expected_shape, at::ScalarType expected_dtype) {

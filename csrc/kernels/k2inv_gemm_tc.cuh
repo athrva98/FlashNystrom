@@ -61,7 +61,7 @@ k2inv_gemm_nn_kernel(
 ) {
     using TF = cutlass::tfloat32_t;
     constexpr int kM = Traits::kM, kN = Traits::kN, kK = Traits::kK;  // kN = column tile
-    const int bh = blockIdx.x, ct = blockIdx.y, tid = threadIdx.x;
+    const int64_t bh = blockIdx.x; const int ct = blockIdx.y, tid = threadIdx.x;
     const int col_off = ct * kN;     // this CTA writes C[:, col_off : col_off+kN]
 
     extern __shared__ TF smem_tf[];

@@ -24,7 +24,7 @@ __global__ void kernel1_scalar_kernel(
     int N, int D, int m
 ) {
     const int tile_idx = blockIdx.x;
-    const int bh = blockIdx.y;
+    const int64_t bh = blockIdx.y;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     constexpr int Br = kK1ScalarBr;

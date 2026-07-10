@@ -41,7 +41,7 @@ __global__ void kernel3_bwd_kernel(
     float*    __restrict__ dK2_inv,
     int N, int D, int m
 ) {
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     constexpr int Bc = kK3BwdBc;
@@ -207,7 +207,7 @@ kernel3_bwd_tc(
     static_assert(kBlockM == kBlockN, "kernel3_bwd_tc requires kBlockM == kBlockN");
 
     const int tile_idx = blockIdx.x;
-    const int bh = blockIdx.y;
+    const int64_t bh = blockIdx.y;
     const int tidx = threadIdx.x;
 
     const int tile_start = tile_idx * kBlockN;
@@ -595,7 +595,7 @@ __global__ void reduce_dQ_tilde_split_kernel(
     float* __restrict__ dQ_tilde,
     int num_splits, int BH, int mD
 ) {
-    int bh = blockIdx.y;
+    int64_t bh = blockIdx.y;
     int idx = blockIdx.x * kBlock + threadIdx.x;
     if (idx >= mD) return;
     const long long bh_stride    = static_cast<long long>(mD);

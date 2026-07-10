@@ -58,7 +58,7 @@ __global__ void ns_bwd_step_kernel(
     float*       __restrict__ dK2_acc,       // (BH, m, m)
     int m
 ) {
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     const int mm = m * m;
@@ -238,7 +238,7 @@ __global__ void ns_bwd_final_kernel(
     float*          __restrict__ dK_tilde,    // (BH, m, D)
     int D, int m
 ) {
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     const int mm = m * m;
@@ -390,7 +390,7 @@ __global__ void ns_bwd_final_pre_kernel(
     int m,
     float ridge_lambda                     // lambda*I added to K2 post-softmax in the forward
 ) {
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     const int mm = m * m;
@@ -530,7 +530,7 @@ __global__ void add_ridge_diag_kernel(
     const float* __restrict__ K2_in,   // (BH, m, m) un-ridged softmax K2 (>=0)
     int m, float kappa_star
 ) {
-    const int bh = blockIdx.x, tid = threadIdx.x, nthreads = blockDim.x;
+    const int64_t bh = blockIdx.x; const int tid = threadIdx.x, nthreads = blockDim.x;
     const int mm = m * m;
     const float* K2 = K2_in + bh * mm;
     extern __shared__ float smem[];
@@ -565,7 +565,7 @@ __global__ void ns_bwd_z0grad_kernel(
     float*       __restrict__ dM_acc,  // (BH, m, m) += Z_0-init grad
     int m
 ) {
-    const int bh = blockIdx.x, tid = threadIdx.x, nthreads = blockDim.x;
+    const int64_t bh = blockIdx.x; const int tid = threadIdx.x, nthreads = blockDim.x;
     const int mm = m * m;
     extern __shared__ float smem[];
     float* sM      = smem;
@@ -616,7 +616,7 @@ __global__ void ns_bwd_softmax_jac_kernel(
     scalar_t*    __restrict__ dS2_out,  // (BH, m, m) elem_type
     int m
 ) {
-    const int bh = blockIdx.x, tid = threadIdx.x, nthreads = blockDim.x;
+    const int64_t bh = blockIdx.x; const int tid = threadIdx.x, nthreads = blockDim.x;
     const int mm = m * m;
     extern __shared__ float smem[];
     float* sK2 = smem; float* sdK2 = smem + mm; float* sdS2 = smem + 2 * mm;

@@ -17,7 +17,7 @@ __global__ void precompute_di_kernel(
     float* __restrict__ D1,           // (BH, N)
     int N, int D
 ) {
-    const int bh = blockIdx.y;
+    const int64_t bh = blockIdx.y;
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= N) return;
 

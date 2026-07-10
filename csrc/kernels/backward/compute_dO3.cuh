@@ -22,7 +22,7 @@ __global__ void compute_dO3_kernel(
     scalar_t*       __restrict__ dO3,      // (BH, m, D) output in elem_type
     int D, int m
 ) {
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
 

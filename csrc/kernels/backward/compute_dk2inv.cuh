@@ -67,7 +67,7 @@ __global__ void compute_dk2inv_from_b_kernel(
     float*          __restrict__ D3,       // (BH, m) output
     int D, int m
 ) {
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
 
@@ -125,7 +125,7 @@ __global__ void compute_dk2inv_kernel(
     int N, int D, int m
 ) {
     constexpr int TILE_N = 32;
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
 
@@ -230,7 +230,7 @@ compute_dk2inv_tc(
     constexpr int kBlockN  = Traits::kBlockN;   // 64 (Bc tile size)
     constexpr int kHeadDim = Traits::kHeadDim;
 
-    const int bh   = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tidx = threadIdx.x;
 
     // SMEM layout: sQt | sKV | sB(FP32)

@@ -26,7 +26,7 @@ __global__ void landmark_bwd_kernel(
     scalar_t* __restrict__ dK_s,         // (BH, N, D) accumulated
     int N, int D, int m
 ) {
-    const int bh = blockIdx.y;
+    const int64_t bh = blockIdx.y;
     const int seg_len_floor = N / m;
 
     const float* dqt = dQ_tilde + (int64_t)bh * m * D;

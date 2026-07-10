@@ -144,7 +144,7 @@ kernel1_fused_tc(
     constexpr int kHeadDim = Traits::kHeadDim;
 
     const int tile_idx = blockIdx.x;
-    const int bh       = blockIdx.y;
+    const int64_t bh = blockIdx.y;
     const int tidx     = threadIdx.x;
 
     const int row_start = tile_idx * kBlockM;

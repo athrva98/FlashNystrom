@@ -20,7 +20,7 @@ __global__ void kernel3_scalar_kernel(
     float*          __restrict__ softmax3_lse_out,
     int N, int D, int m
 ) {
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     constexpr int Bc = 64;

@@ -39,7 +39,7 @@ __global__ void kernel2_inv_kernel(
     int D, int m, int newton_iter,
     float kappa_star                          // Tikhonov target condition number (0 = no ridge)
 ) {
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     const int mm = m * m;

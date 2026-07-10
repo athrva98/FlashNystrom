@@ -29,7 +29,7 @@ __global__ void kernel1_bwd_scalar_kernel(
     scalar_t* __restrict__ dQ_s, float* __restrict__ dstep2, float* __restrict__ dK_tilde,
     int N, int D, int m
 ) {
-    const int tile_idx = blockIdx.x, bh = blockIdx.y;
+    const int tile_idx = blockIdx.x; const int64_t bh = blockIdx.y;
     const int tid = threadIdx.x, nthreads = blockDim.x;
     constexpr int Br = 64;                          // rows of Q handled per CTA
     const int row_start = tile_idx * Br;

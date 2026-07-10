@@ -39,7 +39,7 @@ __global__ void landmark_kernel(
     scalar_t* __restrict__ k_tilde,   // (B*H, m, D)
     int N, int D, int m, float scale
 ) {
-    const int bh = blockIdx.x;
+    const int64_t bh = blockIdx.x;
     const int landmark = blockIdx.y;
 
     // Floor-division segments; the last landmark absorbs the remainder.
