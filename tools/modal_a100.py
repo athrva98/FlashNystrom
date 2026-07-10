@@ -435,6 +435,33 @@ def scaling_a100():
     print("===SCALING_JSON_END===")
 
 
+@app.function(gpu="A100-80GB", timeout=2400)
+def verify_bwd_overflow_b200():
+    """Genuine backward overflow check vs ground truth. B=9,H=8,N=524288:
+    max base offset (BH-1)*N*D = 71*524288*64 = 2.38e9 > 2^31, so the int64
+    backward offsets are exercised. Reference (~5 GB (N,m)) fits B200."""
+    import torch
+    from flash_nystrom import flash_nystrom_attention as fn
+    from flash_nystrom.reference import nystrom_attention_reference as ref
+    B, H, D, m = 9, 8, 64, 64  # BH=72; N=262144 no overflow, N=524288 overflows
+    rel = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()
+
+    def run(N, fnc):
+        g = torch.Generator(device="cuda").manual_seed(0)
+        q, k, v = [torch.randn(B, H, N, D, device="cuda", dtype=torch.float16, generator=g).requires_grad_(True) for _ in range(3)]
+        o = fnc(q, k, v); o.float().pow(2).sum().backward()
+        return q.grad.detach(), k.grad.detach(), v.grad.detach()
+
+    for N in (262144, 524288):
+        maxoff = (B*H - 1) * N * D
+        print(f"N={N}: max base offset {maxoff} (> 2^31 = {maxoff > 2**31-1})")
+        gq_r, gk_r, gv_r = run(N, lambda a, b, c: ref(a, b, c, m, 6, None, 0, 1e3))
+        for tc in (False, True):
+            gq, gk, gv = run(N, lambda a, b, c: fn(a, b, c, num_landmarks=m, kappa_star=1e3, use_tc_pinv=tc))
+            print(f"   {'tf32' if tc else 'scalar':>6}: dQ {rel(gq, gq_r):.2e}  dK {rel(gk, gk_r):.2e}  dV {rel(gv, gv_r):.2e}")
+        del gq_r, gk_r, gv_r; torch.cuda.empty_cache()
+
+
 @app.function(gpu="A100-80GB", timeout=1800)
 def verify_fwd_overflow():
     """Genuine int32-overflow check, forward only (cache-safe, no reference).

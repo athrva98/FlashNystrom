@@ -159,7 +159,8 @@ kernel1_bwd_tc(
     constexpr int kBlockN = Traits::kBlockN;
     constexpr int kHeadDim = Traits::kHeadDim;
 
-    const int tile_idx = blockIdx.x, bh = blockIdx.y, tidx = threadIdx.x;
+    const int tile_idx = blockIdx.x, tidx = threadIdx.x;
+    const int64_t bh = blockIdx.y;
     const int row_start = tile_idx * kBlockM;
     if (row_start >= N) return;
     int tile_rows = min(kBlockM, N - row_start);
