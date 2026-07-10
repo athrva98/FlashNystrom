@@ -435,6 +435,234 @@ def scaling_a100():
     print("===SCALING_JSON_END===")
 
 
+@app.function(gpu="A100-80GB", timeout=1800)
+def verify_fwd_overflow():
+    """Genuine int32-overflow check, forward only (cache-safe, no reference).
+    B=4,H=8,N=2M: max base offset (BH-1)*N*D = 31*2M*64 = 4.2e9 > 2^31, so the
+    high slices index past INT32_MAX. Each output slice must match FN run on
+    that slice alone (B=1, offsets small)."""
+    import torch
+    from flash_nystrom import flash_nystrom_attention as fn
+    torch.manual_seed(0)
+    B, H, N, D, m = 4, 8, 2097152, 64, 64
+    maxoff = (B*H - 1) * N * D
+    print(f"max base offset (BH-1)*N*D = {maxoff} (> 2^31 = {maxoff > 2**31-1})")
+    q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+    k = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+    v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+    rel = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()
+    with torch.no_grad():
+        o_full = fn(q, k, v, num_landmarks=m, use_tc_pinv=True)   # overflowing offsets
+        for b in range(B):
+            o_b = fn(q[b:b+1], k[b:b+1], v[b:b+1], num_landmarks=m, use_tc_pinv=True)
+            off = b * H * N * D
+            print(f"slice {b} (base offset {off} {'>2^31' if off > 2**31-1 else '<2^31'}): "
+                  f"fwd relerr {rel(o_full[b:b+1], o_b):.2e}")
+            del o_b; torch.cuda.empty_cache()
+
+
+@app.function(gpu="A100-80GB", timeout=2400)
+def verify_backward_largeN():
+    """Isolate the dQ/dK large-N discrepancy: FN (scalar and tf32) vs the
+    pure-PyTorch reference (ground truth), dQ/dK/dV relative error, across N.
+    Finds the N at which the backward diverges and whether it is precision or a
+    structural bug (relerr ~1 = structural)."""
+    import torch
+    from flash_nystrom import flash_nystrom_attention as fn
+    from flash_nystrom.reference import nystrom_attention_reference as ref
+    torch.manual_seed(0)
+    B, H, D, m = 1, 4, 64, 64
+    rel = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-12)).item()
+
+    def grads(fnc, q, k, v):
+        q = q.clone().requires_grad_(True); k = k.clone().requires_grad_(True); v = v.clone().requires_grad_(True)
+        o = fnc(q, k, v); o.float().pow(2).sum().backward()
+        return q.grad.detach(), k.grad.detach(), v.grad.detach()
+
+    print(f"{'N':>8} | {'path':>6} | {'dQ':>9} {'dK':>9} {'dV':>9}")
+    for N in (9216, 65536, 262144, 1048576):
+        q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+        k = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+        v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+        gq_r, gk_r, gv_r = grads(lambda a, b, c: ref(a, b, c, m, 6, None, 0, 1e3), q, k, v)
+        for tc in (False, True):
+            gq, gk, gv = grads(lambda a, b, c: fn(a, b, c, num_landmarks=m, kappa_star=1e3, use_tc_pinv=tc), q, k, v)
+            print(f"{N:>8} | {'tf32' if tc else 'scalar':>6} | {rel(gq, gq_r):9.2e} {rel(gk, gk_r):9.2e} {rel(gv, gv_r):9.2e}")
+        del q, k, v, gq_r, gk_r, gv_r; torch.cuda.empty_cache()
+
+
+@app.function(gpu="A100", timeout=1800)
+def dump_inductor_code():
+    """Verify the compiled reference materializes the (N,m) softmax to global
+    memory: dump TorchInductor's generated wrapper and grep the buffer
+    allocations. Static shapes (N=4096, m=64) so sizes are concrete."""
+    import os
+    os.environ["TORCH_LOGS"] = "output_code"
+    import io, logging, torch
+    from flash_nystrom.reference import nystrom_attention_reference as ref
+    torch.manual_seed(0)
+    B, H, N, D, m = 1, 4, 4096, 64, 64
+
+    cap = io.StringIO()
+    handler = logging.StreamHandler(cap)
+    logging.getLogger("torch._inductor").addHandler(handler)
+
+    q, k, v = [torch.randn(B, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True) for _ in range(3)]
+    refc = torch.compile(lambda a, b, c: ref(a, b, c, m, 6, None, 0, 1e3))  # static
+    o = refc(q, k, v); o.float().pow(2).sum().backward()
+    torch.cuda.synchronize()
+
+    code = cap.getvalue()
+    print(f"N={N} m={m}  (N,m)={N*m} elements; captured {len(code)} chars of inductor code")
+    print("=== buffer allocations mentioning N=4096 (the (N,m)/(m,N) intermediates) ===")
+    for line in code.splitlines():
+        s = line.strip()
+        if ("empty_strided_cuda" in s or "empty(" in s) and "4096" in s:
+            print("  " + s[:140])
+    print("=== softmax kernel calls ===")
+    for line in code.splitlines():
+        if "softmax" in line.lower() and (".run(" in line or "def triton" in line):
+            print("  " + line.strip()[:140])
+
+
+def _run_attn_op(gpu_label):
+    """Operator-only comparison: raw attention op (q,k,v -> out, no
+    projection/residual/loss glue), FN vs reference, each eager and
+    torch.compile'd (Triton+cuBLAS). Isolates the attention kernels. B=1 so FN
+    stays under its 2^31 element-index limit up to 2M tokens. fwd+bwd ms vs N."""
+    import torch
+    from flash_nystrom import flash_nystrom_attention as fn
+    from flash_nystrom.reference import nystrom_attention_reference as ref
+    torch.manual_seed(0)
+    dev = "cuda"
+    B, H, D, m = 1, 8, 64, 64
+
+    def fn_op(q, k, v):   return fn(q, k, v, num_landmarks=m, kappa_star=1e3, use_tc_pinv=True)
+    def ref_op(q, k, v):  return ref(q, k, v, m, 6, None, 0, 1e3)
+    ref_c = torch.compile(ref_op, dynamic=True)
+    variants = [("FN eager", fn_op), ("ref eager", ref_op), ("ref compile", ref_c)]
+
+    def timed(f, q, k, v, warmup=10, iters=30):
+        try:
+            for _ in range(warmup):
+                o = f(q, k, v); o.float().pow(2).sum().backward(); q.grad = k.grad = v.grad = None
+            torch.cuda.synchronize()
+            ts = []
+            for _ in range(iters):
+                s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+                s.record(); o = f(q, k, v); o.float().pow(2).sum().backward(); e.record()
+                torch.cuda.synchronize(); ts.append(s.elapsed_time(e)); q.grad = k.grad = v.grad = None
+            ts.sort(); return ts[len(ts) // 2]
+        except Exception as ex:
+            return f"ERR:{str(ex)[:40]}"
+
+    print(f"===GPU {gpu_label}===  B={B} H={H} D={D} m={m}")
+    print(f"{'N':>8} | " + " | ".join(f"{n:>12}" for n, _ in variants) + " | refc/FN | refe/FN")
+    for N in (131072, 262144, 524288, 1048576, 2097152):
+        row, nums = [], []
+        for _, f in variants:
+            torch.cuda.empty_cache()
+            q, k, v = [torch.randn(B, H, N, D, device=dev, dtype=torch.float16, requires_grad=True) for _ in range(3)]
+            t = timed(f, q, k, v)
+            nums.append(t if isinstance(t, float) else None)
+            row.append(f"{t:12.2f}" if isinstance(t, float) else f"{t:>12}")
+        fnn, refe, refc = nums  # [FN, ref_eager, ref_compile]
+        rc = f"{refc/fnn:.2f}x" if (fnn and refc) else ("OOM" if fnn else "-")
+        re = f"{refe/fnn:.2f}x" if (fnn and refe) else ("OOM" if fnn else "-")
+        print(f"{N:>8} | " + " | ".join(row) + f" | {rc:>7} | {re:>7}")
+
+
+@app.function(gpu="A100-80GB", timeout=3600)
+def bench_attn_op_a100():
+    _run_attn_op("A100-80GB")
+
+
+@app.function(gpu="H100", timeout=3600)
+def bench_attn_op_h100():
+    _run_attn_op("H100")
+
+
+@app.function(gpu="H200", timeout=3600)
+def bench_attn_op_h200():
+    _run_attn_op("H200")
+
+
+@app.function(gpu="B200", timeout=3600)
+def bench_attn_op_b200():
+    _run_attn_op("B200")
+
+
+@app.function(gpu="A100", timeout=3600)
+def diagnose_compile_a100():
+    """WHY is the torch.compile'd reference faster? Verify correctness, then
+    profile FN-tf32 vs compiled reference at one fixed shape: kernel-level CUDA
+    time breakdown and launch counts."""
+    import sys, torch
+    sys.path.insert(0, "/root/FlashNystrom")
+    from paper.mqar.model import build_attention
+    from torch.profiler import profile, ProfilerActivity
+
+    B, H, N, D, m = 8, 8, 8192, 64, 64
+    dim = H * D
+    dev = "cuda"
+    torch.manual_seed(0)
+
+    def mkx():
+        return torch.randn(B, N, dim, device=dev, dtype=torch.bfloat16, requires_grad=True)
+
+    # ---- correctness: same weights, eager vs compiled ----
+    ref = build_attention("nystrom_reference", dim, H, num_landmarks=m).to(dev).bfloat16()
+    ref_c = torch.compile(ref, dynamic=True)
+    x = mkx()
+    with torch.no_grad():
+        oe = ref(x); oc = ref_c(x)
+    relerr = ((oe - oc).float().norm() / oe.float().norm().clamp_min(1e-9)).item()
+    print(f"[correctness] compiled-ref vs eager-ref output rel err = {relerr:.2e}")
+
+    fn = build_attention("flash_nystrom_tc", dim, H, num_landmarks=m).to(dev).bfloat16()
+
+    def prof(mod, label):
+        for _ in range(6):
+            o = mod(x); o.float().pow(2).sum().backward(); x.grad = None
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA], record_shapes=False) as p:
+            for _ in range(10):
+                o = mod(x); o.float().pow(2).sum().backward(); x.grad = None
+            torch.cuda.synchronize()
+        evs = [e for e in p.key_averages() if e.self_device_time_total > 0]
+        total = sum(e.self_device_time_total for e in evs)
+        nlaunch = sum(e.count for e in evs)
+        print(f"\n===== {label}: total CUDA {total/10:.1f} us/iter, {nlaunch/10:.0f} kernel launches/iter =====")
+        for e in sorted(evs, key=lambda e: -e.self_device_time_total)[:12]:
+            print(f"  {e.self_device_time_total/total*100:5.1f}%  {e.self_device_time_total/10:8.1f}us  x{e.count/10:5.1f}  {e.key[:60]}")
+
+    prof(fn, "FlashNystrom-tf32")
+    prof(ref_c, "compiled reference")
+    prof(ref, "eager reference")
+
+
+@app.function(gpu="A100", timeout=5400)
+def scaling_compile_a100():
+    """FlashNystrom vs eager reference vs torch.compile'd reference, K tokens/s
+    (fwd+bwd, largest batch that fits) versus N. Answers the "did you try
+    torch.compile" question with an Inductor (Triton) baseline, which the Linux
+    image provides. Prints the JSON."""
+    import subprocess
+    r = subprocess.run(
+        ["python", "benchmarks/profile_scaling.py",
+         "--backends", "flash_nystrom_tc", "nystrom_reference_compile",
+         "--Ns", "16384", "32768", "65536", "131072",
+         "--json", "/tmp/scaling_compile.json"],
+        capture_output=True, text=True, cwd="/root/FlashNystrom")
+    print(r.stdout[-6000:])
+    if r.returncode != 0:
+        print(r.stderr[-6000:])
+        raise RuntimeError("profile_scaling (compile) failed")
+    print("===SCALING_COMPILE_JSON_BEGIN===")
+    print(open("/tmp/scaling_compile.json").read())
+    print("===SCALING_COMPILE_JSON_END===")
+
+
 @app.function(gpu="B200", timeout=1800)
 def bench_point_b200():
     """One fwd+bwd latency point on B200: B=1, H=4, N=16384, D=64, m=32."""

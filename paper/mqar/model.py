@@ -131,16 +131,28 @@ def build_attention(
 ) -> nn.Module:
     if backend == "sdpa":
         return SdpaAttention(dim, heads, causal=causal)
-    if backend == "nystrom_reference":
+    if backend in ("nystrom_reference", "nystrom_reference_compile"):
         if causal:
             raise ValueError("Nystrom attention does not support causal masking")
-        return NystromReferenceAttention(
+        mod = NystromReferenceAttention(
             dim, heads,
             num_landmarks=num_landmarks,
             newton_iter=newton_iter,
             use_conv_residual=use_conv_residual,
             kappa_star=kappa_star,
         )
+        # nystrom_reference_compile: the same eager reference wrapped in
+        # torch.compile (Inductor), the first optimization a practitioner
+        # reaches for. It isolates the value of hand-fusion beyond what the
+        # compiler gives for free. Inductor fuses the pointwise/softmax
+        # epilogues around the cuBLAS matmuls but does not tile the
+        # matmul-softmax-matmul chain into a register-resident kernel, so the
+        # (N, m) intermediates still reach HBM.
+        if backend == "nystrom_reference_compile":
+            # dynamic=True compiles once and handles the autobatch batch-size
+            # sweep without a recompile per shape.
+            return torch.compile(mod, dynamic=True)
+        return mod
     if backend in ("flash_nystrom", "flash_nystrom_tc"):
         if causal:
             raise ValueError("FlashNystrom does not support causal masking")
