@@ -153,19 +153,23 @@ def build_attention(
             # sweep without a recompile per shape.
             return torch.compile(mod, dynamic=True)
         return mod
-    if backend in ("flash_nystrom", "flash_nystrom_tc", "flash_nystrom_leverage"):
+    if backend in ("flash_nystrom", "flash_nystrom_tc",
+                   "flash_nystrom_leverage", "flash_nystrom_leverage_det"):
         if causal:
             raise ValueError("FlashNystrom does not support causal masking")
         from flash_nystrom import FlashNystromAttention
         from flash_nystrom.nystrom_config import NystromConfig
 
-        # flash_nystrom          -> faithful scalar fp32 Newton-Schulz pinv (default),
-        #                           segment-mean landmarks.
-        # flash_nystrom_tc       -> opt-in tf32 tensor-core pinv (faster, small cost).
-        # flash_nystrom_leverage -> segment means replaced by leverage-seeded
-        #                           Voronoi-mean landmarks (landmark_mode=1). The
-        #                           A/B against flash_nystrom isolates the landmark
-        #                           selector alone (identical pinv and everything else).
+        # flash_nystrom              -> faithful scalar fp32 Newton-Schulz pinv (default),
+        #                               segment-mean landmarks.
+        # flash_nystrom_tc           -> opt-in tf32 tensor-core pinv (faster, small cost).
+        # flash_nystrom_leverage     -> leverage-seeded Voronoi means, Gumbel sampling
+        #                               (gumbel_scale=1, as authored).
+        # flash_nystrom_leverage_det -> same but deterministic top-m leverage
+        #                               (gumbel_scale=0). Vision A/Bs show deterministic
+        #                               beats sampling; this checks it on MQAR too. No
+        #                               CLS pin (MQAR has no CLS token).
+        is_lev = backend.startswith("flash_nystrom_leverage")
         cfg = NystromConfig(
             num_landmarks=num_landmarks,
             newton_iter=newton_iter,
@@ -173,7 +177,8 @@ def build_attention(
             use_tc_pinv=(backend == "flash_nystrom_tc"),
             conv_kernel_size=3 if use_conv_residual else 0,
             use_conv_residual=use_conv_residual,
-            landmark_mode=(1 if backend == "flash_nystrom_leverage" else 0),
+            landmark_mode=(1 if is_lev else 0),
+            landmark_gumbel_scale=(0.0 if backend == "flash_nystrom_leverage_det" else 1.0),
         )
         # FlashNystromAttention owns its own q/k/v/out projections, matching
         # SdpaAttention's structure.

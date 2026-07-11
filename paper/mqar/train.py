@@ -333,7 +333,8 @@ def build_parser():
     p.add_argument(
         "--backend",
         choices=["sdpa", "flash_nystrom", "flash_nystrom_tc",
-                 "flash_nystrom_leverage", "nystrom_reference"],
+                 "flash_nystrom_leverage", "flash_nystrom_leverage_det",
+                 "nystrom_reference"],
         default="sdpa",
     )
     p.add_argument("--dim", type=int, default=128)
