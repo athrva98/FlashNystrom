@@ -147,33 +147,65 @@ class TinyViT(nn.Module):
         return self.head(self.norm(x[:, 0]))
 
 
+def _margin_batch(b, margin):
+    """Back the probed max batch off by `margin` and round DOWN to a multiple of
+    8. The probe only measures a bare fwd+bwd+opt step on random inputs; real
+    training additionally holds DataLoader pinned/prefetch buffers, cuDNN conv
+    workspace (the patch embed), the AMP GradScaler, and allocator fragmentation
+    that grows over a long run. Running at exactly the probed max OOMs partway
+    through; the margin reserves headroom so it does not."""
+    if not b:
+        return b
+    return max(8, int(b * margin) // 8 * 8)
+
+
+def _max_batch_for(attn_factory, dim, heads, patch_size, img_size, lr,
+                   autobatch_cap, amp=True):
+    """Largest batch a full train step of this backend fits (doubling search up
+    to autobatch_cap), or None if even the smallest probe OOMs. Self-contained
+    (own amp context, own throwaway model/inputs) so it can be called before any
+    training to pick a single batch that fits EVERY arm. `amp` must match how the
+    arm will actually train -- the fp32 reference (amp off) holds a smaller batch
+    than the fp16 arms, so probing it under amp would overestimate its capacity."""
+    import contextlib
+    from autobatch import search_and_profile
+    amp_ctx = ((lambda: torch.amp.autocast("cuda", dtype=torch.float16))
+               if amp else contextlib.nullcontext)
+
+    def _trial(bs):
+        m = TinyViT(attn_factory, dim=dim, depth=4, heads=heads,
+                    patch_size=patch_size, img_size=img_size).cuda()
+        o = torch.optim.AdamW(m.parameters(), lr=lr)
+        x = torch.randn(bs, 3, img_size, img_size, device="cuda")
+        yb = torch.randint(0, 10, (bs,), device="cuda")
+
+        def run():
+            o.zero_grad(set_to_none=True)
+            with amp_ctx():
+                loss = F.cross_entropy(m(x), yb)
+            loss.backward()
+            o.step()
+
+        return run
+
+    res = search_and_profile(_trial, lo=64, cap=autobatch_cap, warmup=2, iters=3)
+    return res["batch"] if res else None
+
+
 def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
               patch_size=4, dim=256, heads=4, grad_clip=1.0,
-              autobatch=False, autobatch_cap=2048, dataset="cifar10", img_size=32,
+              autobatch=False, autobatch_cap=2048, autobatch_margin=0.85,
+              dataset="cifar10", img_size=32,
               instrument=False, seed=42, amp=True, train_frac=1.0):
     if autobatch and torch.cuda.is_available():
-        from autobatch import search_and_profile
-
-        def _trial(bs):
-            m = TinyViT(attn_factory, dim=dim, depth=4, heads=heads,
-                        patch_size=patch_size, img_size=img_size).cuda()
-            o = torch.optim.AdamW(m.parameters(), lr=lr)
-            x = torch.randn(bs, 3, img_size, img_size, device="cuda")
-            yb = torch.randint(0, 10, (bs,), device="cuda")
-
-            def run():
-                o.zero_grad(set_to_none=True)
-                with _amp_ctx():
-                    loss = F.cross_entropy(m(x), yb)
-                loss.backward()
-                o.step()
-
-            return run
-
-        res = search_and_profile(_trial, lo=64, cap=autobatch_cap, warmup=2, iters=3)
-        if res:
-            batch_size = res["batch"]
-        print(f"  autobatch: batch_size={batch_size}")
+        # Standalone per-arm autobatch (used when train_one is called directly).
+        # The main() A/B path instead resolves ONE shared batch across all arms
+        # up front and calls with autobatch=False.
+        b = _max_batch_for(attn_factory, dim, heads, patch_size, img_size, lr,
+                           autobatch_cap, amp=amp)
+        if b:
+            batch_size = _margin_batch(b, autobatch_margin)
+        print(f"  autobatch: max={b} -> batch_size={batch_size} (at {autobatch_margin:.0%} for headroom)")
 
     norm = T.Normalize((0.5,) * 3, (0.5,) * 3)
     # Native dataset resolution; when img_size exceeds it (e.g. STL-10
@@ -372,6 +404,12 @@ def main():
                          "single-shot probe overshoots and OOMs.")
     ap.add_argument("--autobatch", action="store_true")
     ap.add_argument("--autobatch_cap", type=int, default=2048)
+    ap.add_argument("--autobatch_margin", type=float, default=0.85,
+                    help="fraction of the probed max batch to actually train at "
+                         "(default 0.85). Reserves headroom for allocations the "
+                         "bare-model probe does not see (cuDNN workspace, DataLoader "
+                         "buffers, fragmentation over a long run) so training does "
+                         "not OOM partway. Lower it if you still hit OOM at large N.")
     ap.add_argument("--backends", nargs="+",
                     default=["sdpa", "nystrom_reference", "flash_nystrom"])
     ap.add_argument("--no-instrument", dest="instrument", action="store_false",
@@ -388,9 +426,12 @@ def main():
     a = ap.parse_args()
     m, ni, fdk = a.num_landmarks, a.newton_iter, a.fast_dk2inv
     img_size = a.img_size or (96 if a.dataset == "stl10" else 32)
+    DIM, HEADS = 256, 4   # TinyViT config; must match train_one's defaults
     kw = dict(epochs=a.epochs, batch_size=a.batch_size, patch_size=a.patch_size,
+              dim=DIM, heads=HEADS,
               grad_clip=a.grad_clip, autobatch=a.autobatch,
-              autobatch_cap=a.autobatch_cap, dataset=a.dataset, img_size=img_size,
+              autobatch_cap=a.autobatch_cap, autobatch_margin=a.autobatch_margin,
+              dataset=a.dataset, img_size=img_size,
               instrument=a.instrument, seed=a.seed, train_frac=a.train_frac)
 
     ks = a.kappa_star
@@ -441,6 +482,37 @@ def main():
           f"N={n_tokens} tokens  m={m}  grad_clip={a.grad_clip}  "
           f"fast_dk2inv={fdk}  kappa_star={a.kappa_star:g}  autobatch={a.autobatch}")
     print("=" * 70)
+
+    # Coordinated autobatch for a clean A/B: probe the max batch EACH arm can
+    # hold, then train EVERY arm at the MIN of those maxima. One shared batch =
+    # the comparison is not confounded by per-arm batch differences (batch size
+    # changes gradient noise / effective LR), while still using the largest batch
+    # that fits all arms. Probing respects each arm's amp setting (the fp32
+    # reference holds a smaller batch than the fp16 arms).
+    if a.autobatch and torch.cuda.is_available():
+        print("autobatch: probing max batch per arm, then using the min for ALL arms")
+        maxes = {}
+        for backend in a.backends:
+            label, fac = factories[backend]
+            amp = (backend != "nystrom_reference_fp32")
+            b = _max_batch_for(fac, DIM, HEADS, a.patch_size, img_size, 1e-3,
+                               a.autobatch_cap, amp=amp)
+            maxes[label] = b
+            print(f"  {label:>18}: max batch = {b}")
+            torch.cuda.empty_cache()
+        valid = [b for b in maxes.values() if b]
+        if valid:
+            raw = min(valid)
+            binding = [lbl for lbl, b in maxes.items() if b == raw]
+            chosen = _margin_batch(raw, a.autobatch_margin)
+            print(f"  -> max-that-fits (min over arms) = {raw} "
+                  f"(binding: {', '.join(binding)}); "
+                  f"at {a.autobatch_margin:.0%} for headroom -> batch = {chosen} for ALL arms")
+            kw["batch_size"] = chosen
+        else:
+            print(f"  -> probe found no fitting batch; falling back to --batch_size {a.batch_size}")
+        kw["autobatch"] = False   # resolved; train_one must not re-search per arm
+
     results = []
     for backend in a.backends:
         label, fac = factories[backend]

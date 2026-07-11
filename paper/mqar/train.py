@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 
 import torch
@@ -151,6 +152,11 @@ def _autobatch_config(args, train_x, train_y, device, dtype):
     cap = min(args.autobatch_cap, num_train)
     res = search_and_profile(make_trial, lo=8, cap=cap, warmup=2, iters=3)
     bs = res["batch"] if res else args.batch_size
+    # Back off the probed max: the bare-model probe misses the DataLoader/eval
+    # buffers and fragmentation a full run holds, so training at the exact max
+    # can OOM partway. Reserve headroom (round down to a multiple of 8).
+    if res:
+        bs = max(8, int(bs * args.autobatch_margin) // 8 * 8)
     # Preserve total optimizer steps vs the validated batch-256 recipe; the
     # per-config LR sweep absorbs the LR<->batch coupling.
     target_steps = math.ceil(num_train / 256) * args.epochs
@@ -285,12 +291,32 @@ def train(args):
 
     print(f"best test recall: {best_acc*100:.2f}%")
     # Training throughput + peak memory (median epoch after warmup).
+    step_ms = samp_s = peak = None
     if epoch_times:
         med = sorted(epoch_times)[len(epoch_times) // 2]
         peak = torch.cuda.max_memory_allocated() / (1024 ** 3) if device == "cuda" else 0.0
+        step_ms = med / steps_per_epoch * 1000
+        samp_s = args.num_train / med
         print(f"train profile: batch={args.batch_size} "
-              f"step_ms={med / steps_per_epoch * 1000:.2f} "
-              f"samples_per_s={args.num_train / med:.1f} peak_GiB={peak:.2f}")
+              f"step_ms={step_ms:.2f} "
+              f"samples_per_s={samp_s:.1f} peak_GiB={peak:.2f}")
+    # Structured result for notebook/aggregate collection.
+    if getattr(args, "out_json", None):
+        import json
+        rec = {
+            "backend": args.backend, "seed": args.seed,
+            "best_recall": best_acc * 100.0,
+            "seq_len": args.seq_len, "num_kv_pairs": args.num_kv_pairs,
+            "num_landmarks": args.num_landmarks, "newton_iter": args.newton_iter,
+            "kappa_star": args.kappa_star, "dim": args.dim, "depth": args.depth,
+            "heads": args.heads, "epochs": args.epochs, "batch_size": args.batch_size,
+            "grad_clip": args.grad_clip, "num_train": args.num_train,
+            "step_ms": step_ms, "samples_per_s": samp_s, "peak_GiB": peak,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.out_json)), exist_ok=True)
+        with open(args.out_json, "w") as f:
+            json.dump(rec, f, indent=2)
+        print(f"saved -> {args.out_json}")
     return best_acc
 
 
@@ -331,6 +357,10 @@ def build_parser():
                         "to preserve the batch-256 optimizer-step budget")
     p.add_argument("--autobatch_cap", type=int, default=8192,
                    help="upper bound on the auto-selected batch size")
+    p.add_argument("--autobatch_margin", type=float, default=0.85,
+                   help="fraction of the probed max batch to train at (default "
+                        "0.85); reserves headroom so a full run does not OOM after "
+                        "the bare-model probe")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--grad_clip", type=float, default=0.0,
@@ -341,6 +371,9 @@ def build_parser():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
+    p.add_argument("--out_json", type=str, default=None,
+                   help="write a structured result record (backend, seed, recall, "
+                        "config, timing) to this path for notebook/aggregate collection")
     return p
 
 
