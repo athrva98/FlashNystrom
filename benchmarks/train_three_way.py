@@ -475,13 +475,29 @@ def main():
                 d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
                                     kappa_star=ks, use_tc_pinv=True,
                                     conv_kernel_size=0, use_conv_residual=False))),
-        # flash_nystrom_leverage = segment means replaced by leverage-seeded
+        # flash_nystrom_leverage* = segment means replaced by leverage-seeded
         # Voronoi-mean landmarks (landmark_mode=1). Paired with flash_nystrom_vanilla
-        # (both kappa=0, scalar pinv) it isolates the landmark selector alone.
+        # (both kappa=0, scalar pinv) they isolate the landmark selector. Variants
+        # sweep the two selection knobs (Gumbel exploration, CLS pinning):
+        #   _lev      : gumbel 1, force 0  (Plackett-Luce, as authored)
+        #   _lev_cls  : gumbel 1, force 1  (pin the CLS token as a landmark)
+        #   _lev_det  : gumbel 0, force 1  (deterministic top-m + CLS pin)
         "flash_nystrom_leverage": ("FlashNystrom-Lev",
             lambda d, h: FlashNystromAttention(
                 d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
                                     kappa_star=0.0, use_tc_pinv=False, landmark_mode=1,
+                                    conv_kernel_size=0, use_conv_residual=False))),
+        "flash_nystrom_leverage_cls": ("FlashNystrom-LevCLS",
+            lambda d, h: FlashNystromAttention(
+                d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
+                                    kappa_star=0.0, use_tc_pinv=False, landmark_mode=1,
+                                    landmark_force_first=1,
+                                    conv_kernel_size=0, use_conv_residual=False))),
+        "flash_nystrom_leverage_det": ("FlashNystrom-LevDet",
+            lambda d, h: FlashNystromAttention(
+                d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
+                                    kappa_star=0.0, use_tc_pinv=False, landmark_mode=1,
+                                    landmark_gumbel_scale=0.0, landmark_force_first=1,
                                     conv_kernel_size=0, use_conv_residual=False))),
     }
     n_tokens = (img_size // a.patch_size) ** 2 + 1

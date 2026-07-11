@@ -198,12 +198,14 @@ static void lev_landmarks_qk(NystromParams &p,
         q_in, qt, p.BH, p.seq_len, p.num_landmarks, p.scale,
         p.lm_workspace_ptr, p.lm_workspace_bytes,
         p.landmark_seed, p.landmark_subsample, p.stream,
-        p.q_assign_ptr, p.q_cnt_ptr);
+        p.q_assign_ptr, p.q_cnt_ptr,
+        p.landmark_gumbel_scale, p.landmark_force_first);
     launch_rls_vmean_landmarks<elem_type, Dv>(
         k_in, kt, p.BH, p.seq_len, p.num_landmarks, p.scale,
         p.lm_workspace_ptr, p.lm_workspace_bytes,
         p.landmark_seed + 1, p.landmark_subsample, p.stream,
-        p.k_assign_ptr, p.k_cnt_ptr);
+        p.k_assign_ptr, p.k_cnt_ptr,
+        p.landmark_gumbel_scale, p.landmark_force_first);
 }
 
 template <typename elem_type>

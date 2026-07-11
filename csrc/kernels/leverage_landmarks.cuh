@@ -281,7 +281,8 @@ __global__ void lm_score_kernel(
     const float* __restrict__ m_in,   // (BH, D, D)
     const float* __restrict__ floor_in,
     float* __restrict__ gscore,       // (BH, N)
-    int N, int rows_per_block, uint32_t seed_lo, uint32_t seed_hi
+    int N, int rows_per_block, uint32_t seed_lo, uint32_t seed_hi,
+    float gumbel_scale, int force_first
 ) {
     constexpr int K = D / 32;                     // elems per lane
     static_assert(D % 32 == 0, "D must be a multiple of 32");
@@ -330,7 +331,14 @@ __global__ void lm_score_kernel(
             Philox4 o = philox4x32_10(c, 0xCAFEF00Du, 0xC0FFEE11u);
             const float u = philox_u01(o.v[0]);
             const float gum = -__logf(-__logf(u));
-            gb[r] = __logf(fmaxf(ell, 0.0f) + flr) + gum;
+            // gumbel_scale in [0,1] tunes exploration: 1 = Plackett-Luce sampling,
+            // 0 = deterministic top-m leverage (stable selection, no step jitter).
+            // force_first pins the first `force_first` rows as landmarks (e.g. the
+            // CLS token at position 0, which a classifier reads and which segment
+            // means always cover but leverage may drop).
+            gb[r] = (r < force_first)
+                ? CUDART_INF_F
+                : (__logf(fmaxf(ell, 0.0f) + flr) + gumbel_scale * gum);
         }
     }
 }
@@ -682,7 +690,9 @@ void launch_rls_vmean_landmarks(
     uint64_t rng_seed, int subsample,
     cudaStream_t stream,
     int* assign_out = nullptr,   // (BH, N) per-row cell id for the backward, or null
-    int* cnt_out = nullptr       // (BH, m) per-cell count for the backward, or null
+    int* cnt_out = nullptr,      // (BH, m) per-cell count for the backward, or null
+    float gumbel_scale = 1.0f,   // 1 = Plackett-Luce sampling, 0 = deterministic top-m
+    int force_first = 0          // pin rows [0, force_first) as landmarks (e.g. CLS)
 ) {
     static_assert(D == 64 || D == 128, "supported head dims: 64, 128");
     FN_CHECK(BH > 0 && N > 0 && m > 0, "launch_rls_vmean_landmarks: invalid dims");
@@ -690,6 +700,7 @@ void launch_rls_vmean_landmarks(
     FN_CHECK(m + LM_BLK <= LM_SORT_P2, "LM_SORT_P2 too small for m + LM_BLK");
     FN_CHECK(m <= N, "m > N");
     FN_CHECK(subsample >= 1, "subsample must be >= 1");
+    FN_CHECK(force_first >= 0 && force_first <= m, "force_first must be in [0, m]");
 
     int dev = 0, nsm = 0, max_smem = 0;
     FN_CUDA_CHECK(cudaGetDevice(&dev));
@@ -744,7 +755,8 @@ void launch_rls_vmean_landmarks(
         }
         lm_score_kernel<scalar_t, D><<<grid, LM_BLK, smem, stream>>>(
             x, w.minv, w.flr, w.gscore, N, rows_per_block,
-            (uint32_t)(rng_seed & 0xffffffffu), (uint32_t)(rng_seed >> 32));
+            (uint32_t)(rng_seed & 0xffffffffu), (uint32_t)(rng_seed >> 32),
+            gumbel_scale, force_first);
         FN_CUDA_KERNEL_CHECK();
     }
     // ---- 4. top-m (seeds)

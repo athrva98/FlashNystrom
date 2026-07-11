@@ -67,6 +67,8 @@ struct NystromParams {
     int landmark_mode;            // 0 or 1
     uint64_t landmark_seed;       // base RNG seed (Q uses seed, K uses seed+1)
     int landmark_subsample;       // assign-pass thinning (1 = exact)
+    float landmark_gumbel_scale;  // mode 1: 1 = Plackett-Luce, 0 = deterministic top-m
+    int landmark_force_first;     // mode 1: pin rows [0, force_first) as landmarks (CLS)
     void* __restrict__ lm_workspace_ptr;   // scratch, >= lm_workspace_bytes; mode 1 only
     size_t lm_workspace_bytes;
     int* __restrict__ q_assign_ptr;        // (B,H,N) or nullptr

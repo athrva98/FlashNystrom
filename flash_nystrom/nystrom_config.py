@@ -96,6 +96,16 @@ class NystromConfig:
     """Assign-pass thinning for mode 1 (1 = exact means). >1 systematically
     subsamples row tiles; use only at very large N."""
 
+    landmark_gumbel_scale: float = 1.0
+    """Mode 1 selection exploration. 1.0 = Plackett-Luce sampling (diverse, good
+    for clustered data / MQAR). 0.0 = deterministic top-m leverage (stable
+    selection, no step-to-step landmark jitter)."""
+
+    landmark_force_first: int = 0
+    """Mode 1: pin rows [0, force_first) as landmarks regardless of leverage.
+    Set to 1 for a CLS-token ViT so the classifier's token is always a landmark
+    (segment means always cover it; leverage may otherwise drop it)."""
+
     def __post_init__(self):
         assert self.num_landmarks > 0, "num_landmarks must be positive"
         assert self.landmark_mode in (0, 1), "landmark_mode must be 0 or 1"

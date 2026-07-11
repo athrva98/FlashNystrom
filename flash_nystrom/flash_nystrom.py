@@ -68,12 +68,14 @@ class FlashNystromFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, num_landmarks, newton_iter, fast_dk2inv,
                 kappa_star, use_tc_pinv,
-                landmark_mode=0, landmark_seed=0, landmark_subsample=1):
+                landmark_mode=0, landmark_seed=0, landmark_subsample=1,
+                landmark_gumbel_scale=1.0, landmark_force_first=0):
         assert _C is not None, "CUDA extension not available"
 
         results = _C.forward(q, k, v, num_landmarks, newton_iter,
                              kappa_star, use_tc_pinv,
-                             landmark_mode, landmark_seed, landmark_subsample)
+                             landmark_mode, landmark_seed, landmark_subsample,
+                             landmark_gumbel_scale, landmark_force_first)
         # results: [output, q_s, k_s, q_tilde, k_tilde, k2inv, step2,
         #           lse1, lse2, lse3, ns_iterates, k2_softmax, b_saved,
         #           q_assign, k_assign, q_cnt, k_cnt]
@@ -135,8 +137,10 @@ class FlashNystromFunction(torch.autograd.Function):
 
         # forward inputs: (q, k, v, num_landmarks, newton_iter, fast_dk2inv,
         # kappa_star, use_tc_pinv, landmark_mode, landmark_seed,
-        # landmark_subsample) → 11 grad outputs; only q/k/v differentiable.
-        return dQ, dK, dV, None, None, None, None, None, None, None, None
+        # landmark_subsample, landmark_gumbel_scale, landmark_force_first) → 13
+        # grad outputs; only q/k/v differentiable.
+        return (dQ, dK, dV, None, None, None, None, None,
+                None, None, None, None, None)
 
 
 # Landmark range gating constants. The custom CUDA kernels only handle m <= 64
@@ -186,6 +190,7 @@ def flash_nystrom_attention(
     q, k, v, num_landmarks=64, newton_iter=6, conv_weight=None, conv_kernel_size=0,
     fast_dk2inv=True, kappa_star=0.0, use_tc_pinv=False,
     landmark_mode=0, landmark_seed=0, landmark_subsample=1,
+    landmark_gumbel_scale=1.0, landmark_force_first=0,
 ):
     """main entry point — uses CUDA kernels if available, falls back to pytorch.
 
@@ -249,6 +254,7 @@ def flash_nystrom_attention(
             q, k, v, num_landmarks, newton_iter, fast_dk2inv,
             kappa_star, use_tc_pinv,
             landmark_mode, landmark_seed, landmark_subsample,
+            landmark_gumbel_scale, landmark_force_first,
         )
         # Add depthwise-conv residual via cuDNN if requested.
         if conv_weight is not None and conv_kernel_size > 0:
@@ -305,5 +311,7 @@ class FlashNystromAttention(nn.Module):
             landmark_mode=self.config.landmark_mode,
             landmark_seed=self.config.landmark_seed,
             landmark_subsample=self.config.landmark_subsample,
+            landmark_gumbel_scale=self.config.landmark_gumbel_scale,
+            landmark_force_first=self.config.landmark_force_first,
         )
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, N, self.dim))

@@ -39,7 +39,9 @@ std::vector<torch::Tensor> nystrom_fwd(
     bool use_tc_pinv,
     int64_t landmark_mode,
     int64_t landmark_seed,
-    int64_t landmark_subsample
+    int64_t landmark_subsample,
+    double landmark_gumbel_scale,
+    int64_t landmark_force_first
 ) {
     // Input validation
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
@@ -159,6 +161,8 @@ std::vector<torch::Tensor> nystrom_fwd(
     params.landmark_mode = static_cast<int>(landmark_mode);
     params.landmark_seed = static_cast<uint64_t>(landmark_seed);
     params.landmark_subsample = static_cast<int>(landmark_subsample);
+    params.landmark_gumbel_scale = static_cast<float>(landmark_gumbel_scale);
+    params.landmark_force_first = static_cast<int>(landmark_force_first);
     if (landmark_mode == 1) {
         params.lm_workspace_ptr = lm_workspace.data_ptr();
         params.lm_workspace_bytes = static_cast<size_t>(lm_workspace.numel());
@@ -722,7 +726,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("use_tc_pinv") = false,
           py::arg("landmark_mode") = 0,
           py::arg("landmark_seed") = 0,
-          py::arg("landmark_subsample") = 1);
+          py::arg("landmark_subsample") = 1,
+          py::arg("landmark_gumbel_scale") = 1.0,
+          py::arg("landmark_force_first") = 0);
     m.def("backward", &flash_nystrom::nystrom_bwd,
           "FlashNystrom backward (CUDA). Pass b_saved = softmax(Q_tilde @ K^T) "
           "@ V from the forward to skip the N-walk in compute_dk2inv. "
