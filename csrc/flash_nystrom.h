@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstddef>
+#include <cstdint>   // uint64_t (landmark_seed); gcc does not pull it transitively
 #include <cmath>
 
 namespace flash_nystrom {

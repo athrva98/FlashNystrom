@@ -3,6 +3,7 @@
  * Licensed under the Apache License, Version 2.0
  ******************************************************************************/
 #pragma once
+#include <cstdint>   // int64_t (gcc: not pulled transitively by cuda headers)
 #include "utils.h"
 
 namespace flash_nystrom {

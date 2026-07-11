@@ -37,6 +37,8 @@
 #pragma once
 
 #include <math_constants.h>   // CUDART_INF_F (float -inf; MSVC's INFINITY is double)
+#include <cstdint>            // uint32_t/uint64_t/uintptr_t (gcc: not transitive)
+#include <cstddef>            // size_t
 #include "utils.h"
 
 namespace flash_nystrom {
