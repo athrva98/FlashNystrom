@@ -152,6 +152,11 @@ def _autobatch_config(args, train_x, train_y, device, dtype):
     cap = min(args.autobatch_cap, num_train)
     res = search_and_profile(make_trial, lo=8, cap=cap, warmup=2, iters=3)
     bs = res["batch"] if res else args.batch_size
+    # Back off the probed max: the bare-model probe misses the DataLoader/eval
+    # buffers and fragmentation a full run holds, so training at the exact max
+    # can OOM partway. Reserve headroom (round down to a multiple of 8).
+    if res:
+        bs = max(8, int(bs * args.autobatch_margin) // 8 * 8)
     # Preserve total optimizer steps vs the validated batch-256 recipe; the
     # per-config LR sweep absorbs the LR<->batch coupling.
     target_steps = math.ceil(num_train / 256) * args.epochs
@@ -353,6 +358,10 @@ def build_parser():
                         "to preserve the batch-256 optimizer-step budget")
     p.add_argument("--autobatch_cap", type=int, default=8192,
                    help="upper bound on the auto-selected batch size")
+    p.add_argument("--autobatch_margin", type=float, default=0.85,
+                   help="fraction of the probed max batch to train at (default "
+                        "0.85); reserves headroom so a full run does not OOM after "
+                        "the bare-model probe")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--grad_clip", type=float, default=0.0,
