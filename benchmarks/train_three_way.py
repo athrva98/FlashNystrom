@@ -146,6 +146,25 @@ class TinyViT(nn.Module):
         ])
         self.head = nn.Linear(dim, num_classes)
         self.norm = nn.LayerNorm(dim)
+        # Proper ViT init (DeiT/timm): truncated-normal std 0.02 on all Linear/Conv
+        # weights, zero bias, LayerNorm (1,0). PyTorch's DEFAULT nn.Linear init is
+        # Kaiming-uniform (a=sqrt(5)) -- tuned for ReLU CNNs, too large for a
+        # transformer; it makes early training unstable and the outcome
+        # seed-dependent (the bimodal 32K result). This is the more fundamental fix
+        # than warmup; correct init reduces the reliance on it (cf. T-Fixup).
+        self.apply(self._init_weights)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, (nn.Linear, nn.Conv2d)):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
 
     def forward(self, x):
         B = x.shape[0]
