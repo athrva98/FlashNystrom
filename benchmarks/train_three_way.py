@@ -80,7 +80,18 @@ class SDPAAttention(nn.Module):
         q = self.q_proj(x).view(B, N, H, D).transpose(1, 2)
         k = self.k_proj(x).view(B, N, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, N, H, D).transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v)
+        # Pin sdpa to FlashAttention / mem-efficient (never the math backend that
+        # materializes the (N,N) scores). Full attention is then O(N) MEMORY and fits
+        # at N=9216/32401 on an 80GB A100 -- it's O(N^2) COMPUTE (slow), not memory.
+        # Falling to default dispatch on older torch still prefers Flash on A100.
+        try:
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            _ctx = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+        except Exception:
+            import contextlib
+            _ctx = contextlib.nullcontext()
+        with _ctx:
+            out = F.scaled_dot_product_attention(q, k, v)
         return self.out_proj(out.transpose(1, 2).contiguous().view(B, N, -1))
 
 
