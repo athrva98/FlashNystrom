@@ -207,7 +207,7 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
               patch_size=4, dim=256, heads=4, grad_clip=1.0,
               autobatch=False, autobatch_cap=2048, autobatch_margin=0.85,
               dataset="cifar10", img_size=32,
-              instrument=False, seed=42, amp=True, train_frac=1.0):
+              instrument=False, seed=42, amp=True, train_frac=1.0, warmup_frac=0.1):
     if autobatch and torch.cuda.is_available():
         # Standalone per-arm autobatch (used when train_one is called directly).
         # The main() A/B path instead resolves ONE shared batch across all arms
@@ -264,7 +264,20 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
     model = TinyViT(attn_factory, dim=dim, depth=4, heads=heads,
                     patch_size=patch_size, img_size=img_size).cuda()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    # Linear LR warmup -> cosine decay. A from-scratch ViT trained with cosine from
+    # step 0 (no warmup) is unstable early: on random init a high initial LR makes
+    # "does it escape the underfit basin" a seed coin-flip -> the bimodal 32K result
+    # (some seeds take off, others stall). Warmup is the standard ViT stabilizer;
+    # it collapses that variance. warmup_epochs = round(warmup_frac * epochs).
+    warm = max(1, round(warmup_frac * epochs)) if warmup_frac > 0 else 0
+    if 0 < warm < epochs:
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            [torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warm),
+             torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warm)],
+            milestones=[warm])
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
 
     # Per-step / per-attention-layer instrumentation on the SAME run that
@@ -434,6 +447,10 @@ def main():
                          "Use at large N (e.g. 32K) to cut wall-clock.")
     ap.add_argument("--out_json", type=str, default="three_way_results.json",
                     help="where to write the structured per-backend results")
+    ap.add_argument("--warmup_frac", type=float, default=0.1,
+                    help="fraction of epochs for linear LR warmup before cosine decay "
+                         "(default 0.1). Stabilizes from-scratch ViT training; 0 = no "
+                         "warmup (old behavior, bimodal at large N / small batch).")
     a = ap.parse_args()
     m, ni, fdk = a.num_landmarks, a.newton_iter, a.fast_dk2inv
     img_size = a.img_size or (96 if a.dataset == "stl10" else 32)
@@ -443,7 +460,8 @@ def main():
               grad_clip=a.grad_clip, autobatch=a.autobatch,
               autobatch_cap=a.autobatch_cap, autobatch_margin=a.autobatch_margin,
               dataset=a.dataset, img_size=img_size,
-              instrument=a.instrument, seed=a.seed, train_frac=a.train_frac)
+              instrument=a.instrument, seed=a.seed, train_frac=a.train_frac,
+              warmup_frac=a.warmup_frac)
 
     ks = a.kappa_star
     factories = {
