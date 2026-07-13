@@ -1,0 +1,13 @@
+# Coverage configuration for the FlashNystrom test suite.
+[run]
+branch = False
+
+[report]
+# Lines that are conventionally not exercised by unit tests: the module
+# `__main__` guard (scripts are driven through main() directly in tests, never
+# as __main__), explicit no-cover pragmas, and unreachable defensive raises.
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    raise AssertionError\("unreachable"\)
