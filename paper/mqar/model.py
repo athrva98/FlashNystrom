@@ -64,6 +64,41 @@ class SdpaAttention(nn.Module):
         return self.out_proj(o)
 
 
+class LinearAttention(nn.Module):
+    """Bidirectional linear attention (Katharopoulos et al., 2020), feature map
+    phi(x) = elu(x) + 1.
+
+    Computes O = phi(Q) (phi(K)^T V) / (phi(Q) sum_j phi(K_j)) in O(N d^2), the
+    canonical sub-quadratic attention approximation. Same projection structure as
+    the other backends, so swapping it in is a controlled operator change. This is
+    the linear-attention point in Zoology's MQAR comparison (Arora et al., 2023)."""
+
+    def __init__(self, dim: int, heads: int):
+        super().__init__()
+        if dim % heads != 0:
+            raise ValueError(f"dim {dim} not divisible by heads {heads}")
+        self.dim, self.heads, self.head_dim = dim, heads, dim // heads
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, _ = x.shape
+        H, D = self.heads, self.head_dim
+        q = self.q_proj(x).view(B, N, H, D).transpose(1, 2)
+        k = self.k_proj(x).view(B, N, H, D).transpose(1, 2)
+        v = self.v_proj(x).view(B, N, H, D).transpose(1, 2)
+        qf = F.elu(q) + 1.0
+        kf = F.elu(k) + 1.0
+        kv = kf.transpose(-2, -1) @ v            # (B, H, D, D)
+        z = kf.sum(dim=2)                        # (B, H, D)
+        num = qf @ kv                            # (B, H, N, D)
+        den = (qf @ z.unsqueeze(-1)) + 1e-6      # (B, H, N, 1)
+        o = (num / den).transpose(1, 2).contiguous().view(B, N, self.dim)
+        return self.out_proj(o)
+
+
 class NystromReferenceAttention(nn.Module):
     """Pure-PyTorch Nystrom attention: the exact same Nystrom math as the
     FlashNystrom kernels (segment-mean landmarks, three softmaxes, FP32
@@ -128,6 +163,7 @@ def build_attention(
     newton_iter: int = 6,
     use_conv_residual: bool = False,
     kappa_star: float = 1.0e3,
+    seq_len: int = None,
 ) -> nn.Module:
     if backend == "sdpa":
         return SdpaAttention(dim, heads, causal=causal)
@@ -172,6 +208,18 @@ def build_attention(
         # FlashNystromAttention owns its own q/k/v/out projections, matching
         # SdpaAttention's structure.
         return FlashNystromAttention(dim, heads=heads, config=cfg)
+    if backend == "linear_attention":
+        if causal:
+            raise ValueError("linear attention is bidirectional here; causal not implemented")
+        return LinearAttention(dim, heads)
+    if backend == "hyena":
+        from .baselines import HyenaMixer
+        if seq_len is None:
+            raise ValueError("hyena requires seq_len (max sequence length for l_max)")
+        return HyenaMixer(dim, heads, seq_len=seq_len)
+    if backend == "mamba":
+        from .baselines import MambaMixer
+        return MambaMixer(dim, heads)
     raise ValueError(f"unknown backend {backend!r}")
 
 
@@ -269,7 +317,7 @@ class MQARModel(nn.Module):
             if i % 2 == 0:
                 mixer = BaseConv(dim, conv_kernel_size)
             else:
-                mixer = build_attention(backend, dim, heads, **attn_kw)
+                mixer = build_attention(backend, dim, heads, seq_len=max_seq_len, **attn_kw)
             layers.append(ResidualSublayer(dim, mixer))
         self.layers = nn.ModuleList(layers)
 
