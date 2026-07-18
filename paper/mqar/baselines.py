@@ -31,6 +31,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+# Real Mamba CUDA kernels when installed (fast, the way Mamba is actually run).
+# Without them, Mamba falls back to the pure-PyTorch reference scan below, which
+# is correct but ~1000x slower (a Python loop over the sequence). The local
+# sm_120 card cannot build these; supported archs (Colab A100/L4/T4>=sm80) can,
+# via `pip install mamba-ssm causal-conv1d` (see the Colab notebook).
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as _selective_scan_cuda
+    from causal_conv1d import causal_conv1d_fn as _causal_conv1d_cuda
+    _HAS_MAMBA_CUDA = True
+except Exception:
+    _selective_scan_cuda = None
+    _causal_conv1d_cuda = None
+    _HAS_MAMBA_CUDA = False
+
 
 # =========================================================================== #
 # Mamba selective-scan reference (state-spaces/mamba, verbatim)
@@ -334,7 +348,8 @@ class Mamba(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
     def forward(self, hidden_states):
-        """hidden_states: (B, L, D) -> (B, L, D). Pure-PyTorch reference path."""
+        """hidden_states: (B, L, D) -> (B, L, D). Uses the Mamba CUDA kernels when
+        installed, else the pure-PyTorch reference scan."""
         batch, seqlen, dim = hidden_states.shape
         xz = rearrange(self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
                        "d (b l) -> b d l", l=seqlen)
@@ -342,15 +357,20 @@ class Mamba(nn.Module):
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
         A = -torch.exp(self.A_log.float())
         x, z = xz.chunk(2, dim=1)
-        x = self.act(self.conv1d(x)[..., :seqlen])  # causal short conv (kernel fallback)
+        if _HAS_MAMBA_CUDA:
+            x = _causal_conv1d_cuda(x, rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                                    self.conv1d.bias, None, self.activation)
+        else:
+            x = self.act(self.conv1d(x)[..., :seqlen])  # causal short conv
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = self.dt_proj.weight @ dt.t()
         dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        y = selective_scan_ref(x, dt, A, B, C, self.D.float(), z=z,
-                               delta_bias=self.dt_proj.bias.float(), delta_softplus=True)
+        scan = _selective_scan_cuda if _HAS_MAMBA_CUDA else selective_scan_ref
+        y = scan(x, dt, A, B, C, self.D.float(), z=z,
+                 delta_bias=self.dt_proj.bias.float(), delta_softplus=True)
         y = rearrange(y, "b d l -> b l d")
         return self.out_proj(y)
 
