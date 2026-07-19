@@ -358,8 +358,11 @@ class Mamba(nn.Module):
         A = -torch.exp(self.A_log.float())
         x, z = xz.chunk(2, dim=1)
         if _HAS_MAMBA_CUDA:
+            # keyword bias=/activation= : recent causal_conv1d inserted an
+            # initial_states parameter, so passing activation positionally lands
+            # it in the wrong slot.
             x = _causal_conv1d_cuda(x, rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                                    self.conv1d.bias, None, self.activation)
+                                    bias=self.conv1d.bias, activation=self.activation)
         else:
             x = self.act(self.conv1d(x)[..., :seqlen])  # causal short conv
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
