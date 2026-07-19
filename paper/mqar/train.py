@@ -165,6 +165,47 @@ def _autobatch_config(args, train_x, train_y, device, dtype):
     return bs, epochs, eval_every
 
 
+def build_optimizer(model, lr, weight_decay):
+    """AdamW that honors the per-parameter optimizer conventions the vendored
+    baselines carry, so each method trains as its authors intend:
+
+      * Hyena tags its implicit-filter and positional-embedding parameters with
+        `_optim` (the filter is designed to train at lr=1e-3 and the positional
+        embedding at lr=1e-5, far below the base lr).
+      * Mamba tags A_log and D with `_no_weight_decay`.
+
+    The other backends (sdpa, linear_attention, nystrom, flash_nystrom) set
+    neither, so all of their parameters land in the default group at the base
+    lr/wd. A single flat AdamW would train Hyena's filter 10--1000x too hot and
+    weight-decay Mamba's A_log/D, i.e. run those two methods incorrectly."""
+    default, no_decay, custom = [], [], []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        if hasattr(p, "_optim"):
+            custom.append(p)
+        elif getattr(p, "_no_weight_decay", False):
+            no_decay.append(p)
+        else:
+            default.append(p)
+    groups = [
+        {"params": default, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    # One group per unique `_optim` config (Hyena: filter lr=1e-3, pos-emb lr=1e-5).
+    seen = set()
+    for p in custom:
+        key = frozenset(p._optim.items())
+        if key in seen:
+            continue
+        seen.add(key)
+        grp = {"params": [q for q in custom if frozenset(q._optim.items()) == key]}
+        grp.update(dict(p._optim))
+        groups.append(grp)
+    groups = [g for g in groups if len(g["params"]) > 0]
+    return torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
+
+
 def train(args):
     torch.manual_seed(args.seed)
     device = args.device
@@ -224,7 +265,7 @@ def train(args):
         f"train={args.num_train} test={args.num_test}"
     )
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = build_optimizer(model, args.lr, args.weight_decay)
     steps_per_epoch = math.ceil(args.num_train / args.batch_size)
     # Zoology's MQAR recipe: cosine-anneal from the full LR over all epochs,
     # stepped once PER EPOCH with NO warmup. MQAR's phase transition fires late
