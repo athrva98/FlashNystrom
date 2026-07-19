@@ -351,7 +351,7 @@ def train(args):
             "num_landmarks": args.num_landmarks, "newton_iter": args.newton_iter,
             "kappa_star": args.kappa_star, "dim": args.dim, "depth": args.depth,
             "heads": args.heads, "epochs": args.epochs, "batch_size": args.batch_size,
-            "grad_clip": args.grad_clip, "num_train": args.num_train,
+            "grad_clip": args.grad_clip, "num_train": args.num_train, "lr": args.lr,
             "step_ms": step_ms, "samples_per_s": samp_s, "peak_GiB": peak,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.out_json)), exist_ok=True)
