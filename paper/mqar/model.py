@@ -296,13 +296,17 @@ class MQARModel(nn.Module):
         conv_kernel_size: int = 3,
         embed_dropout: float = 0.1,
         use_pos_emb: bool = False,
+        layer_layout: str = "hybrid",
         **attn_kw,
     ):
         super().__init__()
         if init not in ("normal", "orthogonal"):
             raise ValueError(f"init must be 'normal' or 'orthogonal', got {init!r}")
+        if layer_layout not in ("hybrid", "uniform"):
+            raise ValueError(f"layer_layout must be 'hybrid' or 'uniform', got {layer_layout!r}")
         self.init = init
         self.max_seq_len = max_seq_len
+        self.layer_layout = layer_layout
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.use_pos_emb = use_pos_emb
@@ -310,14 +314,22 @@ class MQARModel(nn.Module):
             self.pos_emb = nn.Embedding(max_seq_len, dim)
         self.embed_drop = nn.Dropout(embed_dropout)
 
-        # Even layers: causal short-conv mixer. Odd layers: attention (the
-        # swappable backend). Matches Zoology's Hybrid(configs[layer_idx % len]).
+        # hybrid (default, Zoology's original_mqar_configs / models_repo recipe):
+        #   even layers a causal short-conv mixer (BaseConv), odd layers the
+        #   swappable backend -- Hybrid(configs[layer_idx % len]). Every mixer is
+        #   hybridized with a short conv "for fair comparison" (Zoology README).
+        # uniform (Zoology's iclr24_zoology_figure2 recipe): EVERY layer is the
+        #   backend mixer, no BaseConv (zoology/model.py builds each block from the
+        #   same config.sequence_mixer). This is the setting the DeltaNet paper's
+        #   Figure 4 uses ("we do not use convolutions for these experiments");
+        #   the sub-quadratic mixers carry order through their own conv/recurrence.
         layers = []
         for i in range(depth):
-            if i % 2 == 0:
-                mixer = BaseConv(dim, conv_kernel_size)
-            else:
-                mixer = build_attention(backend, dim, heads, seq_len=max_seq_len, **attn_kw)
+            use_mixer = layer_layout == "uniform" or i % 2 == 1
+            mixer = (
+                build_attention(backend, dim, heads, seq_len=max_seq_len, **attn_kw)
+                if use_mixer else BaseConv(dim, conv_kernel_size)
+            )
             layers.append(ResidualSublayer(dim, mixer))
         self.layers = nn.ModuleList(layers)
 

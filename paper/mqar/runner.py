@@ -44,17 +44,24 @@ GRAD_RE = re.compile(rf"grad_norm {_NUM}")
 TRAIN_MODULE = "paper.mqar.train"
 
 
+# train.py's BooleanOptionalAction flags: for these, False must emit --no-<name>
+# (their default may be True, so omitting the flag does NOT turn them off). Every
+# other boolean flag is plain store_true, for which argparse rejects a --no- form
+# and False must emit nothing. Keep this in sync with build_parser() in train.py.
+_OPTIONAL_BOOL_FLAGS = frozenset({"fresh_data", "random_non_queries"})
+
+
 def _flag(name: str, value) -> list[str]:
     """One CLI token pair, or nothing.
 
-    True emits a bare ``--name``; False emits NOTHING rather than ``--no-name``.
-    Most of train.py's boolean flags are plain ``store_true`` (--autobatch,
-    --diag, --conv), and argparse rejects a ``--no-`` form for those outright.
-    The one BooleanOptionalAction flag (--fresh_data) defaults to its off state
-    anyway; a caller who genuinely needs to spell ``--no-fresh_data`` passes it
-    through ``extra``.
+    Booleans: a BooleanOptionalAction flag (see ``_OPTIONAL_BOOL_FLAGS``) emits
+    ``--name`` for True and ``--no-name`` for False, so the caller's intent
+    survives regardless of the flag's default. A plain store_true flag emits
+    ``--name`` for True and NOTHING for False (argparse rejects ``--no-`` there).
     """
     if isinstance(value, bool):
+        if name in _OPTIONAL_BOOL_FLAGS:
+            return [f"--{name}"] if value else [f"--no-{name}"]
         return [f"--{name}"] if value else []
     return [f"--{name}", str(value)]
 

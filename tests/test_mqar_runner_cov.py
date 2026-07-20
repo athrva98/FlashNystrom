@@ -58,6 +58,31 @@ def test_build_cmd_false_emits_nothing():
     assert build_cmd(backend="sdpa", diag=False)[4:] == ["--backend", "sdpa"]
 
 
+def test_build_cmd_optional_bool_false_emits_no_form():
+    # BooleanOptionalAction flags default True, so False MUST emit --no-<name>;
+    # omitting it would silently leave the default on.
+    assert build_cmd(backend="sdpa", random_non_queries=False)[4:] == \
+           ["--backend", "sdpa", "--no-random_non_queries"]
+
+
+def test_build_cmd_optional_bool_true_emits_bare_flag():
+    assert build_cmd(backend="sdpa", fresh_data=True)[4:] == \
+           ["--backend", "sdpa", "--fresh_data"]
+
+
+@pytest.mark.parametrize("flag,val,expected", [
+    ("random_non_queries", False, "--no-random_non_queries"),
+    ("random_non_queries", True, "--random_non_queries"),
+    ("fresh_data", False, "--no-fresh_data"),
+    ("layer_layout", "uniform", "--layer_layout"),
+])
+def test_build_cmd_new_flags_parse_under_train(flag, val, expected):
+    # the generated token(s) must be accepted by train.py's own parser
+    argv = build_cmd(backend="hyena", **{flag: val})[4:]
+    assert expected in argv
+    build_parser().parse_args(argv)
+
+
 def test_build_cmd_appends_extra_verbatim():
     assert build_cmd(backend="sdpa", extra=["--epochs", "1"])[-2:] == ["--epochs", "1"]
 

@@ -216,6 +216,7 @@ def train(args):
         seq_len=args.seq_len,
         num_kv_pairs=args.num_kv_pairs,
         power_a=args.power_a,
+        random_non_queries=args.random_non_queries,
     )
     # Fresh synthetic data each epoch (standard MQAR practice): the model can
     # never overfit a fixed train set, which makes the phase transition far more
@@ -247,6 +248,7 @@ def train(args):
         newton_iter=args.newton_iter,
         use_conv_residual=args.conv,
         kappa_star=args.kappa_star,
+        layer_layout=args.layer_layout,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -332,6 +334,13 @@ def train(args):
                 line += (f"  grad_norm {last_gn:.3f}  cond_K2 {d['cond_K2']:.2e}  "
                          f"cond_M {d['cond_M']:.2e}  pinv_resid {d['pinv_resid']:.2e}")
             print(line)
+            # Zoology stops a run once validation accuracy clears the threshold
+            # (config.py:133-134, early_stopping_threshold=0.99). Only cuts epochs
+            # off already-solved runs, so it cannot lower the reported best recall.
+            if args.early_stop_acc > 0 and acc >= args.early_stop_acc:
+                print(f"early stop at epoch {epoch+1}: test recall {acc*100:.2f}% "
+                      f">= {args.early_stop_acc*100:.2f}%")
+                break
 
     print(f"best test recall: {best_acc*100:.2f}%")
     # Training throughput + peak memory (median epoch after warmup).
@@ -356,6 +365,10 @@ def train(args):
             "heads": args.heads, "epochs": args.epochs, "batch_size": args.batch_size,
             "num_train": args.num_train, "lr": args.lr,
             "step_ms": step_ms, "samples_per_s": samp_s, "peak_GiB": peak,
+            # protocol provenance (which recipe this number came from)
+            "num_test": args.num_test, "layer_layout": args.layer_layout,
+            "random_non_queries": args.random_non_queries,
+            "early_stop_acc": args.early_stop_acc,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.out_json)), exist_ok=True)
         with open(args.out_json, "w") as f:
@@ -373,6 +386,11 @@ def build_parser():
     p.add_argument("--power_a", type=float, default=0.01)
     p.add_argument("--num_train", type=int, default=20000)
     p.add_argument("--num_test", type=int, default=2000)
+    p.add_argument("--random_non_queries", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="fill non-query slots with random tokens (generate_mqar "
+                        "default). Zoology's iclr24_zoology_figure2 config sets this "
+                        "False (blank slots); pass --no-random_non_queries to match it.")
     # model
     p.add_argument(
         "--backend",
@@ -383,6 +401,11 @@ def build_parser():
     p.add_argument("--dim", type=int, default=128)
     p.add_argument("--depth", type=int, default=2)
     p.add_argument("--heads", type=int, default=2, help="dim/heads must be 64 or 128 for flash_nystrom")
+    p.add_argument("--layer_layout", choices=["hybrid", "uniform"], default="hybrid",
+                   help="hybrid (default): even BaseConv / odd mixer, Zoology's "
+                        "original_mqar_configs + models_repo recipe. uniform: every "
+                        "layer is the mixer, no BaseConv -- the iclr24_zoology_figure2 "
+                        "recipe the DeltaNet paper's MQAR figure uses.")
     p.add_argument("--num_landmarks", type=int, default=64)
     p.add_argument("--newton_iter", type=int, default=6)
     p.add_argument("--kappa_star", type=float, default=1.0e3,
@@ -408,6 +431,10 @@ def build_parser():
                         "the bare-model probe")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--weight_decay", type=float, default=0.1)
+    p.add_argument("--early_stop_acc", type=float, default=0.0,
+                   help="stop once test recall reaches this fraction (Zoology's "
+                        "early_stopping_threshold=0.99, config.py:134). 0 disables. "
+                        "Only trims already-solved runs, never lowers reported recall.")
     p.add_argument("--fresh_data", action=argparse.BooleanOptionalAction, default=False,
                    help="regenerate train data each epoch (standard MQAR; --no-fresh_data reuses a fixed set)")
     # run

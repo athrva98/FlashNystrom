@@ -230,6 +230,37 @@ def test_model_depth1_is_conv_only():
     assert len(m.layers) == 1 and isinstance(m.layers[0].mixer, BaseConv)
 
 
+def test_model_hybrid_is_default_layout():
+    m = MQARModel(64, 128, dim=64, depth=2, backend="sdpa")
+    assert m.layer_layout == "hybrid"
+
+
+def test_model_uniform_layout_all_mixer_no_conv():
+    # figure-2 / DeltaNet-figure recipe: every layer is the mixer, no BaseConv
+    m = MQARModel(64, 128, dim=64, depth=2, heads=2, backend="sdpa",
+                  layer_layout="uniform")
+    assert all(isinstance(l.mixer, SdpaAttention) for l in m.layers)
+    assert not any(isinstance(l.mixer, BaseConv) for l in m.layers)
+
+
+def test_model_uniform_depth1_is_mixer():
+    m = MQARModel(64, 128, dim=64, depth=1, backend="sdpa", layer_layout="uniform")
+    assert len(m.layers) == 1 and isinstance(m.layers[0].mixer, SdpaAttention)
+
+
+@pytest.mark.parametrize("bad", ["alternating", "", "Uniform", "hybrid2"])
+def test_model_bad_layer_layout_raises(bad):
+    with pytest.raises(ValueError, match="layer_layout must be"):
+        MQARModel(64, 128, backend="sdpa", layer_layout=bad)
+
+
+@pytest.mark.parametrize("layout", ["hybrid", "uniform"])
+def test_model_both_layouts_forward(layout):
+    m = MQARModel(64, 128, dim=64, depth=2, heads=2, backend="sdpa", layer_layout=layout)
+    out = m(torch.randint(0, 64, (2, 64)))
+    assert out.shape == (2, 64, 64) and torch.isfinite(out).all()
+
+
 @pytest.mark.parametrize("init", ["normal", "orthogonal"])
 def test_model_init_schemes(init):
     m = MQARModel(64, 128, dim=64, depth=2, backend="sdpa", init=init)
