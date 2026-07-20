@@ -23,13 +23,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
-import subprocess
-import sys
 
-_BEST = re.compile(r"best test recall:\s*([\d.]+)%")
-_PROF = re.compile(r"train profile: batch=(\d+) step_ms=([\d.]+) "
-                   r"samples_per_s=([\d.]+) peak_GiB=([\d.]+)")
+from .runner import run_train
 
 
 def run_one(backend, seq_len, kv, lr, passthrough):
@@ -37,20 +32,16 @@ def run_one(backend, seq_len, kv, lr, passthrough):
     # batch 256) -- NOT autobatch, whose recall is unverified. No gradient
     # clipping: no paper in this lineage specifies it for the recall synthetics.
     # The training profile (step_ms/peak_gib) is reported at that fixed batch.
-    cmd = [
-        sys.executable, "-m", "paper.mqar.train",
-        "--backend", backend, "--seq_len", str(seq_len), "--num_kv_pairs", str(kv),
-        "--lr", str(lr),
-    ] + passthrough
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    m = _BEST.search(proc.stdout)
-    if m is None:
+    res = run_train(backend=backend, seq_len=seq_len, num_kv_pairs=kv, lr=lr,
+                    extra=passthrough)
+    if res.get("recall") is None:
         return None
-    prof = _PROF.search(proc.stdout)
-    rec = {"recall": float(m.group(1))}
-    if prof:
-        rec.update(batch=int(prof.group(1)), step_ms=float(prof.group(2)),
-                   samp_s=float(prof.group(3)), peak_gib=float(prof.group(4)))
+    rec = {"recall": res["recall"]}
+    # runner's canonical names -> this script's shorter column names
+    for src, dst in (("batch", "batch"), ("step_ms", "step_ms"),
+                     ("samples_per_s", "samp_s"), ("peak_GiB", "peak_gib")):
+        if res.get(src) is not None:
+            rec[dst] = res[src]
     return rec
 
 

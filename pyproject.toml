@@ -57,3 +57,13 @@ bench = [
 
 [tool.setuptools.packages.find]
 include = ["flash_nystrom*"]
+
+[tool.pytest.ini_options]
+# Scope collection to the real suites. Without this, a bare `pytest` at the repo
+# root walks into two places it must not:
+#   * benchmarks/k2inv*_test.py -- developer scripts whose names match pytest's
+#     default `*_test.py` pattern and which call sys.exit() at import, aborting
+#     collection with INTERNALERROR;
+#   * third_party/cutlass -- 8 vendored test files from the submodule.
+# CI already passes `tests/` explicitly; this makes a bare `pytest` agree with it.
+testpaths = ["tests", "paper"]

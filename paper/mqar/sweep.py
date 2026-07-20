@@ -22,28 +22,21 @@ Any unrecognized flags (e.g. --epochs, --num_landmarks) pass through to train.
 from __future__ import annotations
 
 import argparse
-import re
 import statistics
-import subprocess
-import sys
 from itertools import product
 
-_BEST = re.compile(r"best test recall:\s*([\d.]+)%")
+from .runner import build_cmd, run_train
 
 
 def run_one(backend, heads, dim, init, seed, lr, passthrough):
-    cmd = [
-        sys.executable, "-m", "paper.mqar.train",
-        "--backend", backend, "--heads", str(heads), "--dim", str(dim),
-        "--init", init, "--seed", str(seed), "--lr", str(lr),
-    ] + passthrough
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    m = _BEST.search(proc.stdout)
-    if m is None:
+    kw = dict(backend=backend, heads=heads, dim=dim, init=init, seed=seed, lr=lr)
+    res = run_train(extra=passthrough, **kw)
+    if res.get("recall") is None:
+        cmd = build_cmd(extra=passthrough, **kw)
         print(f"    !! FAILED lr={lr}: {' '.join(cmd)}")
-        print("    " + (proc.stdout[-300:] or proc.stderr[-300:]).replace("\n", "\n    "))
+        print("    " + (res.get("output", "")[-300:]).replace("\n", "\n    "))
         return None
-    return float(m.group(1))
+    return res["recall"]
 
 
 def main():
