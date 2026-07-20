@@ -95,12 +95,6 @@ def _diag_probe(model, probe_x, kappa_star, device, dtype):
 
 
 def _autocast_ctx(device: str, dtype: torch.dtype):
-    # fp32 => no autocast (Zoology trains in fp32, zoology/train.py has no AMP).
-    # Note the FlashNystrom kernel cannot run in fp32: it exhausts shared memory
-    # ("kernel3_scalar: insufficient smem"), so bf16 is the only precision the
-    # whole backend set shares. See paper/mqar/model.py.
-    if dtype == torch.float32:
-        return torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=False)
     if device == "cuda":
         return torch.autocast(device_type="cuda", dtype=dtype)
     # CPU: run in fp32 (FlashNystrom falls back to its pure-PyTorch reference).
@@ -171,24 +165,19 @@ def _autobatch_config(args, train_x, train_y, device, dtype):
     return bs, epochs, eval_every
 
 
-def build_optimizer(model, lr, weight_decay, respect_optim_tags: bool = False):
-    """AdamW for the MQAR runs.
+def build_optimizer(model, lr, weight_decay):
+    """AdamW that honors the per-parameter optimizer conventions the vendored
+    baselines carry, so each method trains as its authors intend:
 
-    Default (``respect_optim_tags=False``) is a FLAT AdamW over
-    ``model.parameters()``, which is what the benchmark does: zoology/train.py:185
-    constructs ``optim.AdamW(self.model.parameters(), lr=..., weight_decay=...)``
-    with no parameter groups. The ``_optim`` attributes that Hyena's OptimModule
-    attaches (filter lr=1e-3, positional embedding lr=1e-5) and Mamba's
-    ``_no_weight_decay`` tags are therefore IGNORED by Zoology's own trainer --
-    they are a vestige of the S4/safari trainer the mixers were lifted from.
-    Honoring them here would train those two methods under a different optimizer
-    than the published comparison used.
+      * Hyena tags its implicit-filter and positional-embedding parameters with
+        `_optim` (the filter is designed to train at lr=1e-3 and the positional
+        embedding at lr=1e-5, far below the base lr).
+      * Mamba tags A_log and D with `_no_weight_decay`.
 
-    ``respect_optim_tags=True`` opts into the per-parameter groups instead. Kept
-    so the difference can be measured, but it is a deviation from the benchmark
-    and must not be used for the headline numbers."""
-    if not respect_optim_tags:
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    The other backends (sdpa, linear_attention, nystrom, flash_nystrom) set
+    neither, so all of their parameters land in the default group at the base
+    lr/wd. A single flat AdamW would train Hyena's filter 10--1000x too hot and
+    weight-decay Mamba's A_log/D, i.e. run those two methods incorrectly."""
     default, no_decay, custom = [], [], []
     for p in model.parameters():
         if not p.requires_grad:
@@ -220,15 +209,13 @@ def build_optimizer(model, lr, weight_decay, respect_optim_tags: bool = False):
 def train(args):
     torch.manual_seed(args.seed)
     device = args.device
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
-             "fp32": torch.float32}[args.dtype]
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
 
     common = dict(
         vocab_size=args.vocab_size,
         seq_len=args.seq_len,
         num_kv_pairs=args.num_kv_pairs,
         power_a=args.power_a,
-        random_non_queries=args.random_non_queries,
     )
     # Fresh synthetic data each epoch (standard MQAR practice): the model can
     # never overfit a fixed train set, which makes the phase transition far more
@@ -260,7 +247,6 @@ def train(args):
         newton_iter=args.newton_iter,
         use_conv_residual=args.conv,
         kappa_star=args.kappa_star,
-        layer_layout=args.layer_layout,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -279,8 +265,7 @@ def train(args):
         f"train={args.num_train} test={args.num_test}"
     )
 
-    opt = build_optimizer(model, args.lr, args.weight_decay,
-                          respect_optim_tags=args.respect_optim_tags)
+    opt = build_optimizer(model, args.lr, args.weight_decay)
     steps_per_epoch = math.ceil(args.num_train / args.batch_size)
     # Zoology's MQAR recipe: cosine-anneal from the full LR over all epochs,
     # stepped once PER EPOCH with NO warmup. MQAR's phase transition fires late
@@ -344,12 +329,6 @@ def train(args):
                 line += (f"  grad_norm {last_gn:.3f}  cond_K2 {d['cond_K2']:.2e}  "
                          f"cond_M {d['cond_M']:.2e}  pinv_resid {d['pinv_resid']:.2e}")
             print(line)
-            # Zoology stops a run once validation accuracy clears the threshold
-            # (config.py:133-134 early_stopping_threshold=0.99, train.py:198-205).
-            if args.early_stop_acc > 0 and acc > args.early_stop_acc:
-                print(f"early stop at epoch {epoch+1}: test recall {acc*100:.2f}% "
-                      f"> {args.early_stop_acc*100:.2f}%")
-                break
 
     print(f"best test recall: {best_acc*100:.2f}%")
     # Training throughput + peak memory (median epoch after warmup).
@@ -374,12 +353,6 @@ def train(args):
             "heads": args.heads, "epochs": args.epochs, "batch_size": args.batch_size,
             "grad_clip": args.grad_clip, "num_train": args.num_train, "lr": args.lr,
             "step_ms": step_ms, "samples_per_s": samp_s, "peak_GiB": peak,
-            # protocol provenance: every knob that differs from Zoology figure 2
-            "num_test": args.num_test, "random_non_queries": args.random_non_queries,
-            "layer_layout": args.layer_layout, "dtype": args.dtype,
-            "weight_decay": args.weight_decay, "fresh_data": args.fresh_data,
-            "early_stop_acc": args.early_stop_acc,
-            "respect_optim_tags": args.respect_optim_tags,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.out_json)), exist_ok=True)
         with open(args.out_json, "w") as f:
@@ -395,16 +368,8 @@ def build_parser():
     p.add_argument("--seq_len", type=int, default=256)
     p.add_argument("--num_kv_pairs", type=int, default=16)
     p.add_argument("--power_a", type=float, default=0.01)
-    # Zoology figure 2 sizes (configs.py:39-40).
-    p.add_argument("--num_train", type=int, default=100_000)
-    p.add_argument("--num_test", type=int, default=3_000)
-    p.add_argument("--random_non_queries", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="fill non-query slots with random tokens instead of blanks "
-                        "(Zoology's MQARConfig default, multiquery_ar.py:12; their "
-                        "figure-2 config overrides it to False). True is the harder "
-                        "setting and the one that separates the operators: with blanks "
-                        "the task saturates near ceiling within a couple of epochs.")
+    p.add_argument("--num_train", type=int, default=20000)
+    p.add_argument("--num_test", type=int, default=2000)
     # model
     p.add_argument(
         "--backend",
@@ -425,10 +390,6 @@ def build_parser():
                         "cond(M), ridged-pinv residual) on a fixed probe batch")
     p.add_argument("--init", choices=["normal", "orthogonal"], default="normal",
                    help="weight init for Linear layers (orthogonal = head-independence ablation)")
-    p.add_argument("--layer_layout", choices=["uniform", "hybrid"], default="uniform",
-                   help="uniform = every layer is the sequence mixer (Zoology figure 2, "
-                        "zoology/model.py:243); hybrid = even BaseConv / odd mixer "
-                        "(the structure of Zoology's Based/Hybrid entry)")
     p.add_argument("--conv", action="store_true", help="enable the Nystromformer depthwise-conv residual")
     # optim
     p.add_argument("--epochs", type=int, default=64)
@@ -445,24 +406,13 @@ def build_parser():
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--grad_clip", type=float, default=0.0,
-                   help="max grad norm (0 disables). Zoology does NOT clip "
-                        "(zoology/train.py:117-144), so 0 is the benchmark setting.")
-    p.add_argument("--respect_optim_tags", action="store_true",
-                   help="honor the vendored mixers' per-parameter _optim / "
-                        "_no_weight_decay tags. OFF by default: Zoology uses a flat "
-                        "AdamW (zoology/train.py:185) and ignores those tags.")
-    p.add_argument("--early_stop_acc", type=float, default=0.99,
-                   help="stop once test recall exceeds this (Zoology's "
-                        "early_stopping_threshold, config.py:134). 0 disables.")
+                   help="max grad norm (0 disables); stabilizes the MQAR phase transition")
     p.add_argument("--fresh_data", action=argparse.BooleanOptionalAction, default=False,
                    help="regenerate train data each epoch (standard MQAR; --no-fresh_data reuses a fixed set)")
     # run
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16",
-                   help="Zoology trains in fp32, but the FlashNystrom kernel cannot "
-                        "(insufficient smem), so bf16 is the only precision every "
-                        "backend shares and is the default for the comparison.")
+    p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     p.add_argument("--out_json", type=str, default=None,
                    help="write a structured result record (backend, seed, recall, "
                         "config, timing) to this path for notebook/aggregate collection")

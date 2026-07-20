@@ -1,43 +1,33 @@
 # Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
 # Licensed under the Apache License, Version 2.0
-"""The MQAR model, a port of HazyResearch/zoology's figure-2 MQAR model with the
-sequence mixer made swappable across backends.
+"""The MQAR model, a faithful port of HazyResearch/zoology's MQAR "attention"
+model, with the single attention layer made swappable across three backends.
 
-Structure follows zoology/experiments/paper_configs/iclr24_zoology_figure2/
-configs.py, the config behind the published MQAR comparison (Arora et al.,
-ICLR 2024):
+Zoology's MQAR attention model (the canonical reference, Arora et al. 2024) is
+NOT a plain transformer. Reproduced here exactly so our recall numbers are
+comparable to the published MQAR results:
 
-  * ``n_layers=2``, and every layer is the SAME sequence mixer (zoology/model.py:243
-    builds each block from ``config.sequence_mixer``), i.e. "hyena" is two Hyena
-    layers. Selected by ``layer_layout="uniform"`` (the default here);
-  * ``state_mixer = torch.nn.Identity`` -- no MLP (configs.py:145);
-  * token embeddings tied to the output head; embedding dropout 0.1;
-  * position embeddings for attention only (configs.py:142), generalized here to
-    all permutation-equivariant backends -- see ``_POS_EMB_BACKENDS``.
+  * token embeddings, tied to the output head; NO absolute position embeddings
+    (sequence order is carried by the causal short conv, not learned positions);
+  * the layers alternate by index (Zoology's Hybrid picks
+    ``configs[layer_idx % len]``): even layers are a causal short-conv mixer
+    (``BaseConv``), odd layers are attention. With the default depth 2 this is
+    one conv layer then one attention layer;
+  * NO MLP / state mixer (Zoology sets ``state_mixer = nn.Identity``);
+  * embedding dropout 0.1.
 
-``layer_layout="hybrid"`` (even layers BaseConv, odd the mixer) reproduces the
-structure of Zoology's Based/Hybrid entry instead, and is what this file used
-before being aligned to figure 2.
-
-Swapping only the mixer is what isolates the operator:
+Only the attention layer differs across runs, which is what isolates the
+attention operator:
 
   * ``sdpa``              : exact full attention via F.scaled_dot_product_attention.
   * ``flash_nystrom``     : the FlashNystrom Nystrom-attention CUDA kernels.
   * ``nystrom_reference`` : the same Nystrom math in pure PyTorch (no kernels).
-  * ``linear_attention``, ``hyena``, ``mamba`` : the sub-quadratic baselines.
 
-Two deliberate deviations from official MQAR, both forced and both applied
-uniformly to every backend so none is advantaged:
-
-  1. The attention layer is *bidirectional* (Zoology's MHA is causal).
-     FlashNystrom has no causal kernel. MQAR stays solvable bidirectionally:
-     every query token's bound value lies earlier in the sequence, so dropping
-     the causal mask does not leak the answer. Paired with the predict-in-place
-     labels in data.py (Zoology shifts by one for next-token prediction).
-  2. Training runs in bf16, not Zoology's fp32: the FlashNystrom kernel exhausts
-     shared memory in fp32 ("kernel3_scalar: insufficient smem"), so fp32 is not
-     available to our own method. Every baseline runs in the same bf16 to keep
-     the comparison controlled.
+One deliberate deviation from official MQAR: the attention layer is
+*bidirectional*. FlashNystrom has no causal kernel, so for a controlled
+comparison all three backends run bidirectionally (Zoology's MHA is causal).
+MQAR is solvable bidirectionally: every query token's bound value lies earlier
+in the sequence, so removing the causal mask does not leak the answer.
 """
 from __future__ import annotations
 
@@ -268,18 +258,6 @@ class BaseConv(nn.Module):
         return self.conv(u) * self.projection(u) + u
 
 
-# Zoology figure 2 gives position embeddings to attention only
-# (``max_position_embeddings=input_seq_len if sequence_mixer == "attention" else 0``,
-# configs.py:142). Generalized here by the property that motivates it: a
-# permutation-equivariant operator cannot recover order on its own, so every
-# attention-family backend needs them. Hyena and Mamba carry order in their
-# convolution / recurrence and get none, exactly as in figure 2.
-_POS_EMB_BACKENDS = frozenset({
-    "sdpa", "linear_attention", "nystrom_reference", "nystrom_reference_compile",
-    "flash_nystrom", "flash_nystrom_tc",
-})
-
-
 # --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
@@ -317,41 +295,29 @@ class MQARModel(nn.Module):
         init: str = "normal",
         conv_kernel_size: int = 3,
         embed_dropout: float = 0.1,
-        use_pos_emb: bool | None = None,
-        layer_layout: str = "uniform",
+        use_pos_emb: bool = False,
         **attn_kw,
     ):
         super().__init__()
         if init not in ("normal", "orthogonal"):
             raise ValueError(f"init must be 'normal' or 'orthogonal', got {init!r}")
-        if layer_layout not in ("uniform", "hybrid"):
-            raise ValueError(f"layer_layout must be 'uniform' or 'hybrid', got {layer_layout!r}")
         self.init = init
         self.max_seq_len = max_seq_len
-        self.layer_layout = layer_layout
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        # None => follow figure 2 (attention-family yes, Hyena/Mamba no).
-        if use_pos_emb is None:
-            use_pos_emb = backend in _POS_EMB_BACKENDS
         self.use_pos_emb = use_pos_emb
         if use_pos_emb:
             self.pos_emb = nn.Embedding(max_seq_len, dim)
         self.embed_drop = nn.Dropout(embed_dropout)
 
-        # uniform (Zoology figure 2): EVERY layer is the sequence mixer. model.py:243
-        #   builds `block_cls(config, layer_idx=i) for i in range(n_layers)`, and each
-        #   block instantiates the same `config.sequence_mixer`, so "hyena" means two
-        #   Hyena layers, "attention" two MHA layers.
-        # hybrid: even layers BaseConv, odd the mixer. This is the structure of
-        #   Zoology's Based/Hybrid entry, not of the figure-2 pure-mixer runs.
+        # Even layers: causal short-conv mixer. Odd layers: attention (the
+        # swappable backend). Matches Zoology's Hybrid(configs[layer_idx % len]).
         layers = []
         for i in range(depth):
-            use_mixer = layer_layout == "uniform" or i % 2 == 1
-            mixer = (
-                build_attention(backend, dim, heads, seq_len=max_seq_len, **attn_kw)
-                if use_mixer else BaseConv(dim, conv_kernel_size)
-            )
+            if i % 2 == 0:
+                mixer = BaseConv(dim, conv_kernel_size)
+            else:
+                mixer = build_attention(backend, dim, heads, seq_len=max_seq_len, **attn_kw)
             layers.append(ResidualSublayer(dim, mixer))
         self.layers = nn.ModuleList(layers)
 

@@ -219,34 +219,15 @@ def test_model_weight_tying():
     assert m.head.weight is m.tok_emb.weight
 
 
-def test_model_uniform_layout_is_default_all_mixer():
-    # Zoology figure 2: every layer is the sequence mixer (zoology/model.py:243)
+def test_model_depth_alternation():
     m = MQARModel(64, 128, dim=64, depth=2, heads=2, backend="sdpa")
-    assert m.layer_layout == "uniform"
-    assert all(isinstance(l.mixer, SdpaAttention) for l in m.layers)
-
-
-def test_model_hybrid_layout_alternates():
-    m = MQARModel(64, 128, dim=64, depth=2, heads=2, backend="sdpa",
-                  layer_layout="hybrid")
     assert isinstance(m.layers[0].mixer, BaseConv)       # even -> conv
     assert isinstance(m.layers[1].mixer, SdpaAttention)  # odd  -> attention
 
 
-def test_model_depth1_hybrid_is_conv_only():
-    m = MQARModel(64, 128, dim=64, depth=1, backend="sdpa", layer_layout="hybrid")
-    assert len(m.layers) == 1 and isinstance(m.layers[0].mixer, BaseConv)
-
-
-def test_model_depth1_uniform_is_mixer_only():
+def test_model_depth1_is_conv_only():
     m = MQARModel(64, 128, dim=64, depth=1, backend="sdpa")
-    assert len(m.layers) == 1 and isinstance(m.layers[0].mixer, SdpaAttention)
-
-
-@pytest.mark.parametrize("bad", ["alternating", "", "Uniform", "hybrid2"])
-def test_model_bad_layer_layout_raises(bad):
-    with pytest.raises(ValueError, match="layer_layout must be"):
-        MQARModel(64, 128, backend="sdpa", layer_layout=bad)
+    assert len(m.layers) == 1 and isinstance(m.layers[0].mixer, BaseConv)
 
 
 @pytest.mark.parametrize("init", ["normal", "orthogonal"])
@@ -264,23 +245,9 @@ def test_model_pos_emb_option():
     assert out.shape == (2, 64, 64)
 
 
-def test_model_pos_emb_defaults_on_for_attention_family():
-    # figure 2 gives position embeddings to attention only (configs.py:142);
-    # generalized to every permutation-equivariant backend.
+def test_model_no_pos_emb_by_default():
     m = MQARModel(64, 128, dim=64, depth=2, backend="sdpa")
-    assert m.use_pos_emb and hasattr(m, "pos_emb")
-
-
-def test_model_pos_emb_defaults_off_for_sequential_mixers():
-    # Hyena/Mamba carry order in their conv/recurrence -> no position embeddings
-    from paper.mqar.model import _POS_EMB_BACKENDS
-    assert "hyena" not in _POS_EMB_BACKENDS and "mamba" not in _POS_EMB_BACKENDS
-    assert {"sdpa", "flash_nystrom", "linear_attention"} <= _POS_EMB_BACKENDS
-
-
-def test_model_pos_emb_explicit_false_overrides_default():
-    m = MQARModel(64, 128, dim=64, depth=2, backend="sdpa", use_pos_emb=False)
-    assert not m.use_pos_emb and not hasattr(m, "pos_emb")
+    assert not hasattr(m, "pos_emb")
 
 
 def test_model_seq_len_exceeds_max_with_pos_emb_raises():
