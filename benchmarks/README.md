@@ -43,4 +43,16 @@ development checkpoints. They are archaeology — not maintained as live tests.
   tf32 tensor-core pinv development checkpoints.
 - `_san_*.py` — compute-sanitizer (racecheck/memcheck) driver scripts.
 
+All of the above were migrated off the `FN_KAPPA_STAR` and `FN_K2INV_TC`
+environment variables, which no longer exist: the ridge and the tf32 tensor-core
+pinv are now `kappa_star` / `use_tc_pinv` parameters on `_C.forward` and
+`FlashNystromFunction.apply`. While they still set those env vars the scripts ran
+and printed numbers, but every row silently measured the default path, and
+`_san_repro.py` raised TypeError against the current 8-argument `apply`. All are
+verified to run and pass against the current API.
+
+Note these files match pytest's default `*_test.py` collection pattern and call
+`sys.exit()` at import; `testpaths` in pyproject.toml scopes collection to
+`tests/` and `paper/` so a bare `pytest` does not walk into them.
+
 The maintained correctness gate is `tests/` (pytest), not this directory.

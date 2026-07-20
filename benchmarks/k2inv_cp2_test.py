@@ -1,4 +1,4 @@
-# CP2 gate: tf32 TC forward NS (FN_K2INV_TC=1, no-ridge) vs scalar kernel.
+# CP2 gate: tf32 TC forward NS (use_tc_pinv=True, no-ridge) vs scalar kernel.
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
@@ -7,8 +7,9 @@ IDX_K2INV, IDX_NSITER, IDX_K2SM = 5, 10, 11
 dev = "cuda"; torch.manual_seed(0); torch.zeros(1, device=dev)
 
 def fwd(q, k, v, m, nw, tc):
-    os.environ.pop("FN_KAPPA_STAR", None); os.environ["FN_K2INV_TC"] = "1" if tc else "0"
-    r = _C.forward(q.contiguous(), k.contiguous(), v.contiguous(), m, nw)
+    # use_tc_pinv / kappa_star are forward() parameters now; the FN_K2INV_TC and
+    # FN_KAPPA_STAR env vars they replaced are no longer read anywhere.
+    r = _C.forward(q.contiguous(), k.contiguous(), v.contiguous(), m, nw, 0.0, tc)
     return r[IDX_K2INV].float(), r[IDX_NSITER].float(), r[IDX_K2SM].float()
 
 def rel(a, b):

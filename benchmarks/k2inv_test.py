@@ -16,9 +16,8 @@ def fwd_layer(fix, li, kappa):
     dev = "cuda"
     q = fix[f"q{li}"].to(dev); k = fix[f"k{li}"].to(dev); v = fix[f"v{li}"].to(dev)
     m, nw = fix["M"], fix["NEWTON"]
-    if kappa > 0: os.environ["FN_KAPPA_STAR"] = str(kappa)
-    else: os.environ.pop("FN_KAPPA_STAR", None)
-    res = _C.forward(q, k, v, m, nw)
+    # kappa_star is a forward() parameter; the old FN_KAPPA_STAR env var is gone.
+    res = _C.forward(q, k, v, m, nw, float(max(kappa, 0.0)), False)
     return (res[IDX_K2INV].float().cpu(), res[IDX_NSITER].float().cpu(), res[IDX_K2SM].float().cpu())
 
 def ref_tikhonov(k2sm, kappa, nw):

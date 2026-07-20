@@ -50,9 +50,8 @@ def ref_stages(q,k,v,m,nw,kappa):
 def run_one(B,H,N,d,m,dtype,kappa,regime,nw=6):
     torch.manual_seed(0)
     q,k,v=make_inputs(B,H,N,d,m,regime,dtype)
-    if kappa>0: os.environ["FN_KAPPA_STAR"]=str(kappa)
-    else: os.environ.pop("FN_KAPPA_STAR",None)
-    res=_C.forward(q,k,v,m,nw)
+    # kappa_star is a forward() parameter; the old FN_KAPPA_STAR env var is gone.
+    res=_C.forward(q,k,v,m,nw,float(max(kappa,0.0)),False)
     R=ref_stages(q,k,v,m,nw,kappa)
     # conditioning regime hit
     sv=torch.linalg.svdvals(R["K2"]); condK2=(sv[...,0]/sv[...,-1].clamp(min=1e-30)).mean().item()
@@ -69,7 +68,7 @@ def run_one(B,H,N,d,m,dtype,kappa,regime,nw=6):
     # gradients (GradScaler-style scaled dO so subnormals don't confound the accuracy check)
     dO=torch.randn(B,H,N,d,device=dev,dtype=dtype)*1024.0
     qg=q.clone().requires_grad_();kg=k.clone().requires_grad_();vg=v.clone().requires_grad_()
-    FlashNystromFunction.apply(qg,kg,vg,m,nw,True).backward(dO)
+    FlashNystromFunction.apply(qg,kg,vg,m,nw,True,float(max(kappa,0.0)),False).backward(dO)
     q2=q.float().requires_grad_();k2=k.float().requires_grad_();v2=v.float().requires_grad_()
     from flash_nystrom.reference import nystrom_attention_reference
     nystrom_attention_reference(q2,k2,v2,m,nw,kappa_star=kappa).backward(dO.float())
