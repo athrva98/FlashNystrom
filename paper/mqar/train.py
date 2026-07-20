@@ -306,10 +306,13 @@ def train(args):
                 # the (B, N, vocab) head matmul over the ~94% ignored positions.
                 loss = F.cross_entropy(logits_q.float(), yb[mask])
             scaler.scale(loss).backward()
-            if args.grad_clip > 0:
-                scaler.unscale_(opt)
-                last_gn = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
-            elif args.diag:
+            # No gradient clipping. No paper in this lineage specifies it for the
+            # recall synthetics: Zoology (App E.2), Based and JRT never mention
+            # clipping at all, Hyena never mentions it, and Mamba specifies it only
+            # for LM scaling laws (App E.2.1, 1.0) and speech (E.4.2, 0.1), NOT for
+            # its synthetic tasks (E.1). Zoology's trainer does not clip either.
+            # An infinite max_norm only MEASURES the norm, it does not clip.
+            if args.diag:
                 last_gn = float(torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf")))
             scaler.step(opt)
             scaler.update()
@@ -351,7 +354,7 @@ def train(args):
             "num_landmarks": args.num_landmarks, "newton_iter": args.newton_iter,
             "kappa_star": args.kappa_star, "dim": args.dim, "depth": args.depth,
             "heads": args.heads, "epochs": args.epochs, "batch_size": args.batch_size,
-            "grad_clip": args.grad_clip, "num_train": args.num_train, "lr": args.lr,
+            "num_train": args.num_train, "lr": args.lr,
             "step_ms": step_ms, "samples_per_s": samp_s, "peak_GiB": peak,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.out_json)), exist_ok=True)
@@ -405,8 +408,6 @@ def build_parser():
                         "the bare-model probe")
     p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--weight_decay", type=float, default=0.1)
-    p.add_argument("--grad_clip", type=float, default=0.0,
-                   help="max grad norm (0 disables); stabilizes the MQAR phase transition")
     p.add_argument("--fresh_data", action=argparse.BooleanOptionalAction, default=False,
                    help="regenerate train data each epoch (standard MQAR; --no-fresh_data reuses a fixed set)")
     # run

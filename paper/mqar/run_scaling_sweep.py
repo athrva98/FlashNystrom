@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
 # Licensed under the Apache License, Version 2.0
-"""MQAR scaling experiments for the paper, with auto-batch + grad clipping.
+"""MQAR scaling experiments for the paper, with auto-batch.
 
 Two sweeps, both reporting best-over-LR recall AND the training profile
 (step time, throughput, peak memory) at the saturated batch:
@@ -34,12 +34,13 @@ _PROF = re.compile(r"train profile: batch=(\d+) step_ms=([\d.]+) "
 
 def run_one(backend, seq_len, kv, lr, passthrough):
     # Accuracy runs use the VALIDATED fixed-batch recipe (train.py default
-    # batch 256) + grad clipping -- NOT autobatch, whose recall is unverified.
+    # batch 256) -- NOT autobatch, whose recall is unverified. No gradient
+    # clipping: no paper in this lineage specifies it for the recall synthetics.
     # The training profile (step_ms/peak_gib) is reported at that fixed batch.
     cmd = [
         sys.executable, "-m", "paper.mqar.train",
         "--backend", backend, "--seq_len", str(seq_len), "--num_kv_pairs", str(kv),
-        "--lr", str(lr), "--grad_clip", "1.0",
+        "--lr", str(lr),
     ] + passthrough
     proc = subprocess.run(cmd, capture_output=True, text=True)
     m = _BEST.search(proc.stdout)
@@ -74,7 +75,7 @@ def main():
         axis = [(args.seq_len, kv) for kv in args.kv_pairs]
         axis_name = "kv_pairs"
 
-    print(f"mode={args.mode}  best-over-LR recall + training profile (autobatch, grad_clip=1.0)")
+    print(f"mode={args.mode}  best-over-LR recall + training profile (autobatch, no grad clipping)")
     print(f"{'backend':>18} {axis_name:>9} {'recall%':>8} {'batch':>7} "
           f"{'step_ms':>8} {'samp/s':>9} {'peak_GiB':>9} {'bestLR':>8}")
     print("-" * 84)
