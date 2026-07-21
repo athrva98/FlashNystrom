@@ -25,19 +25,6 @@ import argparse
 import statistics
 from itertools import product
 
-from .runner import build_cmd, run_train
-
-
-def run_one(backend, heads, dim, init, seed, lr, passthrough):
-    kw = dict(backend=backend, heads=heads, dim=dim, init=init, seed=seed, lr=lr)
-    res = run_train(extra=passthrough, **kw)
-    if res.get("recall") is None:
-        cmd = build_cmd(extra=passthrough, **kw)
-        print(f"    !! FAILED lr={lr}: {' '.join(cmd)}")
-        print("    " + (res.get("output", "")[-300:]).replace("\n", "\n    "))
-        return None
-    return res["recall"]
-
 
 def main():
     ap = argparse.ArgumentParser(description="MQAR sweep with per-config LR tuning")
@@ -50,23 +37,51 @@ def main():
                     help="per-config LR sweep; best run is kept (Zoology's np.logspace(-3, -1.5, 4))")
     ap.add_argument("--head_dim", type=int, default=64,
                     help="fixed per-head dimension; dim = heads * head_dim")
+    ap.add_argument("--max_parallel", type=int, default=1,
+                    help="concurrent runs on one GPU (recall-only, so parallel-safe). "
+                         "Defaults to 1 -- raise it on an A100 (e.g. 6); keep it 1 on "
+                         "a small local card. This sweep measures recall, not timing, "
+                         "so concurrency does not corrupt anything.")
     args, passthrough = ap.parse_known_args()
+
+    from collections import defaultdict
+    from .runner import run_many
+
+    # Every (backend, heads, init, seed, lr) is an independent job. best-over-LR
+    # and the per-seed aggregation happen after, so parallel vs sequential give
+    # identical summaries -- only wall-clock differs.
+    jobs = []
+    for backend, heads, init in product(args.backends, args.heads, args.inits):
+        dim = heads * args.head_dim
+        for seed in args.seeds:
+            for lr in args.lrs:
+                jobs.append(dict(backend=backend, heads=heads, dim=dim, init=init,
+                                 seed=seed, lr=lr, extra=passthrough))
+
+    # (backend, heads, init, seed) -> list of (lr, recall)
+    collected: dict[tuple, list[tuple[float, float]]] = defaultdict(list)
+
+    def on_done(job, res, n, total):
+        acc = res.get("recall")
+        print(f"  [{n}/{total}] {job['backend']:18s} heads={job['heads']:<2d} "
+              f"dim={job['dim']:<4d} init={job['init']:<10s} seed={job['seed']} "
+              f"lr={job['lr']:<7g}: {'FAIL' if acc is None else f'{acc:5.2f}%'}", flush=True)
+        if acc is None and res.get("output"):
+            print("      " + res["output"][-200:].replace("\n", "\n      "))
+        if acc is not None:
+            collected[(job["backend"], job["heads"], job["init"], job["seed"])].append(
+                (job["lr"], acc))
+
+    run_many(jobs, max_parallel=args.max_parallel, on_done=on_done)
 
     # results[(backend, heads, init)] = list of (best_recall, best_lr) per seed
     results: dict[tuple, list[tuple[float, float]]] = {}
     for backend, heads, init in product(args.backends, args.heads, args.inits):
-        dim = heads * args.head_dim
         per_seed = []
         for seed in args.seeds:
-            best_acc, best_lr = -1.0, None
-            for lr in args.lrs:
-                acc = run_one(backend, heads, dim, init, seed, lr, passthrough)
-                mark = ""
-                if acc is not None and acc > best_acc:
-                    best_acc, best_lr, mark = acc, lr, "  <- best"
-                print(f"  {backend:18s} heads={heads:<2d} dim={dim:<4d} init={init:<10s} "
-                      f"seed={seed} lr={lr:<7g}: {'FAIL' if acc is None else f'{acc:5.2f}%'}{mark}")
-            if best_acc >= 0:
+            runs = collected.get((backend, heads, init, seed), [])
+            if runs:
+                best_lr, best_acc = max(runs, key=lambda x: x[1])
                 per_seed.append((best_acc, best_lr))
         results[(backend, heads, init)] = per_seed
 
