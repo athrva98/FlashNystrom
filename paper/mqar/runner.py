@@ -26,6 +26,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # A float token, tolerating the nan/inf that the diagnostics emit for backends
 # without landmarks (sdpa reports nan for cond_K2 / cond_M / pinv_resid).
@@ -124,6 +126,7 @@ def run_train(python: str | None = None, stream: bool = False,
     wins over the regex-scraped values.
     """
     cmd = build_cmd(python=python, extra=extra, **opts)
+    t0 = time.time()
     if stream:
         chunks = []
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -140,6 +143,7 @@ def run_train(python: str | None = None, stream: bool = False,
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
         text = proc.stdout
         rc = proc.returncode
+    elapsed = time.time() - t0
 
     if log_path:
         os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
@@ -148,6 +152,7 @@ def run_train(python: str | None = None, stream: bool = False,
 
     result = parse_output(text)
     result["returncode"] = rc
+    result["elapsed_s"] = elapsed
     result["output"] = text   # kept so callers can print diagnostics on failure
 
     # train.py's own structured record is authoritative when it exists. Merge
@@ -201,3 +206,59 @@ def already_done(path: str | None) -> bool:
     """True when a result file already exists, so a resumed sweep can skip it.
     Every driver here is restartable; Colab sessions get reclaimed mid-sweep."""
     return bool(path) and os.path.exists(path)
+
+
+def _default_progress(job, res, n_done, n_total):
+    tag = f"{job.get('backend','?')} d={job.get('dim','?')} lr={job.get('lr','?')}"
+    r = res.get("recall")
+    r = f"{r:.2f}%" if isinstance(r, (int, float)) else "FAIL"
+    mins = (res.get("elapsed_s") or 0) / 60.0
+    print(f"[{n_done}/{n_total}] {tag} -> {r}  ({mins:.1f} min)", flush=True)
+
+
+def run_many(jobs, max_parallel: int = 6, python: str | None = None,
+             on_done=None) -> list[dict]:
+    """Run many train.py jobs concurrently on one GPU, up to max_parallel at once.
+
+    A single MQAR run peaks at a few GiB and leaves an A100 mostly idle, so an
+    80GB card can host several independent runs at once. Each job is a dict of
+    run_train kwargs and MUST carry ``out_json`` -- it is both the result sink and
+    the skip key, so a reclaimed Colab session resumes by re-calling with the same
+    job list (finished runs are skipped).
+
+    The runs are IDENTICAL to running them sequentially -- same seeds, batch size,
+    everything -- so results do not change; only wall-clock improves. Output is
+    captured (never streamed): concurrent live logs would interleave unreadably.
+    Pass ``log_path`` in a job to tee its full output to a file for later reading.
+    ``on_done(job, result, n_done, n_total)`` fires as each run finishes; the
+    default prints a one-line progress summary.
+
+    Caveats to size max_parallel against:
+      * Memory adds up -- keep peak_GiB_per_run * max_parallel below GPU memory
+        (plus ~0.5 GiB of CUDA context per process). On 80GB, 6-10 is safe.
+      * The processes time-slice the SMs, so throughput gains taper as per-run GPU
+        utilization rises: small dims (64-128) parallelize well, dim 512 less so.
+    """
+    if on_done is None:
+        on_done = _default_progress
+    todo = [j for j in jobs if not already_done(j.get("out_json"))]
+    skipped = len(jobs) - len(todo)
+    if skipped:
+        print(f"skip {skipped} already-done", flush=True)
+    if not todo:
+        print("nothing to run", flush=True)
+        return []
+    print(f"running {len(todo)} jobs on {max_parallel} parallel workers", flush=True)
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_parallel) as ex:
+        futs = {ex.submit(run_train, python=python, stream=False, **j): j
+                for j in todo}
+        for n, fut in enumerate(as_completed(futs), 1):
+            job = futs[fut]
+            try:
+                res = fut.result()
+            except Exception as e:   # a crashed child must not kill the pool
+                res = {"recall": None, "error": str(e), **job}
+            results.append(res)
+            on_done(job, res, n, len(todo))
+    return results

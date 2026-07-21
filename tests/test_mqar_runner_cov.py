@@ -15,6 +15,7 @@ from paper.mqar.runner import (
     parse_output,
     run_train,
     sweep_lr,
+    run_many,
     finite_diag,
     already_done,
 )
@@ -260,3 +261,64 @@ def test_sweep_lr_invokes_callback(monkeypatch):
     seen = []
     sweep_lr([0.001, 0.01], backend="sdpa", on_result=lambda lr, r: seen.append(lr))
     assert seen == [0.001, 0.01]
+
+
+# --------------------------------------------------------------------------- #
+# run_many (concurrent driver; run_train stubbed)
+# --------------------------------------------------------------------------- #
+
+def test_run_many_runs_all_jobs(monkeypatch):
+    seen = []
+    monkeypatch.setattr(runner, "run_train",
+                        lambda **kw: (seen.append(kw["dim"]), {"recall": 50.0})[1])
+    jobs = [{"backend": "hyena", "dim": d, "out_json": None} for d in (64, 128, 256)]
+    res = run_many(jobs, max_parallel=3)
+    assert len(res) == 3 and sorted(seen) == [64, 128, 256]
+
+
+def test_run_many_skips_already_done(monkeypatch, tmp_path):
+    done = tmp_path / "done.json"; done.write_text("{}")
+    ran = []
+    monkeypatch.setattr(runner, "run_train",
+                        lambda **kw: (ran.append(kw["out_json"]), {"recall": 1.0})[1])
+    jobs = [{"backend": "sdpa", "out_json": str(done)},
+            {"backend": "sdpa", "out_json": str(tmp_path / "todo.json")}]
+    res = run_many(jobs, max_parallel=2)
+    assert len(res) == 1 and ran == [str(tmp_path / "todo.json")]
+
+
+def test_run_many_all_done_returns_empty(monkeypatch, tmp_path):
+    f = tmp_path / "a.json"; f.write_text("{}")
+    monkeypatch.setattr(runner, "run_train", lambda **kw: pytest.fail("should not run"))
+    assert run_many([{"out_json": str(f)}], max_parallel=2) == []
+
+
+def test_run_many_isolates_crashed_job(monkeypatch):
+    def flaky(**kw):
+        if kw["dim"] == 128:
+            raise RuntimeError("boom")
+        return {"recall": 42.0}
+    monkeypatch.setattr(runner, "run_train", flaky)
+    jobs = [{"backend": "mamba", "dim": d, "out_json": None} for d in (64, 128, 256)]
+    res = run_many(jobs, max_parallel=3)
+    assert len(res) == 3                                   # pool survives the crash
+    crashed = [r for r in res if r.get("error")]
+    assert len(crashed) == 1 and crashed[0]["dim"] == 128
+    assert sum(r.get("recall") == 42.0 for r in res) == 2
+
+
+def test_run_many_progress_callback(monkeypatch):
+    monkeypatch.setattr(runner, "run_train", lambda **kw: {"recall": 1.0})
+    calls = []
+    run_many([{"backend": "sdpa", "out_json": None}], max_parallel=1,
+             on_done=lambda job, res, n, total: calls.append((n, total)))
+    assert calls == [(1, 1)]
+
+
+def test_run_many_default_progress_prints(monkeypatch, capsys):
+    monkeypatch.setattr(runner, "run_train",
+                        lambda **kw: {"recall": 88.5, "elapsed_s": 90.0})
+    run_many([{"backend": "mamba", "dim": 128, "lr": 3e-3, "out_json": None}],
+             max_parallel=1)
+    out = capsys.readouterr().out
+    assert "mamba d=128" in out and "88.5" in out and "1.5 min" in out
