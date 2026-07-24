@@ -261,6 +261,28 @@ def test_model_both_layouts_forward(layout):
     assert out.shape == (2, 64, 64) and torch.isfinite(out).all()
 
 
+def test_init_respects_no_reinit_mamba_dt_bias():
+    # Mamba's dt_proj.bias is the inv_dt timescale init (marked _no_reinit); the
+    # model's _init_weights sweep must NOT zero it. Zeroing it destroys the SSM
+    # timescales and drops recall to chance (the Fig-4 Mamba bug).
+    from paper.mqar.baselines import Mamba
+    bare = Mamba(d_model=64)
+    m = MQARModel(512, 256, dim=64, depth=2, heads=2, backend="mamba", layer_layout="uniform")
+    dt = next(mod for name, mod in m.named_modules() if name.endswith("mamba.dt_proj"))
+    assert not bool((dt.bias == 0).all()), "dt_proj.bias was zeroed by _init_weights"
+    assert dt.weight.std().item() > 0.1, "dt_proj.weight was clobbered to normal(0.02)"
+    # A_log / D structure preserved too
+    mamba = next(mod for name, mod in m.named_modules() if name.endswith("mixer.mamba"))
+    assert torch.equal(mamba.D.detach(), torch.ones_like(mamba.D)), "D was clobbered"
+
+
+def test_init_no_reinit_does_not_affect_other_backends():
+    # only Mamba marks _no_reinit; sdpa's projections must still get normal(0.02)
+    m = MQARModel(512, 256, dim=64, depth=2, heads=2, backend="sdpa")
+    q = next(mod for name, mod in m.named_modules() if name.endswith("q_proj"))
+    assert 0.01 < q.weight.detach().std().item() < 0.04
+
+
 @pytest.mark.parametrize("init", ["normal", "orthogonal"])
 def test_model_init_schemes(init):
     m = MQARModel(64, 128, dim=64, depth=2, backend="sdpa", init=init)

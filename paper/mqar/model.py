@@ -344,15 +344,22 @@ class MQARModel(nn.Module):
         # matching Zoology's default init. Conv1d keeps PyTorch defaults (Zoology
         # only re-inits Linear and Embedding). Orthogonal init makes each
         # projection orthonormal (the head-independence ablation).
+        #
+        # `_no_reinit` params are skipped: a self-initializing mixer (Mamba) marks
+        # its deliberately-crafted inits so this sweep cannot overwrite them.
+        # Zeroing Mamba's dt_proj.bias here destroys the SSM timescales and drops
+        # recall to chance -- Zoology's _init_weights respects the same flag.
         if isinstance(module, nn.Linear):
-            if self.init == "orthogonal":
-                nn.init.orthogonal_(module.weight)
-            else:
-                nn.init.normal_(module.weight, std=0.02)
-            if module.bias is not None:
+            if not getattr(module.weight, "_no_reinit", False):
+                if self.init == "orthogonal":
+                    nn.init.orthogonal_(module.weight)
+                else:
+                    nn.init.normal_(module.weight, std=0.02)
+            if module.bias is not None and not getattr(module.bias, "_no_reinit", False):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, std=0.02)
+            if not getattr(module.weight, "_no_reinit", False):
+                nn.init.normal_(module.weight, std=0.02)
 
     def encode(self, idx: torch.Tensor) -> torch.Tensor:
         """Run the body and final norm, returning hidden states (B, N, dim).

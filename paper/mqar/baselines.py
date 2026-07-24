@@ -347,6 +347,16 @@ class Mamba(nn.Module):
         self.D._no_weight_decay = True
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
+        # Mamba self-initializes every parameter deliberately: dt_proj.bias is the
+        # inv_dt discretization-timescale init, dt_proj.weight is uniform(dt_std),
+        # A_log/D are the S4D structure. Mark them all _no_reinit so a parent
+        # model's _init_weights sweep (which normals Linear weights and zeros
+        # biases) cannot clobber them -- zeroing dt_proj.bias alone destroys the
+        # SSM timescales and drops recall to chance. Mirrors Zoology's _init_weights,
+        # whose Mamba branch skips these (respects _no_reinit).
+        for p in self.parameters():
+            p._no_reinit = True
+
     def forward(self, hidden_states):
         """hidden_states: (B, L, D) -> (B, L, D). Uses the Mamba CUDA kernels when
         installed, else the pure-PyTorch reference scan."""
