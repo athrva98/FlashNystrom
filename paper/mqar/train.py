@@ -408,11 +408,14 @@ def build_parser():
     p.add_argument("--depth", type=int, default=2)
     p.add_argument("--heads", type=int, default=2, help="dim/heads must be 64 or 128 for flash_nystrom")
     p.add_argument("--causal", action="store_true",
-                   help="causal attention mask for backends that support it (sdpa). "
-                        "Zoology's MHA is causal (attention.py triu mask), so this is "
-                        "the standard-protocol setting for the attention row. Hyena and "
-                        "Mamba are causal by construction regardless; the Nystrom family "
-                        "has no causal form and rejects this flag.")
+                   help="DIAGNOSTIC ONLY, not part of the paper benchmark: causal "
+                        "attention mask for backends that support it (sdpa), for "
+                        "reproducing Zoology's causal-attention setting when checking "
+                        "the harness against published numbers. The benchmark runs "
+                        "every maskable method bidirectionally (the Nystrom family has "
+                        "no causal form; masking only the baselines would confound the "
+                        "operator comparison). Hyena/Mamba are causal by construction "
+                        "regardless; the Nystrom family rejects this flag.")
     p.add_argument("--layer_layout", choices=["hybrid", "uniform"], default="hybrid",
                    help="hybrid (default): even BaseConv / odd mixer, Zoology's "
                         "original_mqar_configs + models_repo recipe. uniform: every "

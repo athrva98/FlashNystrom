@@ -15,10 +15,14 @@ the key in a length N+1 buffer and then slices ``inputs = x[:, :-1]``,
 ``labels = x[:, 1:]`` -- after that shift, the label lands back on the key's
 own index, i.e. ``labels[key_pos] = value``, which is exactly what this
 generator emits directly. (An earlier version of this docstring called that a
-"predict-in-place deviation"; it is not a deviation at all.) For a causal LM
-(``--causal`` sdpa, or Hyena/Mamba whose mixers are causal by construction)
-this is the standard next-token protocol verbatim. Bidirectional backends
-(the Nystrom family, which has no causal form) train on the same tensors.
+"predict-in-place deviation"; it is not a deviation at all.) The paper's
+benchmark runs every maskable method BIDIRECTIONALLY on these tensors: one
+direction convention for the whole table, since the Nystrom family has no
+causal form and masking only the baselines would confound the operator
+comparison. Hyena and Mamba are causal by construction, for which this
+alignment is the standard next-token protocol verbatim; train.py's --causal
+flag remains as a diagnostic for reproducing Zoology's causal-attention
+setting outside the benchmark.
 
 Layout of one length-`seq_len` example (context_size = 2 * num_kv_pairs):
 

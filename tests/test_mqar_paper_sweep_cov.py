@@ -10,8 +10,7 @@ import pytest
 
 from paper.mqar import paper_sweep
 from paper.mqar.paper_sweep import (
-    METHODS, DIMS, LRS, PROTOCOL, CAUSAL_METHODS, heads_for, build_jobs,
-    aggregate, main,
+    METHODS, DIMS, LRS, PROTOCOL, heads_for, build_jobs, aggregate, main,
 )
 from paper.mqar.runner import build_cmd
 from paper.mqar.train import build_parser
@@ -87,21 +86,17 @@ def test_jobs_pin_uniform_and_blanks():
     assert ns.early_stop_acc == 0.99 and ns.seq_len == 512
 
 
-def test_causal_split_matches_standard_protocol():
-    # standard protocol = causal LM: sdpa via the mask, hyena/mamba by
-    # construction; the Nystrom family and linear attention have no causal form
-    assert CAUSAL_METHODS == {"sdpa", "hyena", "mamba"}
-    for j in build_jobs(METHODS, [64], [1e-2], [0], "o"):
-        assert j["causal"] is (j["backend"] in CAUSAL_METHODS)
-
-
-def test_causal_flag_reaches_train_argparse():
+def test_benchmark_is_all_bidirectional():
+    # ONE direction convention: no job may pass the causal flag. The Nystrom
+    # family has no causal form, and masking only the baselines would confound
+    # the operator comparison. Hyena/Mamba are causal by construction, which is
+    # an operator property, not a protocol knob set here.
     parser = build_parser()
-    for m, want in [("sdpa", True), ("flash_nystrom", False)]:
-        j = next(x for x in build_jobs([m], [64], [1e-2], [0], "o"))
+    for j in build_jobs(METHODS, [64], [1e-2], [0], "o"):
+        assert "causal" not in j
         ns = parser.parse_args(build_cmd(**{k: v for k, v in j.items()
                                             if k != "log_path"})[4:])
-        assert ns.causal is want
+        assert ns.causal is False   # train.py's diagnostic flag stays off
 
 
 # --------------------------------------------------------------------------- #

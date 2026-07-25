@@ -17,9 +17,11 @@ Protocol (the ``PROTOCOL`` dict below, passed verbatim to train.py):
   model   depth 2, uniform layout (every layer is the mixer, no BaseConv),
           head_dim held at 64 (heads = dim/64), position embeddings for the
           attention-family mixers only (Hyena/Mamba carry order in their own
-          conv/recurrence), bf16; CAUSAL for sdpa/hyena/mamba (the standard
-          protocol -- Zoology's MHA is causal), bidirectional for the Nystrom
-          family and linear attention (no causal form; disclosed deviation)
+          conv/recurrence), bf16; every maskable method runs BIDIRECTIONAL --
+          one direction convention for the whole table, since the Nystrom
+          family has no causal form and masking only the baselines would
+          confound the operator comparison. Hyena and Mamba are causal by
+          construction (an operator property, not a protocol knob).
   optim   AdamW wd 0.1, cosine anneal over 64 epochs, no warmup, no gradient
           clipping, batch 128, early stop once test recall clears 99%
   sweep   dim in {64,128,256,512} x lr in logspace(-4,-2,4); the reported
@@ -55,14 +57,15 @@ METHODS = ["sdpa", "linear_attention", "nystrom_reference",
 DIMS = [64, 128, 256, 512]
 LRS = [1e-4, 4.641589e-4, 2.154435e-3, 1e-2]   # np.logspace(-4, -2, 4)
 
-# The standard MQAR protocol is a causal LM (Zoology's MHA carries a triu causal
-# mask). sdpa takes the mask via --causal; Hyena and Mamba are causal by
-# construction (causal conv / recurrent scan), so the flag is a truthful no-op
-# for them. The Nystrom family and this linear-attention implementation have no
-# causal form: they run bidirectionally on the identical data, which is the
-# paper's disclosed operator-level deviation (the bound value always lies
-# earlier in the sequence, so bidirectionality does not leak the answer).
-CAUSAL_METHODS = frozenset({"sdpa", "hyena", "mamba"})
+# Direction convention: ONE convention for the whole table -- every method that
+# admits a masking choice runs BIDIRECTIONAL (no causal mask). The Nystrom
+# family has no causal form, and mixing masked baselines with an unmasked
+# subject would confound the operator comparison, so none of the maskable
+# methods is masked. Bidirectionality leaks nothing: each bound value lies
+# earlier in the sequence than its query. Hyena and Mamba are causal BY
+# CONSTRUCTION (causal conv / recurrent scan) -- an operator property, not a
+# protocol knob, and the same form behind their published MQAR results, so the
+# DeltaNet-Fig4 validation anchors are unaffected.
 
 # Every train.py knob that is not swept, pinned so the protocol cannot drift
 # with a default change. Booleans use runner's --no- handling where needed.
@@ -106,7 +109,7 @@ def build_jobs(methods, dims, lrs, seeds, out_dir):
                     stem = os.path.join(out_dir, f"{m}_d{d}_lr{lr:.2e}_seed{s}")
                     jobs.append(dict(
                         backend=m, seed=s, dim=d, heads=heads_for(d),
-                        lr=f"{lr:.6e}", causal=m in CAUSAL_METHODS,
+                        lr=f"{lr:.6e}",
                         out_json=stem + ".json", log_path=stem + ".log",
                         **PROTOCOL,
                     ))
