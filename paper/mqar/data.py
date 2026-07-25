@@ -9,13 +9,16 @@ value that key was bound to. "Multi-query" because several independent
 recalls are required in a single sequence, at input-dependent positions.
 
 This is a self-contained reimplementation of the Zoology construction (no
-zoology dependency). It differs from Zoology's in exactly one respect: the
-label sits at the query-key position itself (predict-in-place) rather than
-shifted by one (next-token). FlashNystrom is a bidirectional attention with
-no causal form, so the model reads the whole sequence and emits the value at
-each query position; the full-attention baseline runs in the same
-bidirectional mode for an apples-to-apples comparison. The recall task is
-identical; only the autoregressive shift is dropped.
+zoology dependency), and its (inputs, labels) ALIGNMENT is identical to
+Zoology's returned tensors. Their multiquery_ar.py writes the value one past
+the key in a length N+1 buffer and then slices ``inputs = x[:, :-1]``,
+``labels = x[:, 1:]`` -- after that shift, the label lands back on the key's
+own index, i.e. ``labels[key_pos] = value``, which is exactly what this
+generator emits directly. (An earlier version of this docstring called that a
+"predict-in-place deviation"; it is not a deviation at all.) For a causal LM
+(``--causal`` sdpa, or Hyena/Mamba whose mixers are causal by construction)
+this is the standard next-token protocol verbatim. Bidirectional backends
+(the Nystrom family, which has no causal form) train on the same tensors.
 
 Layout of one length-`seq_len` example (context_size = 2 * num_kv_pairs):
 

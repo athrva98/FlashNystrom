@@ -249,6 +249,7 @@ def train(args):
         use_conv_residual=args.conv,
         kappa_star=args.kappa_star,
         layer_layout=args.layer_layout,
+        causal=args.causal,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -261,6 +262,7 @@ def train(args):
         if args.conv:
             arch += " conv=on"
     arch += (f" layout={args.layer_layout} "
+             f"causal={'on' if args.causal else 'off'} "
              f"pos_emb={'on' if model.use_pos_emb else 'off'} "
              f"params={n_params / 1e6:.2f}M")
     print(arch)
@@ -372,6 +374,7 @@ def train(args):
             "random_non_queries": args.random_non_queries,
             "early_stop_acc": args.early_stop_acc,
             "use_pos_emb": model.use_pos_emb,
+            "causal": args.causal,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.out_json)), exist_ok=True)
         with open(args.out_json, "w") as f:
@@ -404,6 +407,12 @@ def build_parser():
     p.add_argument("--dim", type=int, default=128)
     p.add_argument("--depth", type=int, default=2)
     p.add_argument("--heads", type=int, default=2, help="dim/heads must be 64 or 128 for flash_nystrom")
+    p.add_argument("--causal", action="store_true",
+                   help="causal attention mask for backends that support it (sdpa). "
+                        "Zoology's MHA is causal (attention.py triu mask), so this is "
+                        "the standard-protocol setting for the attention row. Hyena and "
+                        "Mamba are causal by construction regardless; the Nystrom family "
+                        "has no causal form and rejects this flag.")
     p.add_argument("--layer_layout", choices=["hybrid", "uniform"], default="hybrid",
                    help="hybrid (default): even BaseConv / odd mixer, Zoology's "
                         "original_mqar_configs + models_repo recipe. uniform: every "
