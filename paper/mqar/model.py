@@ -259,6 +259,20 @@ class BaseConv(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# Backends that are permutation-equivariant: with no BaseConv in the stack
+# (uniform layout) they carry NO order signal at all, so a bidirectional model
+# built from them literally cannot distinguish "k1 v1 k2 v2" from "k1 v2 k2 v1"
+# and MQAR is unsolvable. Zoology figure-2 handles this by giving attention
+# position embeddings (max_position_embeddings=input_seq_len, configs.py:142)
+# while every conv/SSM mixer gets 0. Hyena and Mamba carry order in their own
+# convolution / recurrence and never need them.
+_POS_EMB_BACKENDS = frozenset({
+    "sdpa", "linear_attention", "nystrom_reference", "nystrom_reference_compile",
+    "flash_nystrom", "flash_nystrom_tc",
+})
+
+
+# --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
 class ResidualSublayer(nn.Module):
@@ -295,7 +309,7 @@ class MQARModel(nn.Module):
         init: str = "normal",
         conv_kernel_size: int = 3,
         embed_dropout: float = 0.1,
-        use_pos_emb: bool = False,
+        use_pos_emb: bool | None = None,
         layer_layout: str = "hybrid",
         **attn_kw,
     ):
@@ -309,6 +323,13 @@ class MQARModel(nn.Module):
         self.layer_layout = layer_layout
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        # None => the figure-2 rule: position embeddings only when the layout
+        # provides no other order signal (uniform, no BaseConv) AND the mixer is
+        # permutation-equivariant (attention family, _POS_EMB_BACKENDS above).
+        # hybrid's BaseConv carries order, so there no backend gets them
+        # (models_repo.py sets max_position_embeddings=0 for every mixer).
+        if use_pos_emb is None:
+            use_pos_emb = layer_layout == "uniform" and backend in _POS_EMB_BACKENDS
         self.use_pos_emb = use_pos_emb
         if use_pos_emb:
             self.pos_emb = nn.Embedding(max_seq_len, dim)

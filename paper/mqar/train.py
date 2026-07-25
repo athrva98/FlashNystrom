@@ -260,7 +260,9 @@ def train(args):
         arch += f" m={args.num_landmarks} newton_iter={args.newton_iter}"
         if args.conv:
             arch += " conv=on"
-    arch += f" params={n_params / 1e6:.2f}M"
+    arch += (f" layout={args.layer_layout} "
+             f"pos_emb={'on' if model.use_pos_emb else 'off'} "
+             f"params={n_params / 1e6:.2f}M")
     print(arch)
     print(
         f"data: vocab={args.vocab_size} seq_len={args.seq_len} kv_pairs={args.num_kv_pairs} "
@@ -369,6 +371,7 @@ def train(args):
             "num_test": args.num_test, "layer_layout": args.layer_layout,
             "random_non_queries": args.random_non_queries,
             "early_stop_acc": args.early_stop_acc,
+            "use_pos_emb": model.use_pos_emb,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.out_json)), exist_ok=True)
         with open(args.out_json, "w") as f:

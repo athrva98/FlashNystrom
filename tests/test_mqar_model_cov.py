@@ -283,6 +283,50 @@ def test_init_no_reinit_does_not_affect_other_backends():
     assert 0.01 < q.weight.detach().std().item() < 0.04
 
 
+# --------------------------------------------------------------------------- #
+# position-embedding auto rule (figure-2: attention family only, uniform only)
+# --------------------------------------------------------------------------- #
+
+def test_pos_emb_auto_on_for_attention_uniform():
+    # uniform layout removes BaseConv, so a permutation-equivariant mixer needs
+    # position embeddings to see order at all (figure-2 configs.py:142)
+    m = MQARModel(64, 128, dim=64, depth=2, heads=1, backend="sdpa",
+                  layer_layout="uniform")
+    assert m.use_pos_emb and isinstance(m.pos_emb, nn.Embedding)
+
+
+@pytest.mark.parametrize("backend", ["hyena", "mamba"])
+def test_pos_emb_auto_off_for_sequential_mixers_uniform(backend):
+    # conv/recurrence mixers carry their own order signal -> no pos emb, which
+    # keeps the validated DeltaNet-Fig4 runs bit-identical
+    m = MQARModel(512, 128, dim=64, depth=2, heads=1, backend=backend,
+                  layer_layout="uniform")
+    assert not m.use_pos_emb and not hasattr(m, "pos_emb")
+
+
+def test_pos_emb_auto_off_in_hybrid():
+    # hybrid's BaseConv carries order; figure-2's models_repo sets
+    # max_position_embeddings=0 for every mixer there
+    m = MQARModel(64, 128, dim=64, depth=2, heads=1, backend="sdpa")
+    assert not m.use_pos_emb
+
+
+def test_pos_emb_explicit_override_beats_auto():
+    m = MQARModel(64, 128, dim=64, depth=2, heads=1, backend="sdpa",
+                  layer_layout="uniform", use_pos_emb=False)
+    assert not m.use_pos_emb
+    m2 = MQARModel(64, 128, dim=64, depth=2, heads=1, backend="mamba",
+                   layer_layout="uniform", use_pos_emb=True)
+    assert m2.use_pos_emb
+
+
+def test_pos_emb_uniform_attention_forward_shape():
+    m = MQARModel(64, 128, dim=64, depth=2, heads=1, backend="sdpa",
+                  layer_layout="uniform")
+    out = m(torch.randint(0, 64, (2, 64)))
+    assert out.shape == (2, 64, 64) and torch.isfinite(out).all()
+
+
 @pytest.mark.parametrize("init", ["normal", "orthogonal"])
 def test_model_init_schemes(init):
     m = MQARModel(64, 128, dim=64, depth=2, backend="sdpa", init=init)
