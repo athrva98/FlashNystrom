@@ -633,6 +633,58 @@ def bench_attn_op_b200():
     _run_attn_op("B200")
 
 
+@app.function(gpu="A100-80GB", timeout=1800)
+def diagnose_scaled_copy_a100():
+    """Is scaled_copy worth optimizing, or is it already at memory roofline?
+
+    Races the kernel against a pure device-to-device copy of the SAME bytes
+    (torch .copy_, which is a straight cudaMemcpyAsync and therefore the
+    achievable floor for any kernel that must read X and write X). If the two
+    match, the pass cannot be made faster in place and the only remaining win
+    is eliminating it by fusing the scale into its producer/consumer."""
+    import torch, time
+    from flash_nystrom.flash_nystrom import _C
+
+    def timed(fn, iters=50, warmup=10):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        ts = []
+        for _ in range(iters):
+            s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+            s.record(); fn(); e.record()
+            torch.cuda.synchronize(); ts.append(s.elapsed_time(e))
+        ts.sort()
+        return ts[len(ts) // 2]
+
+    print("=== scaled_copy vs pure-copy roofline (A100-80GB, fp16) ===")
+    print(f"{'elements':>12} {'MB moved':>9} {'copy ms':>9} {'copy TB/s':>10} "
+          f"{'fwd ms':>9} {'fwd TB/s':>9}  {'note'}")
+    B, H, D = 1, 8, 64
+    for N in (131072, 524288, 2097152):
+        total = B * H * N * D
+        x = torch.randn(total, device="cuda", dtype=torch.float16)
+        y = torch.empty_like(x)
+        moved = 2 * total * 2 / 1e6      # read + write, bytes -> MB
+
+        t_copy = timed(lambda: y.copy_(x))
+        # The whole FN forward at this shape, to place the copy in context.
+        q, k, v = [t.view(B, H, N, D) for t in
+                   (torch.randn(total, device="cuda", dtype=torch.float16),
+                    torch.randn(total, device="cuda", dtype=torch.float16),
+                    torch.randn(total, device="cuda", dtype=torch.float16))]
+        t_fwd = timed(lambda: _C.forward(q, k, v, 64, 6, 1e3, True), iters=20)
+
+        print(f"{total:>12} {moved:>9.0f} {t_copy:>9.3f} {moved/1e3/t_copy:>10.2f} "
+              f"{t_fwd:>9.3f} {'':>9}  2 scaled_copy passes are "
+              f"{2*t_copy/t_fwd*100:.0f}% of forward at best")
+        del x, y, q, k, v
+        torch.cuda.empty_cache()
+    print("\nIf 'copy TB/s' is near A100-80GB peak (~1.94 TB/s), the kernel is at "
+          "roofline and only ELIMINATION (fusing the scale into the consumer) "
+          "can remove this cost.")
+
+
 @app.function(gpu="A100-80GB", timeout=9000)
 def diagnose_maxautotune_a100():
     """WHY does Inductor max-autotune beat FN at N=131072 (0.95x) and lose by
