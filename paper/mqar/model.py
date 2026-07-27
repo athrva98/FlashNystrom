@@ -167,7 +167,8 @@ def build_attention(
 ) -> nn.Module:
     if backend == "sdpa":
         return SdpaAttention(dim, heads, causal=causal)
-    if backend in ("nystrom_reference", "nystrom_reference_compile"):
+    if backend in ("nystrom_reference", "nystrom_reference_compile",
+                   "nystrom_reference_compile_max"):
         if causal:
             raise ValueError("Nystrom attention does not support causal masking")
         mod = NystromReferenceAttention(
@@ -177,17 +178,28 @@ def build_attention(
             use_conv_residual=use_conv_residual,
             kappa_star=kappa_star,
         )
-        # nystrom_reference_compile: the same eager reference wrapped in
-        # torch.compile (Inductor), the first optimization a practitioner
-        # reaches for. It isolates the value of hand-fusion beyond what the
-        # compiler gives for free. Inductor fuses the pointwise/softmax
-        # epilogues around the cuBLAS matmuls but does not tile the
-        # matmul-softmax-matmul chain into a register-resident kernel, so the
-        # (N, m) intermediates still reach HBM.
+        # The two compiled variants wrap the SAME eager reference in
+        # torch.compile (Inductor) -- the first optimization a practitioner
+        # reaches for -- and isolate the value of hand-fusion beyond what the
+        # compiler gives. Inductor fuses the pointwise/softmax epilogues around
+        # the cuBLAS matmuls but does not tile the matmul-softmax-matmul chain
+        # into a register-resident kernel, so the (N, m) intermediates still
+        # reach HBM.
         if backend == "nystrom_reference_compile":
-            # dynamic=True compiles once and handles the autobatch batch-size
-            # sweep without a recompile per shape.
+            # Default mode, dynamic=True: compiles once and handles the
+            # autobatch batch-size sweep without a recompile per shape.
             return torch.compile(mod, dynamic=True)
+        if backend == "nystrom_reference_compile_max":
+            # mode="max-autotune": Inductor's strongest setting -- Triton
+            # matmul template autotuning plus CUDA-graph capture. This is the
+            # baseline a reviewer asking "did you try torch.compile?" means, so
+            # it is the honest ceiling for the compiler path. dynamic must be
+            # False: dynamic shapes disable CUDA graphs and most template
+            # specialization, which would silently weaken the very baseline
+            # this variant exists to strengthen. Static shapes mean one compile
+            # per batch size, so callers must hold the batch fixed (the paper's
+            # latency harness does) rather than sweep it.
+            return torch.compile(mod, mode="max-autotune", dynamic=False)
         return mod
     if backend in ("flash_nystrom", "flash_nystrom_tc"):
         if causal:

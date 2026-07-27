@@ -554,9 +554,17 @@ def dump_inductor_code():
 
 def _run_attn_op(gpu_label):
     """Operator-only comparison: raw attention op (q,k,v -> out, no
-    projection/residual/loss glue), FN vs reference, each eager and
-    torch.compile'd (Triton+cuBLAS). Isolates the attention kernels. B=1 so FN
-    stays under its 2^31 element-index limit up to 2M tokens. fwd+bwd ms vs N."""
+    projection/residual/loss glue), FN vs reference, the latter eager and
+    torch.compile'd in BOTH Inductor modes. Isolates the attention kernels.
+    B=1 so FN stays under its 2^31 element-index limit up to 2M tokens.
+    fwd+bwd ms vs N.
+
+    The max-autotune column is the honest ceiling for "did you try
+    torch.compile?": Triton matmul template autotuning plus CUDA-graph
+    capture, which the default mode does not do. It is compiled per shape
+    (dynamic=False) because dynamic shapes disable exactly those two
+    optimizations; the autotuning pass makes its first call at each N very
+    slow, which the warmup absorbs."""
     import torch
     from flash_nystrom import flash_nystrom_attention as fn
     from flash_nystrom.reference import nystrom_attention_reference as ref
@@ -567,7 +575,9 @@ def _run_attn_op(gpu_label):
     def fn_op(q, k, v):   return fn(q, k, v, num_landmarks=m, kappa_star=1e3, use_tc_pinv=True)
     def ref_op(q, k, v):  return ref(q, k, v, m, 6, None, 0, 1e3)
     ref_c = torch.compile(ref_op, dynamic=True)
-    variants = [("FN eager", fn_op), ("ref eager", ref_op), ("ref compile", ref_c)]
+    ref_cmax = torch.compile(ref_op, mode="max-autotune", dynamic=False)
+    variants = [("FN eager", fn_op), ("ref eager", ref_op),
+                ("ref compile", ref_c), ("ref max-auto", ref_cmax)]
 
     def timed(f, q, k, v, warmup=10, iters=30):
         try:
@@ -584,7 +594,8 @@ def _run_attn_op(gpu_label):
             return f"ERR:{str(ex)[:40]}"
 
     print(f"===GPU {gpu_label}===  B={B} H={H} D={D} m={m}")
-    print(f"{'N':>8} | " + " | ".join(f"{n:>12}" for n, _ in variants) + " | refc/FN | refe/FN")
+    print(f"{'N':>8} | " + " | ".join(f"{n:>12}" for n, _ in variants)
+          + " | refe/FN | refc/FN | refmax/FN")
     for N in (131072, 262144, 524288, 1048576, 2097152):
         row, nums = [], []
         for _, f in variants:
@@ -593,14 +604,17 @@ def _run_attn_op(gpu_label):
             t = timed(f, q, k, v)
             nums.append(t if isinstance(t, float) else None)
             row.append(f"{t:12.2f}" if isinstance(t, float) else f"{t:>12}")
-        fnn, refe, refc = nums  # [FN, ref_eager, ref_compile]
-        rc = f"{refc/fnn:.2f}x" if (fnn and refc) else ("OOM" if fnn else "-")
-        re = f"{refe/fnn:.2f}x" if (fnn and refe) else ("OOM" if fnn else "-")
-        print(f"{N:>8} | " + " | ".join(row) + f" | {rc:>7} | {re:>7}")
+        fnn, refe, refc, refmax = nums  # [FN, ref_eager, ref_compile, ref_max_autotune]
+        def _ratio(x):
+            return f"{x/fnn:.2f}x" if (fnn and x) else ("OOM" if fnn else "-")
+        print(f"{N:>8} | " + " | ".join(row)
+              + f" | {_ratio(refe):>7} | {_ratio(refc):>7} | {_ratio(refmax):>9}")
 
 
-@app.function(gpu="A100-80GB", timeout=3600)
+@app.function(gpu="A100-80GB", timeout=9000)
 def bench_attn_op_a100():
+    # 2.5h: the max-autotune variant re-runs Inductor's template search at each
+    # N (dynamic=False), which is minutes per shape on top of the timed work.
     _run_attn_op("A100-80GB")
 
 
@@ -617,6 +631,104 @@ def bench_attn_op_h200():
 @app.function(gpu="B200", timeout=3600)
 def bench_attn_op_b200():
     _run_attn_op("B200")
+
+
+@app.function(gpu="A100-80GB", timeout=9000)
+def diagnose_maxautotune_a100():
+    """WHY does Inductor max-autotune beat FN at N=131072 (0.95x) and lose by
+    1.17x at N=2097152? Runs the operator-only shapes of _run_attn_op and, at
+    the crossover N and one N past it, reports for each path:
+
+      1. per-kernel CUDA time + launch counts (where the time actually goes),
+      2. total bytes moved, estimated from the tensors each kernel family must
+         touch, to test the IO-bound hypothesis directly,
+      3. the autotuned Triton source for the reference's hottest kernels, so
+         the fusion structure Inductor chose is visible rather than guessed.
+
+    Everything printed is measured; no ratios are inferred from the timings."""
+    import os, io, logging, sys
+    os.environ["TORCHINDUCTOR_MAX_AUTOTUNE"] = "1"
+    import torch
+    from torch.profiler import profile, ProfilerActivity
+    from flash_nystrom import flash_nystrom_attention as fn
+    from flash_nystrom.reference import nystrom_attention_reference as ref
+
+    torch.manual_seed(0)
+    B, H, D, m = 1, 8, 64, 64
+
+    def fn_op(q, k, v):
+        return fn(q, k, v, num_landmarks=m, kappa_star=1e3, use_tc_pinv=True)
+
+    def ref_op(q, k, v):
+        return ref(q, k, v, m, 6, None, 0, 1e3)
+
+    def fwd_bwd(f, q, k, v):
+        o = f(q, k, v)
+        o.float().pow(2).sum().backward()
+        q.grad = k.grad = v.grad = None
+
+    def prof_path(label, f, q, k, v, iters=10):
+        for _ in range(5):                       # warmup: absorbs autotuning
+            fwd_bwd(f, q, k, v)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as p:
+            for _ in range(iters):
+                fwd_bwd(f, q, k, v)
+            torch.cuda.synchronize()
+        evs = [e for e in p.key_averages() if e.self_device_time_total > 0]
+        total = sum(e.self_device_time_total for e in evs)
+        launches = sum(e.count for e in evs)
+        print(f"\n--- {label}: {total/iters:.1f} us/iter CUDA, "
+              f"{launches/iters:.0f} launches/iter ---")
+        print(f"    {'%':>6} {'us/iter':>9} {'count':>6}  kernel")
+        for e in sorted(evs, key=lambda e: -e.self_device_time_total)[:10]:
+            print(f"    {e.self_device_time_total/total*100:6.1f} "
+                  f"{e.self_device_time_total/iters:9.1f} {e.count/iters:6.1f}  {e.key[:70]}")
+        return total / iters
+
+    print(f"=== max-autotune diagnosis  B={B} H={H} D={D} m={m} ===")
+    for N in (131072, 2097152):
+        print(f"\n############ N={N} "
+              f"(qkv {3*B*H*N*D*2/1e6:.0f} MB fp16, (N,m) intermediate "
+              f"{B*H*N*m*2/1e6:.0f} MB) ############")
+        q, k, v = [torch.randn(B, H, N, D, device="cuda", dtype=torch.float16,
+                               requires_grad=True) for _ in range(3)]
+        ref_cmax = torch.compile(ref_op, mode="max-autotune", dynamic=False)
+        t_fn = prof_path("FlashNystrom (tf32 pinv)", fn_op, q, k, v)
+        t_mx = prof_path("reference max-autotune", ref_cmax, q, k, v)
+        print(f"\n  >>> N={N}: max-autotune / FN = {t_mx/t_fn:.2f}x "
+              f"({'FN faster' if t_mx > t_fn else 'MAX-AUTOTUNE FASTER'})")
+        del q, k, v, ref_cmax
+        torch.cuda.empty_cache()
+        torch._dynamo.reset()
+
+    # Autotuned Triton source at the shape where max-autotune WINS.
+    print("\n############ autotuned Triton for the reference at N=131072 ############")
+    os.environ["TORCH_LOGS"] = "output_code"
+    cap = io.StringIO()
+    handler = logging.StreamHandler(cap)
+    logging.getLogger("torch._inductor").addHandler(handler)
+    N = 131072
+    q, k, v = [torch.randn(B, H, N, D, device="cuda", dtype=torch.float16,
+                           requires_grad=True) for _ in range(3)]
+    rc = torch.compile(ref_op, mode="max-autotune", dynamic=False)
+    fwd_bwd(rc, q, k, v)
+    torch.cuda.synchronize()
+    code = cap.getvalue()
+    print(f"captured {len(code)} chars of Inductor output")
+    print("\n=== buffer allocations (the materialized intermediates) ===")
+    seen = 0
+    for line in code.splitlines():
+        s = line.strip()
+        if "empty_strided_cuda" in s:
+            print("  " + s[:150]); seen += 1
+            if seen >= 25:
+                print("  ... (truncated)"); break
+    print("\n=== kernel defs + template choices ===")
+    for line in code.splitlines():
+        s = line.strip()
+        if s.startswith("def triton_") or "template" in s.lower() or "extern_kernels" in s:
+            print("  " + s[:150])
 
 
 @app.function(gpu="A100", timeout=3600)
