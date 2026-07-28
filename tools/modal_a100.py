@@ -1408,3 +1408,58 @@ def bench_baselines_fa_a100():
     """The operator table including sliding-window attention, which needs
     FlashAttention's fused windowed kernel (hence the FA image)."""
     _run_baselines("A100-80GB", Ns=(65536, 262144, 1048576), sdpa_max_n=262144)
+
+
+@app.function(gpu="A100-80GB", timeout=14400)
+def mqar_diagnostic_a100():
+    """The reduced MQAR diagnostic for the paper's bidirectional framing.
+
+    MQAR is no longer a headline comparison against causal mixers (Hyena and
+    Mamba are causal by construction, a different regime). It is retained as
+    the ADVERSARIAL RECALL PROBE: the task a rank-m factorization is worst at,
+    measuring what the low-rank approximation costs against exact attention
+    under otherwise identical bidirectional conditions.
+
+    So the method set is the operators the paper actually claims about --
+    exact attention as the ceiling, the pure-PyTorch Nystrom reference, and
+    both FlashNystrom pseudoinverse paths -- and the sweep is over model
+    dimension at the certified protocol. 4 methods x 4 dims x 4 LRs = 64 runs
+    instead of 112, and no causal baselines to install."""
+    import subprocess
+    cmd = ["python", "-u", "-m", "paper.mqar.paper_sweep",
+           "--methods", "sdpa", "nystrom_reference", "flash_nystrom",
+           "flash_nystrom_tc",
+           "--max_parallel", "4", "--out", "runs/mqar_paper"]
+    r = subprocess.run(cmd, cwd="/root/FlashNystrom", capture_output=True, text=True)
+    print(r.stdout[-12000:])
+    if r.returncode != 0:
+        print("=== STDERR ===")
+        print(r.stderr[-4000:])
+
+
+@app.function(gpu="A100-80GB", timeout=10800)
+def genomics_a100():
+    """Second bidirectional domain: DNA regulatory-motif classification at
+    N=4096, swapping only the attention operator. Three seeds per arm."""
+    import sys, statistics
+    sys.path.insert(0, "/root/FlashNystrom")
+    from benchmarks.genomics import train_eval
+
+    ARMS = ["sdpa", "nystrom_reference", "flash_nystrom", "flash_nystrom_tc"]
+    SEEDS = [0, 1, 2]
+    print("=== DNA regulatory-motif classification, N=4096, 3 seeds ===")
+    results = {}
+    for arm in ARMS:
+        accs = []
+        for s in SEEDS:
+            acc = train_eval(arm, seq_len=4096, seed=s)
+            accs.append(acc)
+            print(f"  {arm} seed {s}: {acc:.2f}%", flush=True)
+        mu = statistics.mean(accs)
+        sd = statistics.stdev(accs) if len(accs) > 1 else 0.0
+        results[arm] = (mu, sd, accs)
+        print(f"  ==> {arm}: {mu:.2f} +/- {sd:.2f}  {[round(a,1) for a in accs]}",
+              flush=True)
+    print("\n=== SUMMARY (test acc %, mean +/- sd over 3 seeds) ===")
+    for arm, (mu, sd, accs) in results.items():
+        print(f"  {arm:22s} {mu:6.2f} +/- {sd:5.2f}   {[round(a,1) for a in accs]}")
