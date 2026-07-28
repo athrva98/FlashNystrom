@@ -14,10 +14,11 @@ order, so a causal mask would discard half the context for no modelling
 reason. That is why this domain belongs to the bidirectional family rather
 than to the causal-LM family the SSM literature targets.
 
-Task: binary classification of human enhancer / promoter sequences against
-length-matched background, one-hot over {A,C,G,T} tokenized per base. The
-sequence IS the context, so the model must attend across the whole window --
-exactly the regime where the operator choice matters.
+Task: long-range repeat detection. Each sequence opens with a query k-mer;
+the label is whether that exact k-mer recurs later in the sequence. The two
+positions are arbitrarily far apart and neither is privileged, so the model
+must match content across the whole window in both directions -- the regime
+where the operator choice matters.
 
 Only the attention operator changes between arms; everything else (tokenizer,
 backbone, optimizer, schedule, seeds) is held fixed, so a difference in test
@@ -35,36 +36,39 @@ BASES = "ACGT"
 BASE_TO_IDX = {b: i for i, b in enumerate(BASES)}
 
 
-def synth_regulatory_dataset(num_examples: int, seq_len: int, seed: int = 0,
-                             motif_len: int = 8, n_motifs: int = 3):
-    """A controlled stand-in for regulatory-element detection.
+KMER = 6                      # DNABERT-style k-mer tokens
+KMER_VOCAB = 4 ** KMER        # 4096
 
-    Positive sequences carry `n_motifs` copies of a fixed motif at random
-    positions in an i.i.d. background; negatives carry the same number of
-    RANDOM k-mers, so the two classes match in length, base composition and
-    k-mer count. The only signal is the specific motif, placed anywhere in the
-    window, which forces the model to attend across the full sequence rather
-    than exploit position or composition.
 
-    Synthetic rather than a downloaded corpus so the experiment is
-    reproducible without a data dependency and the signal is known exactly;
-    the point here is to compare operators under identical data, not to claim
-    a genomics result.
+def synth_repeat_dataset(num_examples: int, seq_len: int, seed: int = 0):
+    """Long-range repeat detection over k-mer tokens.
+
+    Sequences are tokenized as non-overlapping ``KMER``-mers, the standard
+    representation for DNA transformers (DNABERT and successors) and the one
+    that makes the task well posed: with single-base tokens any k-mer question
+    first requires aggregating adjacent positions, which attention does poorly
+    without a convolutional prior, so the experiment would measure the missing
+    locality prior rather than the attention operator. With k-mer tokens the
+    question is content matching between two positions, which is exactly what
+    attention computes.
+
+    Each sequence opens with a query k-mer token. In positives that same token
+    recurs once at a random later position; in negatives a different random
+    token is placed there instead. Both classes therefore hold exactly two
+    insertions and identical token statistics, and the label depends only on
+    whether the two agree -- an arbitrarily long-range, order-free relation.
     """
     g = torch.Generator().manual_seed(seed)
-    x = torch.randint(0, 4, (num_examples, seq_len), generator=g)
+    x = torch.randint(0, KMER_VOCAB, (num_examples, seq_len), generator=g)
     y = torch.zeros(num_examples, dtype=torch.long)
     y[: num_examples // 2] = 1
-    motif = torch.randint(0, 4, (motif_len,), generator=g)
 
     for i in range(num_examples):
-        for _ in range(n_motifs):
-            pos = int(torch.randint(0, seq_len - motif_len, (1,), generator=g))
-            if y[i] == 1:
-                x[i, pos:pos + motif_len] = motif           # the real motif
-            else:
-                x[i, pos:pos + motif_len] = torch.randint(   # matched decoy
-                    0, 4, (motif_len,), generator=g)
+        query = int(torch.randint(0, KMER_VOCAB, (1,), generator=g))
+        x[i, 0] = query
+        pos = int(torch.randint(1, seq_len, (1,), generator=g))
+        x[i, pos] = query if y[i] == 1 else int(
+            torch.randint(0, KMER_VOCAB, (1,), generator=g))
     perm = torch.randperm(num_examples, generator=g)
     return x[perm], y[perm]
 
@@ -82,7 +86,7 @@ class DNAClassifier(nn.Module):
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from paper.mqar.model import build_attention
 
-        self.emb = nn.Embedding(4, dim)
+        self.emb = nn.Embedding(KMER_VOCAB, dim)
         self.pos = nn.Embedding(seq_len, dim)
         self.blocks = nn.ModuleList()
         for _ in range(depth):
@@ -104,16 +108,22 @@ class DNAClassifier(nn.Module):
         for b in self.blocks:
             h = h + b["attn"](b["norm"](h))
             h = h + b["mlp"](b["norm2"](h))
-        return self.head(self.norm_f(h).mean(dim=1))       # mean-pool: bidirectional
+        # MAX-pool, not mean: the label depends on whether a motif occurs
+        # ANYWHERE, so a mean over N positions divides the evidence by N
+        # (24 signal positions in 4096 is a 0.6% signal-to-noise ratio in
+        # the pooled vector, which no arm can learn). Max-pooling is the
+        # standard readout for motif detection and keeps the task about
+        # the attention operator rather than about pooling dilution.
+        return self.head(self.norm_f(h).max(dim=1).values)
 
 
-def train_eval(backend, seq_len=4096, dim=128, heads=2, num_landmarks=64,
-               n_train=4096, n_test=1024, epochs=8, batch_size=16, lr=3e-4,
+def train_eval(backend, seq_len=2048, dim=128, heads=2, num_landmarks=64,
+               n_train=8192, n_test=1024, epochs=15, batch_size=32, lr=3e-4,
                seed=0, device="cuda", dtype=torch.bfloat16):
     """Train one arm and return best test accuracy. Only `backend` varies."""
     torch.manual_seed(seed)
-    xtr, ytr = synth_regulatory_dataset(n_train, seq_len, seed=seed)
-    xte, yte = synth_regulatory_dataset(n_test, seq_len, seed=seed + 10_000)
+    xtr, ytr = synth_repeat_dataset(n_train, seq_len, seed=seed)
+    xte, yte = synth_repeat_dataset(n_test, seq_len, seed=seed + 10_000)
     model = DNAClassifier(seq_len, dim, 2, heads, backend, num_landmarks).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
