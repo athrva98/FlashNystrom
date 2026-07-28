@@ -220,6 +220,22 @@ def build_attention(
         # FlashNystromAttention owns its own q/k/v/out projections, matching
         # SdpaAttention's structure.
         return FlashNystromAttention(dim, heads=heads, config=cfg)
+    if backend in ("linformer", "sliding_window"):
+        # Bidirectional-native baselines, defined once in benchmarks/baseline_attn.py
+        # and shared by the vision, MQAR and genomics harnesses so every
+        # experiment compares the same objects. Both route to optimized
+        # implementations (FA-2's windowed kernel; a dense-projection Linformer).
+        import os, sys
+        _bench = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))), "benchmarks")
+        if _bench not in sys.path:
+            sys.path.insert(0, _bench)
+        from baseline_attn import build_baseline
+        if causal:
+            raise ValueError(f"{backend} is bidirectional here; causal not implemented")
+        if seq_len is None:
+            raise ValueError(f"{backend} requires seq_len")
+        return build_baseline(backend, dim, heads, seq_len)
     if backend == "linear_attention":
         if causal:
             raise ValueError("linear attention is bidirectional here; causal not implemented")

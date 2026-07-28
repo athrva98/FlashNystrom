@@ -52,8 +52,11 @@ import statistics
 
 from .runner import run_many
 
-METHODS = ["sdpa", "linear_attention", "nystrom_reference",
-           "flash_nystrom", "flash_nystrom_tc", "hyena", "mamba"]
+# The bidirectional-native set. Hyena and Mamba are excluded: they are causal
+# by construction, so comparing them here would measure the masking regime
+# rather than the operator (see the paper's experiments preamble).
+METHODS = ["sdpa", "linear_attention", "linformer", "sliding_window",
+           "nystrom_reference", "flash_nystrom", "flash_nystrom_tc"]
 DIMS = [64, 128, 256, 512]
 LRS = [1e-4, 4.641589e-4, 2.154435e-3, 1e-2]   # np.logspace(-4, -2, 4)
 

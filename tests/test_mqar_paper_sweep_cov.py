@@ -40,8 +40,14 @@ def test_lr_grid_is_figure2_logspace():
     assert LRS[1] / LRS[0] == pytest.approx(LRS[2] / LRS[1], rel=1e-3)
 
 
-def test_all_seven_methods_and_four_dims():
-    assert len(METHODS) == 7 and "flash_nystrom" in METHODS and "mamba" in METHODS
+def test_method_set_is_bidirectional_native():
+    # Hyena and Mamba are deliberately absent: causal by construction, so
+    # comparing them would measure the masking regime, not the operator.
+    assert len(METHODS) == 7
+    for m in ("sdpa", "linear_attention", "linformer", "sliding_window",
+              "nystrom_reference", "flash_nystrom", "flash_nystrom_tc"):
+        assert m in METHODS, m
+    assert "hyena" not in METHODS and "mamba" not in METHODS
     assert DIMS == [64, 128, 256, 512]
 
 
@@ -181,7 +187,7 @@ def test_main_dry_run_lists_everything(tmp_path, capsys):
 
 
 def test_main_collect_only_aggregates(tmp_path, capsys, monkeypatch):
-    _fake(str(tmp_path), "mamba", 256, LRS[2], 0, 99.08)
+    _fake(str(tmp_path), "flash_nystrom", 256, LRS[2], 0, 99.08)
     monkeypatch.setattr(paper_sweep, "run_many",
                         lambda *a, **k: pytest.fail("collect_only must not run"))
     main(["--collect_only", "--out", str(tmp_path)])

@@ -401,7 +401,8 @@ def build_parser():
     p.add_argument(
         "--backend",
         choices=["sdpa", "flash_nystrom", "flash_nystrom_tc", "nystrom_reference",
-                 "linear_attention", "hyena", "mamba"],
+                 "linear_attention", "linformer", "sliding_window",
+                 "hyena", "mamba"],
         default="sdpa",
     )
     p.add_argument("--dim", type=int, default=128)
