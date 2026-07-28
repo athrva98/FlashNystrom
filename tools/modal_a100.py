@@ -633,6 +633,95 @@ def bench_attn_op_b200():
     _run_attn_op("B200")
 
 
+def _run_baselines(gpu_label, Ns=(16384, 65536, 131072, 262144, 524288, 1048576),
+                   sdpa_max_n=524288):
+    """Operator-level latency: FlashNystrom vs the sub-quadratic attention
+    family, fwd+bwd ms vs N. Every entry maps (q,k,v) -> out with no
+    projections or block glue, so the number is the attention math alone.
+
+    Exact attention (SDPA) is included until it OOMs or times out, as the
+    ceiling. Linformer uses r = m so its rank matches the landmark count;
+    its (r, N) projections are allocated per length and their size is
+    reported, since that memory grows with N while a landmark count does not.
+    """
+    import sys, torch
+    sys.path.insert(0, "/root/FlashNystrom")
+    from flash_nystrom import flash_nystrom_attention as fn
+    from benchmarks.baseline_ops import (
+        sdpa_op, linear_attention_op, linformer_op,
+        make_linformer_projections, linformer_projection_bytes,
+    )
+    torch.manual_seed(0)
+    B, H, D, m = 1, 8, 64, 64
+
+    def timed(f, q, k, v, extra_grads=(), warmup=5, iters=20):
+        """fwd+bwd. extra_grads are additional LEARNED tensors whose gradients
+        the step must also produce (Linformer's E and F), so every method is
+        charged for the full backward its own formulation requires."""
+        def clear():
+            q.grad = k.grad = v.grad = None
+            for t in extra_grads:
+                t.grad = None
+        try:
+            for _ in range(warmup):
+                o = f(q, k, v); o.float().pow(2).sum().backward(); clear()
+            torch.cuda.synchronize()
+            ts = []
+            for _ in range(iters):
+                s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+                s.record(); o = f(q, k, v); o.float().pow(2).sum().backward(); e.record()
+                torch.cuda.synchronize(); ts.append(s.elapsed_time(e)); clear()
+            ts.sort(); return ts[len(ts) // 2]
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache(); return "OOM"
+        except Exception as ex:
+            return f"ERR:{str(ex)[:28]}"
+
+    print(f"===GPU {gpu_label}===  B={B} H={H} D={D} m=r={m}  (fwd+bwd ms)")
+    print(f"{'N':>9} | {'FlashNystrom':>13} | {'linear attn':>12} | "
+          f"{'Linformer':>10} | {'exact SDPA':>11} | {'Lf proj MB':>10}")
+    for N in Ns:
+        q, k, v = [torch.randn(B, H, N, D, device="cuda", dtype=torch.float16,
+                               requires_grad=True) for _ in range(3)]
+        # E, F are learned parameters in Linformer, so the step pays for dE/dF.
+        E, F_ = make_linformer_projections(B, H, N, m, "cuda", torch.float16,
+                                           requires_grad=True)
+        row = []
+        for f, extra in (
+            (lambda a, b, c: fn(a, b, c, num_landmarks=m, kappa_star=1e3, use_tc_pinv=True), ()),
+            (linear_attention_op, ()),
+            (lambda a, b, c: linformer_op(a, b, c, E, F_), (E, F_)),
+            (sdpa_op, ()),
+        ):
+            # Exact attention is skipped past sdpa_max_n: it is already
+            # established as ~1000x slower there, and one cell costs ~20 min
+            # of quadratic work that no claim depends on.
+            if f is sdpa_op and N > sdpa_max_n:
+                row.append(f"{'skipped':>13}")
+                continue
+            t = timed(f, q, k, v, extra_grads=extra)
+            row.append(f"{t:13.2f}" if isinstance(t, float) else f"{t:>13}")
+            torch.cuda.empty_cache()
+        proj_mb = linformer_projection_bytes(N, m) / 1e6
+        print(f"{N:>9} | {row[0]:>13} | {row[1][-12:]:>12} | {row[2][-10:]:>10} | "
+              f"{row[3][-11:]:>11} | {proj_mb:>10.0f}")
+        del q, k, v, E, F_
+        torch.cuda.empty_cache()
+
+
+@app.function(gpu="A100-80GB", timeout=5400)
+def bench_baselines_a100():
+    _run_baselines("A100-80GB")
+
+
+@app.function(gpu="A100-80GB", timeout=5400)
+def bench_baselines_longn_a100():
+    """The long-N tail only. Linformer's lead over FN decays monotonically
+    (3.80x at 16k -> 1.05x at 524k), so the crossover sits in this range;
+    exact attention is skipped here, being ~1000x slower already."""
+    _run_baselines("A100-80GB", Ns=(1048576, 2097152), sdpa_max_n=0)
+
+
 @app.function(gpu="A100-80GB", timeout=1800)
 def diagnose_scaled_copy_a100():
     """Is scaled_copy worth optimizing, or is it already at memory roofline?
