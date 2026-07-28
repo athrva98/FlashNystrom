@@ -648,7 +648,7 @@ def _run_baselines(gpu_label, Ns=(16384, 65536, 131072, 262144, 524288, 1048576)
     sys.path.insert(0, "/root/FlashNystrom")
     from flash_nystrom import flash_nystrom_attention as fn
     from benchmarks.baseline_ops import (
-        sdpa_op, linear_attention_op, linformer_op,
+        sdpa_op, linear_attention_op, linformer_op, sliding_window_op,
         make_linformer_projections, linformer_projection_bytes,
     )
     torch.manual_seed(0)
@@ -678,8 +678,11 @@ def _run_baselines(gpu_label, Ns=(16384, 65536, 131072, 262144, 524288, 1048576)
             return f"ERR:{str(ex)[:28]}"
 
     print(f"===GPU {gpu_label}===  B={B} H={H} D={D} m=r={m}  (fwd+bwd ms)")
+    print("sliding window: w=64 matches the per-query key budget (m landmarks); "
+          "w=256 is a typical deployed width. Both are LOCAL-only.")
     print(f"{'N':>9} | {'FlashNystrom':>13} | {'linear attn':>12} | "
-          f"{'Linformer':>10} | {'exact SDPA':>11} | {'Lf proj MB':>10}")
+          f"{'Linformer':>10} | {'SW w=64':>9} | {'SW w=256':>9} | "
+          f"{'exact SDPA':>11} | {'Lf proj MB':>10}")
     for N in Ns:
         q, k, v = [torch.randn(B, H, N, D, device="cuda", dtype=torch.float16,
                                requires_grad=True) for _ in range(3)]
@@ -691,6 +694,8 @@ def _run_baselines(gpu_label, Ns=(16384, 65536, 131072, 262144, 524288, 1048576)
             (lambda a, b, c: fn(a, b, c, num_landmarks=m, kappa_star=1e3, use_tc_pinv=True), ()),
             (linear_attention_op, ()),
             (lambda a, b, c: linformer_op(a, b, c, E, F_), (E, F_)),
+            (lambda a, b, c: sliding_window_op(a, b, c, 64), ()),
+            (lambda a, b, c: sliding_window_op(a, b, c, 256), ()),
             (sdpa_op, ()),
         ):
             # Exact attention is skipped past sdpa_max_n: it is already
@@ -704,7 +709,8 @@ def _run_baselines(gpu_label, Ns=(16384, 65536, 131072, 262144, 524288, 1048576)
             torch.cuda.empty_cache()
         proj_mb = linformer_projection_bytes(N, m) / 1e6
         print(f"{N:>9} | {row[0]:>13} | {row[1][-12:]:>12} | {row[2][-10:]:>10} | "
-              f"{row[3][-11:]:>11} | {proj_mb:>10.0f}")
+              f"{row[3][-9:]:>9} | {row[4][-9:]:>9} | {row[5][-11:]:>11} | "
+              f"{proj_mb:>10.0f}")
         del q, k, v, E, F_
         torch.cuda.empty_cache()
 
@@ -1395,3 +1401,10 @@ def main():
     test.remote()
     print("=== benchmark ===")
     bench.remote()
+
+
+@app.function(gpu="A100-80GB", image=fa_image, timeout=5400)
+def bench_baselines_fa_a100():
+    """The operator table including sliding-window attention, which needs
+    FlashAttention's fused windowed kernel (hence the FA image)."""
+    _run_baselines("A100-80GB", Ns=(65536, 262144, 1048576), sdpa_max_n=262144)

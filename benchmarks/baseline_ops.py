@@ -90,3 +90,40 @@ def linformer_projection_bytes(N, r, dtype_size=2):
     """Bytes held by the two (r, N) projections, the memory Linformer needs
     that a landmark method does not."""
     return 2 * r * N * dtype_size
+
+
+def sliding_window_op(q, k, v, window: int):
+    """Bidirectional sliding-window attention: each query attends exactly to
+    the `window` nearest keys, half on each side (Longformer / BigBird /
+    Mistral-style local attention, without the global tokens).
+
+    Routed through FlashAttention-2's fused windowed kernel, which is the
+    fastest available implementation, so the comparison is against the
+    baseline at its best rather than against a masked O(N^2) stand-in.
+
+    The receptive field is the point of contrast, not just the cost: a window
+    of w gives each query an EXACT view of w local keys and no global mixing
+    (information travels only w/2 positions per layer), whereas m landmarks
+    give an APPROXIMATE view of the entire sequence in one layer. Matching the
+    per-query key budget (w = m) matches FLOPs but not what the operator can
+    represent, which is why both are reported.
+    """
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError as e:  # pragma: no cover - depends on the bench image
+        raise RuntimeError(
+            "sliding_window_op needs flash-attn (the fused windowed kernel); "
+            "a masked SDPA stand-in would be O(N^2) and not a fair baseline"
+        ) from e
+    half = window // 2
+    # flash_attn wants (B, N, H, D); ours are (B, H, N, D).
+    qt, kt, vt = (t.transpose(1, 2).contiguous() for t in (q, k, v))
+    o = flash_attn_func(qt, kt, vt, causal=False, window_size=(half, half))
+    return o.transpose(1, 2)
+
+
+def sliding_window_receptive_field(window: int, layers: int = 1):
+    """Positions reachable after `layers` sliding-window layers: each layer
+    moves information at most window//2 in each direction. Contrast with a
+    landmark method, whose receptive field is the whole sequence at depth 1."""
+    return window // 2 * layers
