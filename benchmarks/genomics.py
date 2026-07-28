@@ -108,13 +108,14 @@ class DNAClassifier(nn.Module):
         for b in self.blocks:
             h = h + b["attn"](b["norm"](h))
             h = h + b["mlp"](b["norm2"](h))
-        # MAX-pool, not mean: the label depends on whether a motif occurs
-        # ANYWHERE, so a mean over N positions divides the evidence by N
-        # (24 signal positions in 4096 is a 0.6% signal-to-noise ratio in
-        # the pooled vector, which no arm can learn). Max-pooling is the
-        # standard readout for motif detection and keeps the task about
-        # the attention operator rather than about pooling dilution.
-        return self.head(self.norm_f(h).max(dim=1).values)
+        # Read out at position 0, where the query k-mer sits, so the readout
+        # token IS the thing being matched. One attention operation then
+        # answers the task: position 0 attends over the sequence and its
+        # output reflects whether anything matched it. Pooling over all
+        # positions instead (mean or max) forces the model to first localize
+        # the match and then propagate it to a pooled summary, which is
+        # strictly more circuit than the question requires.
+        return self.head(self.norm_f(h)[:, 0])
 
 
 def train_eval(backend, seq_len=2048, dim=128, heads=2, num_landmarks=64,
@@ -122,7 +123,10 @@ def train_eval(backend, seq_len=2048, dim=128, heads=2, num_landmarks=64,
                seed=0, device="cuda", dtype=torch.bfloat16):
     """Train one arm and return best test accuracy. Only `backend` varies."""
     torch.manual_seed(seed)
-    xtr, ytr = synth_repeat_dataset(n_train, seq_len, seed=seed)
+    # FRESH training data each epoch. The fixed-set version memorized: train
+    # loss fell while test accuracy stayed at chance, because with a 4096-token
+    # vocabulary the model can key on which queries it has seen instead of
+    # learning the comparison. Regenerating removes that shortcut entirely.
     xte, yte = synth_repeat_dataset(n_test, seq_len, seed=seed + 10_000)
     model = DNAClassifier(seq_len, dim, 2, heads, backend, num_landmarks).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
@@ -130,6 +134,7 @@ def train_eval(backend, seq_len=2048, dim=128, heads=2, num_landmarks=64,
 
     best = 0.0
     for ep in range(epochs):
+        xtr, ytr = synth_repeat_dataset(n_train, seq_len, seed=seed * 1000 + ep)
         model.train()
         perm = torch.randperm(n_train)
         for i in range(0, n_train, batch_size):

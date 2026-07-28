@@ -43,6 +43,7 @@ _pin_cifar_mirror()
 
 from flash_nystrom import FlashNystromAttention, NystromConfig
 from flash_nystrom.reference import nystrom_attention_reference
+from baseline_attn import build_baseline
 
 
 def subset_indices(n_full, train_frac, batch_size, seed):
@@ -454,7 +455,17 @@ def main():
                          "buffers, fragmentation over a long run) so training does "
                          "not OOM partway. Lower it if you still hit OOM at large N.")
     ap.add_argument("--backends", nargs="+",
-                    default=["sdpa", "nystrom_reference", "flash_nystrom"])
+                    default=["sdpa", "nystrom_reference", "flash_nystrom"],
+                    help="arms to train. Beyond the Nystrom family and sdpa, the "
+                         "bidirectional-native baselines are linear_attention "
+                         "(fused Triton via flash_bla when installed), linformer "
+                         "(rank --linformer_rank) and sliding_window (fused FA-2 "
+                         "windowed kernel, width --sw_window).")
+    ap.add_argument("--linformer_rank", type=int, default=64,
+                    help="Linformer projection rank r; default matches m=64 so "
+                         "the low-rank budget equals the landmark count")
+    ap.add_argument("--sw_window", type=int, default=256,
+                    help="sliding-window width (total, half per side)")
     ap.add_argument("--no-instrument", dest="instrument", action="store_false",
                     help="disable the per-step collapse diagnostics (ON by default): "
                          "per-layer dO underflow, NaN origin, collapse onset")
@@ -483,6 +494,8 @@ def main():
               warmup_frac=a.warmup_frac)
 
     ks = a.kappa_star
+    # needed by the Linformer projections and the window clamp below
+    n_tokens = (img_size // a.patch_size) ** 2 + 1
     factories = {
         "sdpa": ("SDPA", lambda d, h: SDPAAttention(d, h)),
         "nystrom_reference": ("Nystrom-Ref",
@@ -517,6 +530,18 @@ def main():
                 d, h, NystromConfig(num_landmarks=m, newton_iter=ni, fast_dk2inv=fdk,
                                     kappa_star=ks, use_tc_pinv=False,
                                     conv_kernel_size=0, use_conv_residual=False))),
+        # --- bidirectional-native baselines -------------------------------
+        # Same projection shell as every other arm; only the attention math
+        # differs. Routed to fused kernels where they exist so the comparison
+        # is against optimized implementations, not unfused framework code.
+        "linear_attention": ("LinearAttn",
+            lambda d, h: build_baseline("linear_attention", d, h, n_tokens)),
+        "linformer": ("Linformer",
+            lambda d, h: build_baseline("linformer", d, h, n_tokens,
+                                        rank=a.linformer_rank)),
+        "sliding_window": (f"SlidingWin",
+            lambda d, h: build_baseline("sliding_window", d, h, n_tokens,
+                                        window=a.sw_window)),
         # flash_nystrom_tc = the opt-in tf32 tensor-core pinv (faster, ~1-5% accuracy cost).
         "flash_nystrom_tc": ("FlashNystrom-TC",
             lambda d, h: FlashNystromAttention(
@@ -524,7 +549,6 @@ def main():
                                     kappa_star=ks, use_tc_pinv=True,
                                     conv_kernel_size=0, use_conv_residual=False))),
     }
-    n_tokens = (img_size // a.patch_size) ** 2 + 1
     print("=" * 70)
     print(f"{a.dataset}  img_size={img_size}  patch_size={a.patch_size}  "
           f"N={n_tokens} tokens  m={m}  grad_clip={a.grad_clip}  "
