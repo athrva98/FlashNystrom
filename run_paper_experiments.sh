@@ -32,6 +32,12 @@ have flash_bla  && echo "  flash_bla         OK (linear_attention fused)" \
                      the UNFUSED torch path, which is ~2x slower and NOT a fair
                      baseline. Install:
                      pip install -e git+https://github.com/fla-org/flash-bidirectional-linear-attention.git#egg=flash_bla"
+have pyfaidx    && echo "  pyfaidx           OK (species task)" \
+                || echo "  pyfaidx           MISSING -> species task WILL FAIL:
+                     pip install pyfaidx"
+have genomic_benchmarks && echo "  genomic-benchmarks OK" \
+                || echo "  genomic-benchmarks MISSING -> that stage WILL FAIL:
+                     pip install genomic-benchmarks"
 echo
 
 # --------------------------------------------------------------------------
@@ -79,19 +85,54 @@ if [[ " $STAGES " == *" mqar "* ]]; then
 fi
 
 # --------------------------------------------------------------------------
-# 3. GENOMICS -- second bidirectional domain. The task is VERIFIED solvable
-#    (an oracle scores 94.0%), but a 2-layer model only finds the matching
-#    circuit after an MQAR-style phase transition, so it needs the LR grid and
-#    a long budget rather than the short schedule that failed earlier. Treat a
-#    result as valid ONLY if the sdpa arm clears ~85%; below that the arms are
-#    at chance and the comparison says nothing about the operator.
+# 3. GENOMICS -- second bidirectional domain, on established benchmarks.
+#
+#    a) species classification (HyenaDNA, NeurIPS 2023): real genomes,
+#       chromosome-disjoint splits, at 1024 and 32768 bp. This is the
+#       long-range evidence and the one that matters most.
+#    b) Genomic Benchmarks (Grešová et al., BMC Genomic Data 2023): the
+#       standard regulatory-element check that HyenaDNA and Caduceus both
+#       report, on the two longest datasets in the suite.
+#    c) the synthetic needle-retrieval diagnostic, kept only to separate
+#       "operator cannot do this" from "model did not train".
+#
+#    Each carries its own validity gate on the sdpa arm (see run_genomics.py);
+#    a stage that prints "!! INVALID" must not go in the paper.
+#
+#    (a) needs reference genomes first, roughly 1.5 GB at the default
+#    --chroms_per_split 4:
+#        python benchmarks/download_genomes.py --out data/genomes
 # --------------------------------------------------------------------------
 if [[ " $STAGES " == *" genomics "* ]]; then
   echo "########## GENOMICS ##########"
-  python -u benchmarks/run_genomics.py \
-    --arms $ARMS --seeds $SEEDS \
-    --lrs 1e-4 3e-4 1e-3 3e-3 --epochs 60 --seq_len 2048 \
-    --n_train 32768 --out runs/genomics 2>&1 | tee logs/genomics.log
+
+  if [[ ! -d data/genomes ]]; then
+    echo "--- fetching reference genomes ---"
+    python -u benchmarks/download_genomes.py --out data/genomes \
+      2>&1 | tee logs/genomes_download.log
+  fi
+
+  for N in 1024 32768; do
+    bs=32; [[ $N -ge 32768 ]] && bs=4
+    echo "--- species N=$N (batch $bs) ---"
+    python -u benchmarks/run_genomics.py --task species \
+      --arms $ARMS --seeds $SEEDS --lrs 1e-4 3e-4 1e-3 3e-3 \
+      --seq_len "$N" --batch_size "$bs" --epochs 20 \
+      --n_train 32768 --n_test 4096 --species_dir data/genomes \
+      --out runs/genomics 2>&1 | tee "logs/genomics_species_${N}.log"
+  done
+
+  echo "--- genomic benchmarks ---"
+  python -u benchmarks/run_genomics.py --task genomic_benchmarks \
+    --arms $ARMS --seeds $SEEDS --lrs 1e-4 3e-4 1e-3 3e-3 \
+    --epochs 40 --batch_size 32 --out runs/genomics \
+    2>&1 | tee logs/genomics_gb.log
+
+  echo "--- synthetic diagnostic ---"
+  python -u benchmarks/run_genomics.py --task repeat --variant pointer \
+    --arms $ARMS --seeds $SEEDS --lrs 1e-4 3e-4 1e-3 3e-3 \
+    --seq_len 2048 --epochs 40 --n_train 32768 --out runs/genomics \
+    2>&1 | tee logs/genomics_repeat.log
 fi
 
 echo "=== done: results under runs/, logs under logs/ ==="

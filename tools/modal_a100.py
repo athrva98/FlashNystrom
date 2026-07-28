@@ -1439,20 +1439,26 @@ def mqar_diagnostic_a100():
 
 @app.function(gpu="A100-80GB", timeout=10800)
 def genomics_a100():
-    """Second bidirectional domain: DNA regulatory-motif classification at
-    N=4096, swapping only the attention operator. Three seeds per arm."""
+    """The synthetic needle-retrieval DIAGNOSTIC at N=4096, three seeds per arm.
+
+    Not the paper's genomics evidence. The two real-data tasks (HyenaDNA
+    species classification and Genomic Benchmarks) need reference genomes or
+    the benchmarks package on disk and run on the long-lived node via
+    run_paper_experiments.sh; this entry point exists only because the
+    synthetic task needs no download and so can sanity-check an arm here."""
     import sys, statistics
     sys.path.insert(0, "/root/FlashNystrom")
     from benchmarks.genomics import train_eval
 
     ARMS = ["sdpa", "nystrom_reference", "flash_nystrom", "flash_nystrom_tc"]
     SEEDS = [0, 1, 2]
-    print("=== DNA regulatory-motif classification, N=4096, 3 seeds ===")
+    print("=== synthetic needle retrieval (diagnostic), N=4096, 3 seeds ===")
     results = {}
     for arm in ARMS:
         accs = []
         for s in SEEDS:
-            acc = train_eval(arm, seq_len=4096, seed=s)
+            acc = train_eval(arm, task="repeat", variant="pointer",
+                             seq_len=4096, seed=s, epochs=40)
             accs.append(acc)
             print(f"  {arm} seed {s}: {acc:.2f}%", flush=True)
         mu = statistics.mean(accs)
