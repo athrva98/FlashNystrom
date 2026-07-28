@@ -51,3 +51,10 @@ benchmarks/*.txt
 ROADMAP.md
 TODO.md
 *.local.md
+
+# experiment outputs (results live on the node, not in git)
+runs/
+runs_smoke/
+logs/
+logs_smoke/
+.coverage
