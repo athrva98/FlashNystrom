@@ -585,12 +585,22 @@ def main():
             print(f"  -> probe found no fitting batch; falling back to --batch_size {a.batch_size}")
         kw["autobatch"] = False   # resolved; train_one must not re-search per arm
 
-    results = []
+    results, failed = [], []
     for backend in a.backends:
         label, fac = factories[backend]
         print(f"\n--- {label} ---")
-        results.append(train_one(label, fac,
-                                  amp=(backend != "nystrom_reference_fp32"), **kw))
+        try:
+            results.append(train_one(label, fac,
+                                     amp=(backend != "nystrom_reference_fp32"), **kw))
+        except Exception as e:
+            # One arm must not take the rest of the sweep with it. A missing
+            # optional kernel used to kill every arm queued behind it, losing
+            # hours of completed work along with it.
+            import traceback
+            failed.append((label, f"{type(e).__name__}: {e}"))
+            print(f"  !! {label} FAILED: {type(e).__name__}: {str(e)[:200]}")
+            traceback.print_exc()
+            torch.cuda.empty_cache()
 
     print("\n" + "=" * 70)
     print("Summary:")
@@ -598,13 +608,18 @@ def main():
         print(f"  {r['label']:>14}: test_acc={r['test_acc']:.1f}%  N={r.get('N_tokens','?')}  "
               f"batch={r.get('batch','?')}  samp/s={r.get('samples_per_s',0):.0f}  "
               f"peak_GiB={r.get('peak_gib',0):.2f}")
+    for label, err in failed:
+        print(f"  {label:>14}: FAILED  {err[:120]}")
     record = dict(dataset=a.dataset, patch_size=a.patch_size, seed=a.seed,
                   num_landmarks=m, newton_iter=ni, kappa_star=a.kappa_star,
                   n_tokens=n_tokens, results=results)
     with open(a.out_json, "w") as f:
         json.dump(record, f, indent=2)
     print(f"Saved to {a.out_json}")
+    # Non-zero when an arm is missing: the record on disk is incomplete, and a
+    # caller's "ok" must not mean "some arms quietly never ran".
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

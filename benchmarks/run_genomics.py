@@ -108,6 +108,7 @@ def main(argv=None):
         chance, ceiling = 50.0, 100.0
         label = "genomic_benchmarks"
 
+    failures = []
     if not a.collect_only:
         total = len(a.arms) * len(a.seeds) * len(a.lrs) * len(subjobs)
         print(f"genomics [{label}]: {total} runs = {len(a.arms)} arms x "
@@ -125,15 +126,27 @@ def main(argv=None):
                             continue
                         print(f"[{n}/{total}] {a.task} {sub or ''} {arm} "
                               f"seed={seed} lr={lr:g}", flush=True)
-                        acc = train_eval(
-                            arm, task=a.task, seq_len=a.seq_len, dim=a.dim,
-                            heads=a.heads, depth=a.depth,
-                            num_landmarks=a.num_landmarks, epochs=a.epochs,
-                            batch_size=a.batch_size, lr=lr, seed=seed,
-                            n_train=a.n_train, n_test=a.n_test,
-                            species_dir=a.species_dir, species=a.species,
-                            chroms_per_split=a.chroms_per_split,
-                            gb_dataset=sub, variant=a.variant)
+                        try:
+                            acc = train_eval(
+                                arm, task=a.task, seq_len=a.seq_len, dim=a.dim,
+                                heads=a.heads, depth=a.depth,
+                                num_landmarks=a.num_landmarks, epochs=a.epochs,
+                                batch_size=a.batch_size, lr=lr, seed=seed,
+                                n_train=a.n_train, n_test=a.n_test,
+                                species_dir=a.species_dir, species=a.species,
+                                chroms_per_split=a.chroms_per_split,
+                                gb_dataset=sub, variant=a.variant)
+                        except Exception as e:
+                            # One arm must not take the sweep down with it: a
+                            # missing optional kernel would otherwise cost every
+                            # arm queued behind it. No JSON is written, so the
+                            # cell retries on resume rather than being skipped
+                            # as if it had succeeded.
+                            failures.append((a.task, sub, arm, seed, lr,
+                                             f"{type(e).__name__}: {e}"))
+                            print(f"  !! FAILED {arm}: {type(e).__name__}: "
+                                  f"{str(e)[:200]}", flush=True)
+                            continue
                         with open(path, "w") as f:
                             json.dump({"task": a.task, "subset": sub, "arm": arm,
                                        "seed": seed, "lr": lr, "acc": acc,
@@ -182,11 +195,22 @@ def main(argv=None):
             print(f"\n  valid: exact attention at {sdpa:.1f}% "
                   f"(gate {gate:.1f}%, chance {chance:.2f}%)")
 
+    # Exit non-zero so a caller's "ok" actually means something: a stage where
+    # every cell died must not look identical to one that succeeded.
+    rc = 1 if failures else 0
+    if failures:
+        print(f"\n  !! {len(failures)} cell(s) FAILED and were not written "
+              f"(they will retry on resume):")
+        for t, sub, arm, seed, lr, err in failures:
+            print(f"    {t}{'/' + sub if sub else ''} {arm} seed={seed} "
+                  f"lr={lr:g}: {err[:160]}")
+
     with open(os.path.join(a.out, f"{a.task}_summary.json"), "w") as f:
         json.dump({"task": a.task, "seq_len": a.seq_len, "chance": chance,
                    "ceiling": ceiling, "gate": gate, "lrs": a.lrs,
                    "seeds": a.seeds, "table": summary}, f, indent=2)
+    return rc
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

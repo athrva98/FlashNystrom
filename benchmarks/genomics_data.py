@@ -150,7 +150,7 @@ class SpeciesDataset(torch.utils.data.Dataset):
                  chroms_per_split: int = 4, seed: int = 0,
                  rc_aug: bool = False):
         try:
-            from pyfaidx import Fasta
+            import pyfaidx                                   # noqa: F401
         except ImportError as e:                              # pragma: no cover
             raise ImportError(
                 "the species task needs pyfaidx: pip install pyfaidx") from e
@@ -162,13 +162,18 @@ class SpeciesDataset(torch.utils.data.Dataset):
         self.rc_aug = rc_aug
         self.seed = seed
 
-        self.fastas: dict[str, list] = {}
+        # Store PATHS, not open handles. A pyfaidx Fasta holds a BufferedReader,
+        # which cannot be pickled to a spawned DataLoader worker (Windows) and
+        # which forked workers would silently SHARE, interleaving their seeks on
+        # one descriptor and returning corrupted windows. Handles are opened
+        # lazily in whichever process first indexes the dataset.
+        self.paths: dict[str, list] = {}
         for spec in self.species:
             if spec not in SPECIES_CHROMOSOME_SPLITS:
                 raise ValueError(f"unknown species {spec!r}; known: "
                                  f"{sorted(SPECIES_CHROMOSOME_SPLITS)}")
             chroms = SPECIES_CHROMOSOME_SPLITS[spec][split][:chroms_per_split]
-            handles = []
+            paths = []
             for c in chroms:
                 path = os.path.join(species_dir, spec, f"{c}.fa")
                 if not os.path.exists(path):
@@ -176,11 +181,31 @@ class SpeciesDataset(torch.utils.data.Dataset):
                         f"missing {path}. Fetch it with:\n"
                         f"  python benchmarks/download_genomes.py "
                         f"--species {spec} --out {species_dir}")
-                fa = Fasta(path)
-                handles.append(fa[list(fa.keys())[0]])
-            if not handles:
+                paths.append(path)
+            if not paths:
                 raise ValueError(f"no chromosomes for {spec}/{split}")
-            self.fastas[spec] = handles
+            self.paths[spec] = paths
+        self._fastas = None          # per-process cache, built on first use
+
+    @property
+    def fastas(self):
+        """Open handles for THIS process, built on first access."""
+        if self._fastas is None:
+            from pyfaidx import Fasta
+            self._fastas = {}
+            for spec, paths in self.paths.items():
+                handles = []
+                for p in paths:
+                    fa = Fasta(p)
+                    handles.append(fa[list(fa.keys())[0]])
+                self._fastas[spec] = handles
+        return self._fastas
+
+    def __getstate__(self):
+        # never ship open file handles to a worker
+        st = self.__dict__.copy()
+        st["_fastas"] = None
+        return st
 
     def __len__(self):
         return self.total_size

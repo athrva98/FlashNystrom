@@ -101,9 +101,12 @@ def heads_for(dim: int) -> int:
     return max(1, dim // 64)
 
 
-def build_jobs(methods, dims, lrs, seeds, out_dir):
+def build_jobs(methods, dims, lrs, seeds, out_dir, protocol=None):
     """One run_many job per (method, dim, lr, seed). out_json doubles as the
-    resume key; log_path keeps each run's full epoch log next to its record."""
+    resume key; log_path keeps each run's full epoch log next to its record.
+
+    ``protocol`` defaults to the pinned PROTOCOL; only --smoke overrides it."""
+    protocol = PROTOCOL if protocol is None else protocol
     jobs = []
     for m in methods:
         for d in dims:
@@ -114,7 +117,7 @@ def build_jobs(methods, dims, lrs, seeds, out_dir):
                         backend=m, seed=s, dim=d, heads=heads_for(d),
                         lr=f"{lr:.6e}",
                         out_json=stem + ".json", log_path=stem + ".log",
-                        **PROTOCOL,
+                        **protocol,
                     ))
     return jobs
 
@@ -205,10 +208,23 @@ def main(argv=None):
                     help="skip running; aggregate whatever is on disk")
     ap.add_argument("--dry_run", action="store_true",
                     help="print the run list and exit without training")
+    ap.add_argument("--smoke", action="store_true",
+                    help="OVERRIDE the pinned protocol with near-zero budgets to "
+                         "test the plumbing. Results are NOT protocol-valid and "
+                         "must never be reported.")
     args = ap.parse_args(argv)
 
     os.makedirs(args.out, exist_ok=True)
-    jobs = build_jobs(args.methods, args.dims, args.lrs, args.seeds, args.out)
+    protocol = dict(PROTOCOL)
+    if args.smoke:
+        # The protocol is pinned so it cannot drift silently; this is the one
+        # explicit, loudly-labelled way past it. 64 epochs over 100k examples is
+        # ~4 min per arm, which defeats the purpose of a smoke test.
+        protocol.update(epochs=1, num_train=2048, num_test=512, batch_size=64)
+        print("!! SMOKE: protocol OVERRIDDEN (epochs=1, num_train=2048). "
+              "These numbers are plumbing checks, NOT results.")
+    jobs = build_jobs(args.methods, args.dims, args.lrs, args.seeds, args.out,
+                      protocol=protocol)
     print(f"certified MQAR sweep: {len(jobs)} runs = {len(args.methods)} methods "
           f"x {len(args.dims)} dims x {len(args.lrs)} LRs x {len(args.seeds)} seed(s)")
     print("protocol: " + " ".join(f"{k}={v}" for k, v in PROTOCOL.items()))

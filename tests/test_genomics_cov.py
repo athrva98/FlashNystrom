@@ -324,3 +324,88 @@ def test_pointer_model_can_overfit_one_batch():
         first = first if first is not None else loss.item()
     assert loss.item() < first * 0.5
     assert (m(x).argmax(-1) == pos).float().mean().item() >= 0.75
+
+
+# --------------------------------------------------------------------------- #
+# SpeciesDataset must survive multi-worker DataLoaders.
+#
+# Regression: __init__ used to open pyfaidx handles eagerly. That makes the
+# dataset unpicklable (spawn/Windows raises "cannot pickle _io.BufferedReader")
+# and, worse, on fork the workers SHARE one descriptor and interleave their
+# seeks, silently returning corrupted windows. Handles are now opened lazily
+# per process. These tests fail loudly if that regresses.
+# --------------------------------------------------------------------------- #
+
+def _tiny_genome(root, species=("human", "mouse"), chroms=("2", "4", "5", "7"),
+                 n=4000):
+    """Minimal FASTA tree in the layout SpeciesDataset expects."""
+    import os
+    for si, spec in enumerate(species):
+        d = os.path.join(str(root), spec)
+        os.makedirs(d, exist_ok=True)
+        for ci, c in enumerate(chroms):
+            g = torch.Generator().manual_seed(si * 10 + ci)
+            seq = "".join("ACGT"[i] for i in
+                          torch.randint(0, 4, (n,), generator=g).tolist())
+            with open(os.path.join(d, f"{c}.fa"), "w") as f:
+                f.write(f">{c} synthetic\n")
+                for i in range(0, n, 60):
+                    f.write(seq[i:i + 60] + "\n")
+    return str(root)
+
+
+def test_species_dataset_is_picklable_after_use(tmp_path):
+    import pickle
+    pytest.importorskip("pyfaidx")
+    from benchmarks.genomics_data import SpeciesDataset
+    root = _tiny_genome(tmp_path)
+    d = SpeciesDataset(root, "train", 128, 16, species=["human", "mouse"],
+                       chroms_per_split=2, seed=0)
+    pickle.dumps(d)          # before any handle is opened
+    _ = d[0]                 # opens handles in this process
+    pickle.dumps(d)          # must STILL pickle: this is the regression
+
+
+def test_species_dataset_windows_do_not_depend_on_worker_count(tmp_path):
+    """Shared file descriptors would desync these two loaders."""
+    pytest.importorskip("pyfaidx")
+    from benchmarks.genomics_data import SpeciesDataset
+    root = _tiny_genome(tmp_path)
+    d = SpeciesDataset(root, "train", 128, 32, species=["human", "mouse"],
+                       chroms_per_split=2, seed=0)
+    a = torch.utils.data.DataLoader(d, batch_size=32, num_workers=0, shuffle=False)
+    xa, ya = next(iter(a))
+    b = torch.utils.data.DataLoader(d, batch_size=32, num_workers=0, shuffle=False)
+    xb, yb = next(iter(b))
+    assert torch.equal(xa, xb) and torch.equal(ya, yb)
+    assert int(xa.min()) >= 0 and int(xa.max()) <= 4
+
+
+def test_species_getstate_drops_open_handles(tmp_path):
+    pytest.importorskip("pyfaidx")
+    from benchmarks.genomics_data import SpeciesDataset
+    root = _tiny_genome(tmp_path)
+    d = SpeciesDataset(root, "train", 128, 16, species=["human"],
+                       chroms_per_split=2, seed=0)
+    _ = d[0]
+    assert d.__getstate__()["_fastas"] is None   # handles never travel
+    assert d._fastas is not None                 # but the live object keeps its own
+
+
+def test_driver_exits_nonzero_when_every_cell_fails(tmp_path, monkeypatch):
+    """Regression: the driver swallowed per-cell failures and still exited 0,
+    so a stage where every arm died looked identical to one that worked."""
+    import benchmarks.run_genomics as rg
+    monkeypatch.setattr(rg, "train_eval",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    rc = rg.main(["--task", "repeat", "--arms", "sdpa", "--seeds", "0",
+                  "--lrs", "1e-3", "--out", str(tmp_path)])
+    assert rc == 1
+
+
+def test_driver_exits_zero_when_cells_succeed(tmp_path, monkeypatch):
+    import benchmarks.run_genomics as rg
+    monkeypatch.setattr(rg, "train_eval", lambda *a, **k: 88.0)
+    rc = rg.main(["--task", "repeat", "--arms", "sdpa", "--seeds", "0",
+                  "--lrs", "1e-3", "--out", str(tmp_path)])
+    assert rc == 0

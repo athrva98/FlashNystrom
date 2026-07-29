@@ -90,7 +90,7 @@ def preflight(verbose=True):
 # the plan
 # --------------------------------------------------------------------------- #
 
-def build_jobs(stages, arms, seeds, out, smoke):
+def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes"):
     """Every job is (stage, name, argv). Smoke shrinks budgets, never coverage:
     the same stages and the same arms run, just briefly."""
     jobs = []
@@ -122,8 +122,11 @@ def build_jobs(stages, arms, seeds, out, smoke):
                 "--methods", *arms, "--out", f"{out}/mqar",
                 "--seeds", *[str(x) for x in seeds]]
         if s:
-            # one dim, one LR, one seed: still every arm, still the real code
-            argv += ["--dims", "64", "--lrs", "1e-3", "--max_parallel", "1"]
+            # one dim, one LR, one seed: still every arm, still the real code.
+            # --smoke also overrides the pinned 64-epoch/100k-example protocol,
+            # which would otherwise cost ~4 min per arm.
+            argv += ["--dims", "64", "--lrs", "1e-3", "--max_parallel", "1",
+                     "--smoke"]
         else:
             argv += ["--max_parallel", "4"]
         jobs.append(("mqar", "sweep", argv))
@@ -142,7 +145,7 @@ def build_jobs(stages, arms, seeds, out, smoke):
                 "--n_train", "64" if s else "32768",
                 "--n_test", "32" if s else "4096",
                 "--chroms_per_split", "2" if s else "4",
-                "--species_dir", "data/genomes"]))
+                "--species_dir", species_dir]))
 
         jobs.append(("genomics", "genomic_benchmarks", gcommon + [
             "--task", "genomic_benchmarks", "--lrs", *lrs,
@@ -161,6 +164,30 @@ def build_jobs(stages, arms, seeds, out, smoke):
 
 
 # --------------------------------------------------------------------------- #
+
+def failure_reason(log_path):
+    """One line explaining a failure, so the summary distinguishes 'one optional
+    kernel is missing' from 'the whole stage died'."""
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:                                          # pragma: no cover
+        return ""
+    import re
+    cells = re.search(r"!! (\d+) cell\(s\) FAILED", text)
+    mods = sorted(set(re.findall(r"No module named '([\w.]+)'", text)))
+    bits = []
+    if cells:
+        bits.append(f"{cells.group(1)} cell(s)")
+    if mods:
+        bits.append("missing " + ", ".join(mods))
+    if bits:
+        return "; ".join(bits)
+    for line in reversed(text.strip().splitlines()):
+        if line.strip():
+            return line.strip()[:70]
+    return ""
+
 
 def run(jobs, log_dir, keep_going=True):
     os.makedirs(log_dir, exist_ok=True)
@@ -191,7 +218,8 @@ def run(jobs, log_dir, keep_going=True):
 
     print(f"\n{'=' * 70}\nSUMMARY  ({time.time() - t_all:.0f}s total)")
     for stage, name, ok, dt, log, _ in results:
-        print(f"  {'ok  ' if ok else 'FAIL'}  {stage:9s} {name:22s} {dt:7.0f}s")
+        why = "" if ok else "  <- " + failure_reason(log)
+        print(f"  {'ok  ' if ok else 'FAIL'}  {stage:9s} {name:22s} {dt:7.0f}s{why}")
     bad = [r for r in results if not r[2]]
     if bad:
         print(f"\n{len(bad)} FAILED. Reproduce individually:")
@@ -213,6 +241,8 @@ def main(argv=None):
                     help="default: runs/ (or runs_smoke/ under --smoke)")
     ap.add_argument("--list", action="store_true",
                     help="print the plan and exit")
+    ap.add_argument("--species_dir", default="data/genomes",
+                    help="reference genomes for the species task")
     ap.add_argument("--stop_on_fail", action="store_true")
     ap.add_argument("--fresh", action="store_true",
                     help="delete the output dir first (smoke only)")
@@ -226,7 +256,7 @@ def main(argv=None):
         shutil.rmtree(out)          # smoke results are disposable by design
     os.makedirs(out, exist_ok=True)
 
-    jobs = build_jobs(a.stages, a.arms, seeds, out, a.smoke)
+    jobs = build_jobs(a.stages, a.arms, seeds, out, a.smoke, a.species_dir)
     mode = "SMOKE (tiny budgets, results are NOT results)" if a.smoke else "FULL"
     print(f"=== {mode} ===")
     print(f"stages {a.stages} | {len(a.arms)} arms | seeds {seeds} | out {out}/")
@@ -246,7 +276,7 @@ def main(argv=None):
             print("\n!! flash_bla missing: the linear_attention arm would run "
                   "UNFUSED, which is not a fair baseline. Install it before "
                   "any run whose numbers go in the paper.")
-    if "genomics" in a.stages and not os.path.isdir("data/genomes"):
+    if "genomics" in a.stages and not os.path.isdir(a.species_dir):
         print("\n!! data/genomes not found; the species sub-stage will fail. "
               "Fetch it first:\n     python benchmarks/download_genomes.py "
               "--out data/genomes")
