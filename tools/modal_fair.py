@@ -38,6 +38,7 @@ app = modal.App("fn-fair-baselines", image=image)
 @app.function(gpu="A100-80GB", timeout=5400)
 def probe_and_bench():
     import sys, torch
+    import torch.nn.functional as F
     sys.path.insert(0, REMOTE)
 
     # 1. What does flash_bla actually expose?
@@ -112,6 +113,16 @@ def probe_and_bench():
         fmt = lambda t: f"{t:11.2f}" if isinstance(t, float) else f"{str(t)[:11]:>11}"
         cells = [fmt(t_fn), fmt(t_t)]
         for label, f_ in fused_ops.items():
-            cells.append(fmt(timed(lambda a,b,c: f_(a,b,c), q, k, v)))
+            # Time the COMPLETE operator: feature map, fused kernel, normalizer,
+            # division. Timing the bare kernel call omits two elu passes, the z
+            # reduction and the division, which understates linear attention's
+            # cost against arms that ARE timed end to end.
+            def full(a, b, c, _f=f_):
+                af, bf = F.elu(a) + 1.0, F.elu(b) + 1.0
+                num = _f(af, bf, c, 1.0)
+                z = bf.sum(dim=-2, dtype=torch.float32)
+                den = (af.float() @ z.unsqueeze(-1)) + 1e-6
+                return (num / den).to(c.dtype)
+            cells.append(fmt(timed(full, q, k, v)))
         print(f"{N:>9} | " + " | ".join(cells))
         del q,k,v; torch.cuda.empty_cache()

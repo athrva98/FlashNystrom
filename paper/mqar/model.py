@@ -64,41 +64,6 @@ class SdpaAttention(nn.Module):
         return self.out_proj(o)
 
 
-class LinearAttention(nn.Module):
-    """Bidirectional linear attention (Katharopoulos et al., 2020), feature map
-    phi(x) = elu(x) + 1.
-
-    Computes O = phi(Q) (phi(K)^T V) / (phi(Q) sum_j phi(K_j)) in O(N d^2), the
-    canonical sub-quadratic attention approximation. Same projection structure as
-    the other backends, so swapping it in is a controlled operator change. This is
-    the linear-attention point in Zoology's MQAR comparison (Arora et al., 2023)."""
-
-    def __init__(self, dim: int, heads: int):
-        super().__init__()
-        if dim % heads != 0:
-            raise ValueError(f"dim {dim} not divisible by heads {heads}")
-        self.dim, self.heads, self.head_dim = dim, heads, dim // heads
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, N, _ = x.shape
-        H, D = self.heads, self.head_dim
-        q = self.q_proj(x).view(B, N, H, D).transpose(1, 2)
-        k = self.k_proj(x).view(B, N, H, D).transpose(1, 2)
-        v = self.v_proj(x).view(B, N, H, D).transpose(1, 2)
-        qf = F.elu(q) + 1.0
-        kf = F.elu(k) + 1.0
-        kv = kf.transpose(-2, -1) @ v            # (B, H, D, D)
-        z = kf.sum(dim=2)                        # (B, H, D)
-        num = qf @ kv                            # (B, H, N, D)
-        den = (qf @ z.unsqueeze(-1)) + 1e-6      # (B, H, N, 1)
-        o = (num / den).transpose(1, 2).contiguous().view(B, N, self.dim)
-        return self.out_proj(o)
-
-
 class NystromReferenceAttention(nn.Module):
     """Pure-PyTorch Nystrom attention: the exact same Nystrom math as the
     FlashNystrom kernels (segment-mean landmarks, three softmaxes, FP32
@@ -220,26 +185,33 @@ def build_attention(
         # FlashNystromAttention owns its own q/k/v/out projections, matching
         # SdpaAttention's structure.
         return FlashNystromAttention(dim, heads=heads, config=cfg)
-    if backend in ("linformer", "sliding_window"):
+    if backend in ("linear_attention", "linformer", "sliding_window"):
         # Bidirectional-native baselines, defined once in benchmarks/baseline_attn.py
         # and shared by the vision, MQAR and genomics harnesses so every
-        # experiment compares the same objects. Both route to optimized
-        # implementations (FA-2's windowed kernel; a dense-projection Linformer).
+        # experiment compares the same objects. All route to optimized
+        # implementations (flash_bla's fused Triton linear attention; FA-2's
+        # windowed kernel; a dense-projection Linformer).
+        #
+        # linear_attention used to have a SECOND copy in this file. The two
+        # drifted: the copy here never called the fused kernel, so MQAR and
+        # genomics were not running the fair baseline, and it kept the fp16
+        # accumulation that silently zeroes the output past N~2304. One
+        # definition, one set of fixes.
+        # Imported by PACKAGE path, not by injecting benchmarks/ onto sys.path.
+        # The bare `import baseline_attn` created a SECOND module object with
+        # its own copies of these classes, so isinstance checks against
+        # benchmarks.baseline_attn failed and the two could drift independently.
         import os, sys
-        _bench = os.path.join(os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.abspath(__file__)))), "benchmarks")
-        if _bench not in sys.path:
-            sys.path.insert(0, _bench)
-        from baseline_attn import build_baseline
+        _root = os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        from benchmarks.baseline_attn import build_baseline
         if causal:
             raise ValueError(f"{backend} is bidirectional here; causal not implemented")
         if seq_len is None:
             raise ValueError(f"{backend} requires seq_len")
         return build_baseline(backend, dim, heads, seq_len)
-    if backend == "linear_attention":
-        if causal:
-            raise ValueError("linear attention is bidirectional here; causal not implemented")
-        return LinearAttention(dim, heads)
     if backend == "hyena":
         from .baselines import HyenaMixer
         if seq_len is None:

@@ -38,14 +38,53 @@ def linear_attention_op(q, k, v, eps: float = 1e-6):
 
     Associative order: (phi(K)^T V) is (D, D), so cost is O(N D^2) and the
     N x N matrix is never formed. Non-causal, matching how every operator in
-    this comparison is timed."""
+    this comparison is timed.
+
+    The normalizer accumulates in fp32. It is a sum over N terms, so in fp16 it
+    passes 65504 around N=2304 and the operator returns zeros and then NaN --
+    at lengths well inside this paper's range. sum(dtype=) uses an fp32
+    accumulator without materializing an fp32 copy of kf, so this is the same
+    memory traffic as the fp16 reduction and the timing is unchanged."""
+    from benchmarks.baseline_attn import _fp16_safe_scale
     qf = F.elu(q) + 1.0
     kf = F.elu(k) + 1.0
-    kv = kf.transpose(-2, -1) @ v            # (B, H, D, D)
-    z = kf.sum(dim=-2)                       # (B, H, D)
-    num = qf @ kv                            # (B, H, N, D)
-    den = (qf @ z.unsqueeze(-1)) + eps       # (B, H, N, 1)
-    return num / den
+    # BOTH accumulators grow like N. The numerator gets a common scale s on v
+    # (undone on the denominator, so out = num/den is unchanged) which keeps it
+    # in fp16 range without an fp32 O(ND^2) matmul that would change the timing.
+    s = _fp16_safe_scale(q.shape[-2], v.dtype)
+    kv = kf.transpose(-2, -1) @ (v * s if s != 1.0 else v)   # (B, H, D, D)
+    z = kf.sum(dim=-2, dtype=torch.float32)                  # (B, H, D)
+    num = qf @ kv                                            # (B, H, N, D)
+    den = (qf.float() @ z.unsqueeze(-1)) * s + eps
+    return (num / den).to(v.dtype)
+
+
+def linear_attention_fused_op(q, k, v, eps: float = 1e-6):
+    """Linear attention through flash_bla's fused Triton kernel.
+
+    The COMPLETE operator, not just the kernel call. flash_bla's ``simple_la``
+    implements the unnormalized core, so the feature map and the normalization
+    belong to the caller and must be timed with it: an operator timed without
+    them is not the operator, and comparing it against arms that ARE timed end
+    to end understates its cost. On top of the kernel this adds two elementwise
+    passes for phi, one reduction for z, and one division.
+
+    Raises ImportError when flash_bla is absent rather than silently falling
+    back, so a latency table can never mix fused and unfused rows.
+    """
+    try:
+        from flash_bla.ops.simple_la.fused import simple_la
+    except ImportError as e:                                  # pragma: no cover
+        raise ImportError(
+            "linear_attention_fused_op needs flash_bla (the fused Triton "
+            "kernel): pip install -e git+https://github.com/fla-org/flash-"
+            "bidirectional-linear-attention.git#egg=flash_bla") from e
+    qf = F.elu(q) + 1.0
+    kf = F.elu(k) + 1.0
+    num = simple_la(qf, kf, v, 1.0)
+    z = kf.sum(dim=-2, dtype=torch.float32)
+    den = (qf.float() @ z.unsqueeze(-1)) + eps
+    return (num / den).to(v.dtype)
 
 
 def linformer_op(q, k, v, E, F_):

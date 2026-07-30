@@ -52,6 +52,23 @@ def _get_fused_la():
     return _FUSED_LA or None
 
 
+def _fp16_safe_scale(n: int, dtype) -> float:
+    """Common scale keeping a length-N linear-attention numerator inside fp16.
+
+    Only fp16 needs it: bf16 and fp32 carry ~3.4e38 of range and never overflow
+    here. Returns a power of two, so scaling is an exact exponent shift and
+    costs no precision.
+
+    The bound is n*s <= 512. In the fully coherent worst case the numerator
+    reaches about n*s*D, so at D=64 that is ~32768, half of fp16's 65504. The
+    scale stays above 4.8e-4 even at n=10^6, an order of magnitude clear of
+    fp16's smallest normal (6.1e-5), so the scaled values cannot underflow.
+    """
+    if dtype != torch.float16 or n <= 512:
+        return 1.0
+    return 2.0 ** -math.ceil(math.log2(n / 512.0))
+
+
 class _QKVOut(nn.Module):
     """Shared projection shell so every baseline carries identical wrapper cost."""
 
@@ -86,22 +103,54 @@ class LinearAttention(_QKVOut):
     def forward(self, x):
         q, k, v = self._qkv(x)
         qf, kf = F.elu(q) + 1.0, F.elu(k) + 1.0
+        N, dt = qf.shape[-2], v.dtype
+
+        # BOTH linear-attention accumulators are sums over N terms, so both grow
+        # like N and leave fp16's range (max 65504) well before the contexts this
+        # paper trains at. The normalizer is the first to go: phi(q).z reaches
+        # ~2e6 at N=2304, and overflowing it gives num/inf = 0, so the arm emits
+        # all-zero attention and a loss of exactly 0 -- silently dead rather than
+        # crashed. The numerator follows at ~N=65536, which is the NaN.
+        #
+        # The reduction is therefore done in fp32. It is O(ND) against the
+        # O(ND^2) matmul, so the fused kernel still does all the real work and
+        # the arm stays a fair baseline.
+        # autocast would re-cast fp32 matmul operands straight back to fp16, so
+        # the fp32 reduction only holds with autocast explicitly disabled.
+        with torch.amp.autocast(x.device.type, enabled=False):
+            # sum(dtype=fp32) accumulates in fp32 without materializing an fp32
+            # copy of kf first, so this costs the same memory traffic as the
+            # fp16 reduction it replaces.
+            zf = kf.sum(dim=-2, dtype=torch.float32)         # (B,H,D)
+            den = (qf.float() @ zf.unsqueeze(-1)) + 1e-6     # (B,H,N,1)
+
         fused = _get_fused_la()
         if fused is not None:
-            global _FUSED_LA_WARNED
-            num = fused(qf, kf, v, 1.0)                     # (B,H,N,D)
-            den = (qf @ kf.sum(dim=-2).unsqueeze(-1)) + 1e-6
-            return self._merge(num / den)
+            # Scale v going in and undo it in fp32, so the numerator the kernel
+            # accumulates also stays in range. Exact: out = num/den is invariant
+            # under a common scale, and s is bounded well above fp16's smallest
+            # normal so v*s cannot underflow.
+            s = _fp16_safe_scale(N, dt)
+            num = fused(qf, kf, v * s if s != 1.0 else v, 1.0)
+            with torch.amp.autocast(x.device.type, enabled=False):
+                num = num.float()
+                if s != 1.0:
+                    num = num / s
+                out = (num / den).to(dt)
+            return self._merge(out)
+
+        global _FUSED_LA_WARNED
         if not _FUSED_LA_WARNED:
             warnings.warn("flash_bla not installed: linear attention is running "
                           "the UNFUSED torch path, which is ~2x slower than the "
                           "available Triton kernel and is not a fair baseline.")
             _FUSED_LA_WARNED = True
-        kv = kf.transpose(-2, -1) @ v
-        z = kf.sum(dim=-2)
-        num = qf @ kv
-        den = (qf @ z.unsqueeze(-1)) + 1e-6
-        return self._merge(num / den)
+        # No kernel to protect here, so accumulate the state in fp32 directly.
+        with torch.amp.autocast(x.device.type, enabled=False):
+            kv = kf.float().transpose(-2, -1) @ v.float()
+            num = qf.float() @ kv
+            out = (num / den).to(dt)
+        return self._merge(out)
 
 
 class LinformerAttention(_QKVOut):
