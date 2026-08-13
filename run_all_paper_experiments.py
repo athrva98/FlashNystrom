@@ -90,11 +90,46 @@ def preflight(verbose=True):
 # the plan
 # --------------------------------------------------------------------------- #
 
-def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes"):
+# Estimated A100-80GB hours per job under --preset paper12, used only to order
+# jobs and to warn before a stage that cannot finish in the remaining budget.
+# Derived from the measured operator latencies; good to about a factor of two.
+EST_HOURS = {
+    "cifar10_p4_i32": 0.02, "stl10_p2_i96": 0.22, "stl10_p1_i96": 0.76,
+    "stl10_p1_i180": 2.78, "sweep": 5.41, "species_N1024": 0.57,
+    "species_N32768": 1.07, "genomic_benchmarks": 0.76, "repeat_diagnostic": 0.21,
+}
+
+# Scientific value per job, highest first. Ordering matters more than the
+# estimate: if the budget runs out, what is missing should be the least
+# load-bearing thing, not whatever happened to be last in the list.
+PRIORITY = [
+    "genomic_benchmarks",   # real data, cheap, and the only external anchor
+    "cifar10_p4_i32",       # cheapest accuracy-neutrality check
+    "stl10_p2_i96",         # first tier where sub-quadratic matters
+    "species_N1024",        # genomics LR sweep; feeds the 32768 tier
+    "stl10_p1_i96",
+    "sweep",                # MQAR: the adversarial probe, the headline figure
+    "species_N32768",       # long-context genomics
+    "stl10_p1_i180",        # long-context vision
+    "repeat_diagnostic",    # a diagnostic, not evidence
+]
+
+
+def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes",
+               preset="full"):
     """Every job is (stage, name, argv). Smoke shrinks budgets, never coverage:
-    the same stages and the same arms run, just briefly."""
+    the same stages and the same arms run, just briefly.
+
+    preset="paper12" is the reduced grid costed for a ~12h A100 budget: the
+    learning rate is swept once per task at its CHEAPEST length and the winner
+    carried up, 3 seeds are kept wherever a claim needs error bars and dropped
+    to 1 only at the most expensive tier of each stage, and the genomics species
+    budget is cut from 655k windows to 82k. Every arm still appears at every
+    context tier, and exact attention is still present as the reference.
+    """
     jobs = []
     s = smoke
+    p12 = preset == "paper12"
 
     if "vision" in stages:
         # dataset, patch, img, epochs, batch, train_frac
@@ -102,11 +137,21 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes"):
                  ("stl10", 2, 96, 50, 128, 1.0),
                  ("stl10", 1, 96, 50, 48, 1.0),
                  ("stl10", 1, 180, 50, 16, 0.5)]
+        if p12:
+            # 30 epochs, not 50: STL-10 has 5000 labelled images and a small ViT
+            # has converged well before then. The largest tier runs 1 seed; its
+            # variance is taken from the three cheaper tiers and reported as such.
+            tiers = [("cifar10", 4, 32, 20, 128, 1.0),
+                     ("stl10", 2, 96, 30, 128, 1.0),
+                     ("stl10", 1, 96, 30, 48, 1.0),
+                     ("stl10", 1, 180, 30, 16, 0.5)]
         if s:
             tiers = [("cifar10", 4, 32, 1, 16, 0.02),
                      ("stl10", 2, 96, 1, 8, 0.02)]
         for seed in seeds:
             for ds, ps, img, ep, bs, frac in tiers:
+                if p12 and img == 180 and seed != seeds[0]:
+                    continue          # largest tier: one seed only
                 tag = f"{ds}_p{ps}_i{img}_seed{seed}"
                 jobs.append(("vision", tag, [
                     PY, "-u", "benchmarks/train_three_way.py",
@@ -127,6 +172,14 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes"):
             # which would otherwise cost ~4 min per arm.
             argv += ["--dims", "64", "--lrs", "1e-3", "--max_parallel", "1",
                      "--smoke"]
+        elif p12:
+            # 3 LR points still bracket Zoology's logspace(-4,-2,4) optimum, and
+            # the driver already flags any winner sitting on a grid boundary.
+            # 1 seed is paper_sweep's own default.
+            argv = [a for a in argv if a not in ("--seeds",)]
+            argv = argv[:argv.index("--out")] + ["--out", f"{out}/mqar"]
+            argv += ["--seeds", "0", "--lrs", "1e-4", "1e-3", "1e-2",
+                     "--max_parallel", "4"]
         else:
             argv += ["--max_parallel", "4"]
         jobs.append(("mqar", "sweep", argv))
@@ -138,14 +191,22 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes"):
         lrs = ["1e-3"] if s else ["1e-4", "3e-4", "1e-3", "3e-3"]
 
         for N, bs in ([(256, 4)] if s else [(1024, 32), (32768, 4)]):
+            # The LR is swept at N=1024 (cheap) and the winner carried to
+            # N=32768, where a full grid costs 70h on its own. --lr_from points
+            # the long-context run at the short one's summary.
+            jlrs = lrs
+            extra = []
+            if p12 and N == 32768:
+                jlrs = ["1e-3"]
+                extra = ["--lr_from", f"{out}/genomics"]
             jobs.append(("genomics", f"species_N{N}", gcommon + [
                 "--task", "species", "--seq_len", str(N),
-                "--batch_size", str(bs), "--lrs", *lrs,
-                "--epochs", "1" if s else "20",
-                "--n_train", "64" if s else "32768",
-                "--n_test", "32" if s else "4096",
+                "--batch_size", str(bs), "--lrs", *jlrs,
+                "--epochs", "1" if s else ("10" if (p12 and N == 32768) else "20"),
+                "--n_train", "64" if s else ("8192" if (p12 and N == 32768) else "32768"),
+                "--n_test", "32" if s else ("2048" if (p12 and N == 32768) else "4096"),
                 "--chroms_per_split", "2" if s else "4",
-                "--species_dir", species_dir]))
+                "--species_dir", species_dir] + extra))
 
         jobs.append(("genomics", "genomic_benchmarks", gcommon + [
             "--task", "genomic_benchmarks", "--lrs", *lrs,
@@ -153,7 +214,8 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes"):
             + (["--gb_datasets", "dummy_mouse_enhancers_ensembl"] if s else [])))
 
         jobs.append(("genomics", "repeat_diagnostic", gcommon + [
-            "--task", "repeat", "--variant", "pointer", "--lrs", *lrs,
+            "--task", "repeat", "--variant", "pointer",
+            "--lrs", *(["1e-3"] if p12 else lrs),
             "--seq_len", "256" if s else "2048",
             "--epochs", "1" if s else "40",
             "--batch_size", "8" if s else "32",
@@ -189,10 +251,27 @@ def failure_reason(log_path):
     return ""
 
 
-def run(jobs, log_dir, keep_going=True):
+def order_by_value(jobs):
+    """Highest scientific value first, so a budget overrun drops the least
+    load-bearing experiment rather than whichever happened to be last."""
+    rank = {n: i for i, n in enumerate(PRIORITY)}
+    return sorted(jobs, key=lambda j: rank.get(j[1].rsplit("_seed", 1)[0], 99))
+
+
+def run(jobs, log_dir, keep_going=True, budget_h=None):
     os.makedirs(log_dir, exist_ok=True)
     results, t_all = [], time.time()
+    skipped = []
     for i, (stage, name, argv) in enumerate(jobs, 1):
+        if budget_h is not None:
+            spent = (time.time() - t_all) / 3600
+            est = EST_HOURS.get(name.rsplit("_seed", 1)[0], 0.0)
+            if spent + est > budget_h and spent > 0:
+                print(f"\n[{i}/{len(jobs)}] SKIP {stage}/{name}: needs ~{est:.1f}h,"
+                      f" only {budget_h - spent:.1f}h of the {budget_h:.0f}h"
+                      f" budget left. Resume with the same command.", flush=True)
+                skipped.append((stage, name, est))
+                continue
         log = os.path.join(log_dir, f"{stage}_{name}.log")
         print(f"\n[{i}/{len(jobs)}] {stage}/{name}\n  {' '.join(argv)}",
               flush=True)
@@ -220,6 +299,12 @@ def run(jobs, log_dir, keep_going=True):
     for stage, name, ok, dt, log, _ in results:
         why = "" if ok else "  <- " + failure_reason(log)
         print(f"  {'ok  ' if ok else 'FAIL'}  {stage:9s} {name:22s} {dt:7.0f}s{why}")
+    if skipped:
+        tot_sk = sum(e for _, _, e in skipped)
+        print(f"\n  {len(skipped)} job(s) SKIPPED for budget (~{tot_sk:.1f}h)."
+              f" Everything is resumable: re-run the same command to continue.")
+        for stage, name, est in skipped:
+            print(f"    {stage}/{name}  (~{est:.1f}h)")
     bad = [r for r in results if not r[2]]
     if bad:
         print(f"\n{len(bad)} FAILED. Reproduce individually:")
@@ -243,6 +328,11 @@ def main(argv=None):
                     help="print the plan and exit")
     ap.add_argument("--species_dir", default="data/genomes",
                     help="reference genomes for the species task")
+    ap.add_argument("--preset", default="full", choices=["full", "paper12"],
+                    help="paper12: reduced grid costed for a ~12h A100 budget")
+    ap.add_argument("--budget_hours", type=float, default=None,
+                    help="stop launching jobs once the budget is spent; jobs run "
+                         "highest-value-first and everything is resumable")
     ap.add_argument("--stop_on_fail", action="store_true")
     ap.add_argument("--fresh", action="store_true",
                     help="delete the output dir first (smoke only)")
@@ -256,8 +346,15 @@ def main(argv=None):
         shutil.rmtree(out)          # smoke results are disposable by design
     os.makedirs(out, exist_ok=True)
 
-    jobs = build_jobs(a.stages, a.arms, seeds, out, a.smoke, a.species_dir)
-    mode = "SMOKE (tiny budgets, results are NOT results)" if a.smoke else "FULL"
+    jobs = build_jobs(a.stages, a.arms, seeds, out, a.smoke, a.species_dir,
+                      a.preset)
+    if a.budget_hours:
+        jobs = order_by_value(jobs)
+        est = sum(EST_HOURS.get(n.rsplit("_seed", 1)[0], 0.0) for _, n, _ in jobs)
+        print(f"budget {a.budget_hours:.0f}h | estimated {est:.1f}h | "
+              f"highest-value-first ordering")
+    mode = ("SMOKE (tiny budgets, results are NOT results)" if a.smoke
+            else f"{a.preset.upper()} grid")
     print(f"=== {mode} ===")
     print(f"stages {a.stages} | {len(a.arms)} arms | seeds {seeds} | out {out}/")
 
@@ -281,7 +378,8 @@ def main(argv=None):
               "Fetch it first:\n     python benchmarks/download_genomes.py "
               "--out data/genomes")
 
-    rc = run(jobs, log_dir, keep_going=not a.stop_on_fail)
+    rc = run(jobs, log_dir, keep_going=not a.stop_on_fail,
+             budget_h=a.budget_hours)
     if a.smoke:
         print("\nSmoke complete. Accuracies above are meaningless by "
               "construction. If everything says 'ok', run the full sweep:\n"

@@ -59,6 +59,31 @@ def cell_path(out, task, arm, seed, lr, extra):
     return os.path.join(out, f"{task}_{tag}.json")
 
 
+def best_lr_per_arm(src_dir, task):
+    """Winning learning rate per arm, read from a cheaper run of the same task.
+
+    Sweeping the LR at every sequence length is the single most expensive thing
+    in the genomics budget: at N=32768 a 4-point grid costs 70 GPU-hours on its
+    own. The optimum barely moves with sequence length at fixed model size, so
+    the grid is swept once at the short length and the winner carried up. Each
+    arm gets its OWN winner, since the optimum does differ between operators.
+
+    Returns {arm: lr}; arms with no data are simply absent and fall back to the
+    caller's grid.
+    """
+    per = {}
+    for f in glob.glob(os.path.join(src_dir, f"{task}_*.json")):
+        if os.path.basename(f).endswith("summary.json"):
+            continue
+        r = json.load(open(f))
+        per.setdefault(r["arm"], {}).setdefault(r["lr"], []).append(r["acc"])
+    out = {}
+    for arm, by_lr in per.items():
+        # mean over seeds at each LR, then the best LR
+        out[arm] = max(by_lr, key=lambda lr: statistics.mean(by_lr[lr]))
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--task", default="species",
@@ -88,6 +113,9 @@ def main(argv=None):
     ap.add_argument("--out", default="runs/genomics")
     ap.add_argument("--gate", type=float, default=None,
                     help="override the task's default sdpa validity gate")
+    ap.add_argument("--lr_from", default=None,
+                    help="directory of a cheaper run of this task; its winning "
+                         "LR per arm is reused instead of sweeping --lrs again")
     ap.add_argument("--collect_only", action="store_true")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
@@ -108,17 +136,35 @@ def main(argv=None):
         chance, ceiling = 50.0, 100.0
         label = "genomic_benchmarks"
 
+    lr_map = {}
+    if a.lr_from:
+        src = a.lr_from
+        if src.endswith(".json"):
+            src = os.path.dirname(src)
+        if os.path.isdir(src):
+            lr_map = best_lr_per_arm(src, a.task)
+        if lr_map:
+            print(f"reusing best LR per arm from {src}: "
+                  + ", ".join(f"{k}={v:g}" for k, v in sorted(lr_map.items())))
+        else:
+            print(f"!! --lr_from {src} yielded nothing; falling back to the "
+                  f"full grid {a.lrs}. That is {len(a.lrs)}x the cost.")
+
+    def arm_lrs(arm):
+        return [lr_map[arm]] if arm in lr_map else a.lrs
+
     failures = []
     if not a.collect_only:
-        total = len(a.arms) * len(a.seeds) * len(a.lrs) * len(subjobs)
+        total = sum(len(arm_lrs(x)) for x in a.arms) * len(a.seeds) * len(subjobs)
+        lrdesc = "1 reused LR" if lr_map else f"{len(a.lrs)} LRs"
         print(f"genomics [{label}]: {total} runs = {len(a.arms)} arms x "
-              f"{len(a.seeds)} seeds x {len(a.lrs)} LRs x {len(subjobs)} set(s)")
+              f"{len(a.seeds)} seeds x {lrdesc} x {len(subjobs)} set(s)")
         print(f"chance {chance:.2f}%, ceiling {ceiling:.1f}%, sdpa gate {gate:.1f}%")
         n = 0
         for sub in subjobs:
             for arm in a.arms:
                 for seed in a.seeds:
-                    for lr in a.lrs:
+                    for lr in arm_lrs(arm):
                         n += 1
                         path = cell_path(a.out, a.task, arm, seed, lr, sub)
                         if os.path.exists(path):
