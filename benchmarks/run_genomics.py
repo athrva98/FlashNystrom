@@ -28,6 +28,7 @@ import json
 import os
 import statistics
 import sys
+import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -185,11 +186,21 @@ def main(argv=None):
                         except Exception as e:
                             # One arm must not take the sweep down with it: a
                             # missing optional kernel would otherwise cost every
-                            # arm queued behind it. No JSON is written, so the
-                            # cell retries on resume rather than being skipped
+                            # arm queued behind it. No result JSON is written, so
+                            # the cell retries on resume rather than being skipped
                             # as if it had succeeded.
+                            #
+                            # The traceback is written to --out, NOT just printed:
+                            # on a hosted runtime the console log dies with the
+                            # VM, and a failure you cannot read afterwards costs
+                            # another full run to reproduce.
+                            tb = traceback.format_exc()
                             failures.append((a.task, sub, arm, seed, lr,
                                              f"{type(e).__name__}: {e}"))
+                            with open(cell_path(a.out, a.task, arm, seed, lr, sub)
+                                      .replace(".json", ".error.txt"), "w") as f:
+                                f.write(f"{a.task} {sub or ''} {arm} seed={seed} "
+                                        f"lr={lr:g}\n\n{tb}")
                             print(f"  !! FAILED {arm}: {type(e).__name__}: "
                                   f"{str(e)[:200]}", flush=True)
                             continue
@@ -254,7 +265,11 @@ def main(argv=None):
     with open(os.path.join(a.out, f"{a.task}_summary.json"), "w") as f:
         json.dump({"task": a.task, "seq_len": a.seq_len, "chance": chance,
                    "ceiling": ceiling, "gate": gate, "lrs": a.lrs,
-                   "seeds": a.seeds, "table": summary}, f, indent=2)
+                   "seeds": a.seeds, "table": summary,
+                   "failures": [{"subset": sub, "arm": arm, "seed": seed,
+                                 "lr": lr, "error": err}
+                                for _, sub, arm, seed, lr, err in failures]},
+                  f, indent=2)
     return rc
 
 
