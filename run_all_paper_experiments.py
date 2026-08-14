@@ -258,11 +258,28 @@ def order_by_value(jobs):
     return sorted(jobs, key=lambda j: rank.get(j[1].rsplit("_seed", 1)[0], 99))
 
 
+def completion_marker(argv):
+    """Path a job writes only on success, or None if it resumes internally.
+
+    The MQAR and genomics drivers skip finished cells themselves, so their jobs
+    have no marker here. train_three_way.py has no such check: without this it
+    retrains every vision arm from scratch after a runtime reset, which on Colab
+    is the difference between losing one run and losing six hours.
+    """
+    if "--out_json" in argv:
+        return argv[argv.index("--out_json") + 1]
+    return None
+
+
 def run(jobs, log_dir, keep_going=True, budget_h=None):
     os.makedirs(log_dir, exist_ok=True)
     results, t_all = [], time.time()
     skipped = []
     for i, (stage, name, argv) in enumerate(jobs, 1):
+        marker = completion_marker(argv)
+        if marker and os.path.exists(marker):
+            print(f"[{i}/{len(jobs)}] done {stage}/{name} -> {marker}", flush=True)
+            continue
         if budget_h is not None:
             spent = (time.time() - t_all) / 3600
             est = EST_HOURS.get(name.rsplit("_seed", 1)[0], 0.0)
