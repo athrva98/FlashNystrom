@@ -2,57 +2,53 @@
 
 Diagnostic, performance, and correctness scripts. These are **not** part of the
 shipped package (the sdist excludes this directory); they are developer tools.
-Most write to `C:/tmp/` or stdout and call `os._exit(0)` at the end to avoid the
-Windows CUDA-teardown hang.
-
 Run from the repo root in the build env, e.g. `python benchmarks/bench_paper.py`.
+
+For the paper's experiments do **not** run these directly. There is one driver:
+
+```
+python run_all_paper_experiments.py --smoke      # first: minutes, finds bugs
+python run_all_paper_experiments.py --preset paper12
+```
+
+## Paper experiments (driven by `run_all_paper_experiments.py`)
+| script | role |
+|---|---|
+| `train_three_way.py` | the vision harness: every arm on CIFAR-10 / STL-10 at four context tiers |
+| `run_genomics.py` | the genomics driver: species classification, Genomic Benchmarks, and the synthetic control |
+| `genomics.py` / `genomics_data.py` | genomics models and datasets, with their provenance |
+| `download_genomes.py` | fetches the Ensembl chromosomes the species task needs |
+| `baseline_attn.py` | the bidirectional baselines as `nn.Module`s, shared by every harness |
+| `baseline_ops.py` | the same operators bare, for latency measurement |
 
 ## Performance
 | script | what it measures |
 |---|---|
-| `bench_paper.py` | the headline FN vs FA2/FA3 latency table for the paper/README |
-| `bench_forward.py` / `bench_backward.py` / `bench_fwd_bwd.py` | per-pass latency sweeps |
+| `bench_bidir_latency.py` | the paper's bidirectional-operator table, every arm timed end to end |
+| `bench_paper.py` | the headline FN vs FA2/FA3 latency table |
+| `bench_fwd_bwd.py` | per-pass latency sweeps |
 | `profile_scaling.py` | per-kernel breakdown vs N/BH (uses `FLASH_NYSTROM_PROFILE`) |
 | `autobatch.py` | autobatch cap behavior |
 | `plot_benchmarks.py` / `make_figures.py` | turn the JSON/CSV outputs into plots |
 
 ## Correctness / numerics
+These back specific claims in the paper; keep them runnable.
+
 | script | what it checks |
 |---|---|
 | `adversarial_sweep.py` | per-stage FN-vs-reference error across N/B/H/m/d/dtype/kappa/regime |
 | `pinv_bwd_sweep.py` | the pinv backward is fp32-exact vs an autograd unroll across cond(K2) |
-| `grad_bias.py` | FN gradients are zero-mean unbiased vs the fp16 reference (no systematic bias) |
+| `grad_bias.py` | FN gradients are zero-mean unbiased vs the fp16 reference |
 | `measure_bwd_ranges.py` | magnitude ranges of every backward intermediate |
-| `train_mnist_seeds.py` | paired multi-seed MNIST: FN vs reference (the real comparison instrument) |
+| `train_mnist_seeds.py` | paired multi-seed MNIST: FN vs reference, the comparison instrument |
 
-## Training harnesses
-`train_three_way.py` (SDPA / reference / FN on CIFAR/STL), `train_five_way.py`,
-`train_long_context.py`. Use multi-seed runs for any FN-vs-reference comparison;
-single seeds are inside the run-to-run noise band.
+Use multi-seed runs for any FN-vs-reference comparison; single seeds sit inside
+the run-to-run noise band.
 
-## Fixtures
-`capture_k2inv_fixture.py` writes a real trained-activation fixture to
-`C:/tmp/fn_real_fixture.pt` used by the sanitizer/diagnostic drivers.
-
-## Historical (kept for reproducibility, not routine use)
-These reproduce bugs that were diagnosed and fixed, or validate TC-pinv
-development checkpoints. They are archaeology — not maintained as live tests.
-- `repro_stl10_collapse.py`, `mnist_diverge.py`, `mnist_internal.py` — training
-  divergence investigations (resolved: FN is unbiased vs the reference).
-- `k2inv_test.py`, `k2inv_cp2/cp5/cp6_test.py`, `k2inv_gemm_test.py` — the
-  tf32 tensor-core pinv development checkpoints.
-- `_san_*.py` — compute-sanitizer (racecheck/memcheck) driver scripts.
-
-All of the above were migrated off the `FN_KAPPA_STAR` and `FN_K2INV_TC`
-environment variables, which no longer exist: the ridge and the tf32 tensor-core
-pinv are now `kappa_star` / `use_tc_pinv` parameters on `_C.forward` and
-`FlashNystromFunction.apply`. While they still set those env vars the scripts ran
-and printed numbers, but every row silently measured the default path, and
-`_san_repro.py` raised TypeError against the current 8-argument `apply`. All are
-verified to run and pass against the current API.
-
-Note these files match pytest's default `*_test.py` collection pattern and call
-`sys.exit()` at import; `testpaths` in pyproject.toml scopes collection to
-`tests/` and `paper/` so a bare `pytest` does not walk into them.
-
-The maintained correctness gate is `tests/` (pytest), not this directory.
+## Removed
+One-off scripts for bugs that are now fixed and documented (the MNIST
+divergence, the STL-10 collapse, the tensor-core pinv development checkpoints
+and their fixture, the MQAR diagnose drivers, the Modal harnesses superseded by
+`run_all_paper_experiments.py` and `bench_bidir_latency.py`) were deleted rather
+than kept as archaeology. They are in git history if a result ever needs
+re-deriving.
