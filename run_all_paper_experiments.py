@@ -129,7 +129,8 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes",
     """
     jobs = []
     s = smoke
-    p12 = preset == "paper12"
+    mini = preset == "minimal"
+    p12 = preset in ("paper12", "minimal")
 
     if "vision" in stages:
         # dataset, patch, img, epochs, batch, train_frac
@@ -150,6 +151,8 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes",
                      ("stl10", 2, 96, 1, 8, 0.02)]
         for seed in seeds:
             for ds, ps, img, ep, bs, frac in tiers:
+                if mini and img == 180:
+                    continue          # minimal: the 32K tier is ~4.6h on its own
                 if p12 and img == 180 and seed != seeds[0]:
                     continue          # largest tier: one seed only
                 tag = f"{ds}_p{ps}_i{img}_seed{seed}"
@@ -184,7 +187,7 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes",
             argv += ["--max_parallel", "4"]
         jobs.append(("mqar", "sweep", argv))
 
-    if "genomics" in stages:
+    if "genomics" in stages and not mini:
         gcommon = [PY, "-u", "benchmarks/run_genomics.py",
                    "--arms", *arms, "--seeds", *[str(x) for x in seeds],
                    "--out", f"{out}/genomics"]
@@ -345,8 +348,12 @@ def main(argv=None):
                     help="print the plan and exit")
     ap.add_argument("--species_dir", default="data/genomes",
                     help="reference genomes for the species task")
-    ap.add_argument("--preset", default="full", choices=["full", "paper12"],
-                    help="paper12: reduced grid costed for a ~12h A100 budget")
+    ap.add_argument("--preset", default="full",
+                    choices=["full", "paper12", "minimal"],
+                    help="paper12: reduced grid for a ~12h A100 budget. "
+                         "minimal: ~4h, the load-bearing core only (3 vision "
+                         "context tiers x 3 seeds + the MQAR dimension sweep); "
+                         "run it first, then paper12 resumes on top of it.")
     ap.add_argument("--budget_hours", type=float, default=None,
                     help="stop launching jobs once the budget is spent; jobs run "
                          "highest-value-first and everything is resumable")
