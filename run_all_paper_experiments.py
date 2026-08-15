@@ -152,7 +152,7 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes",
         for seed in seeds:
             for ds, ps, img, ep, bs, frac in tiers:
                 if mini and img == 180:
-                    continue          # minimal: the 32K tier is ~4.6h on its own
+                    continue          # the 32K vision tier costs ~4.6h alone
                 if p12 and img == 180 and seed != seeds[0]:
                     continue          # largest tier: one seed only
                 tag = f"{ds}_p{ps}_i{img}_seed{seed}"
@@ -187,7 +187,7 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes",
             argv += ["--max_parallel", "4"]
         jobs.append(("mqar", "sweep", argv))
 
-    if "genomics" in stages and not mini:
+    if "genomics" in stages:
         gcommon = [PY, "-u", "benchmarks/run_genomics.py",
                    "--arms", *arms, "--seeds", *[str(x) for x in seeds],
                    "--out", f"{out}/genomics"]
@@ -351,9 +351,9 @@ def main(argv=None):
     ap.add_argument("--preset", default="full",
                     choices=["full", "paper12", "minimal"],
                     help="paper12: reduced grid for a ~12h A100 budget. "
-                         "minimal: ~4h, the load-bearing core only (3 vision "
-                         "context tiers x 3 seeds + the MQAR dimension sweep); "
-                         "run it first, then paper12 resumes on top of it.")
+                         "minimal: paper12 without the 32K vision tier. "
+                         "Genomics is kept: it is what makes the paper's "
+                         "bidirectional-domains argument. ~11h.")
     ap.add_argument("--budget_hours", type=float, default=None,
                     help="stop launching jobs once the budget is spent; jobs run "
                          "highest-value-first and everything is resumable")
