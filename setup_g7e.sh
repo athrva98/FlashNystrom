@@ -89,11 +89,24 @@ cat <<'EOF'
 If the smoke reported failures other than a missing optional kernel, fix them
 before starting the sweep. Then, under tmux:
 
-    python run_all_paper_experiments.py --preset paper12 2>&1 | tee logs/sweep.log
+    python run_all_paper_experiments.py --preset paper12 --budget_hours 40 \
+        2>&1 | tee logs/sweep.log
 
 Progress: one line per job. Per-job detail is in logs/. Results are JSON under
 runs/ and the sweep is resumable, so a disconnect costs only the run in flight.
-Check what finished at any time with:
+Check what finished at any time, from another shell, with:
 
     python tools/inventory_runs.py --out runs
+
+Budget. The paper12 grid was costed at ~13.5h on an A100-80GB. An L40S has
+0.42x its memory bandwidth and 0.58x its fp16 tensor throughput, and this
+workload is mostly memory-bound, so expect roughly 23-32h. That fits a two-day
+window, but not with much to spare: --budget_hours 40 leaves margin and makes
+the driver stop cleanly rather than be killed mid-run. Jobs run
+highest-value-first, so anything dropped at the end is the least load-bearing.
+
+If wall-clock gets tight, --preset minimal is the same grid without the 32401
+vision tier (~2.8h on A100, so ~5-7h here). That tier runs one seed and carries
+no error bar, and section 5.1 already scopes its claim accordingly, so dropping
+it costs a column rather than a claim.
 EOF
