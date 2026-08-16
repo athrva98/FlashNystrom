@@ -77,8 +77,8 @@ if [[ "$DO_GENOMES" == "1" ]]; then
   python benchmarks/download_genomes.py --out "$GENOMES" --chroms_per_split 4
 fi
 
-say "memory check at the sweep's real batch sizes"
-python tools/memcheck.py || echo "!! reduce the flagged batch sizes before the sweep"
+say "preflight: measured per-step time and peak memory, projected total"
+python tools/preflight.py --preset paper12 || echo "!! see the failures above"
 
 say "smoke: every stage, every arm, tiny budgets"
 python run_all_paper_experiments.py --smoke --species_dir "$GENOMES"
