@@ -130,7 +130,19 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes",
     jobs = []
     s = smoke
     mini = preset == "minimal"
-    p12 = preset in ("paper12", "minimal")
+    kern = preset == "kernel"
+    p12 = preset in ("paper12", "minimal", "kernel")
+
+    # A systems paper claims EQUIVALENCE (the fused kernel computes what the
+    # reference computes) and SPEED. Equivalence is tested by FlashNystrom vs
+    # nystrom_reference; exact attention is the approximation-quality reference
+    # and belongs at the short tiers only. The other bidirectional baselines
+    # answer "is Nystrom competitive among sub-quadratic methods", which is a
+    # claim about the METHOD, not this kernel, and it costs ~3x the compute.
+    KERNEL_ARMS = ["sdpa", "nystrom_reference", "flash_nystrom", "flash_nystrom_tc"]
+    LONG_ARMS = ["nystrom_reference", "flash_nystrom", "flash_nystrom_tc"]
+    if kern:
+        arms = [a for a in KERNEL_ARMS if a in arms] or KERNEL_ARMS
 
     if "vision" in stages:
         # dataset, patch, img, epochs, batch, train_frac
@@ -153,15 +165,20 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes",
             for ds, ps, img, ep, bs, frac in tiers:
                 if mini and img == 180:
                     continue          # the 32K vision tier costs ~4.6h alone
-                if p12 and img == 180 and seed != seeds[0]:
+                if p12 and not kern and img == 180 and seed != seeds[0]:
                     continue          # largest tier: one seed only
+                # kernel preset keeps ALL THREE seeds at the longest tier and
+                # drops exact attention there instead: sdpa is ~85% of that
+                # tier's cost, and the equivalence claim does not need it at a
+                # length where exact attention is impractical by premise.
+                tier_arms = LONG_ARMS if (kern and img == 180) else arms
                 tag = f"{ds}_p{ps}_i{img}_seed{seed}"
                 jobs.append(("vision", tag, [
                     PY, "-u", "benchmarks/train_three_way.py",
                     "--dataset", ds, "--patch_size", str(ps),
                     "--img_size", str(img), "--epochs", str(ep),
                     "--batch_size", str(bs), "--train_frac", str(frac),
-                    "--backends", *arms, "--seed", str(seed),
+                    "--backends", *tier_arms, "--seed", str(seed),
                     "--kappa_star", "0", "--no-instrument",
                     "--out_json", f"{out}/vision_{tag}.json"]))
 
@@ -187,7 +204,7 @@ def build_jobs(stages, arms, seeds, out, smoke, species_dir="data/genomes",
             argv += ["--max_parallel", "4"]
         jobs.append(("mqar", "sweep", argv))
 
-    if "genomics" in stages:
+    if "genomics" in stages and not kern:
         gcommon = [PY, "-u", "benchmarks/run_genomics.py",
                    "--arms", *arms, "--seeds", *[str(x) for x in seeds],
                    "--out", f"{out}/genomics"]
@@ -349,7 +366,7 @@ def main(argv=None):
     ap.add_argument("--species_dir", default="data/genomes",
                     help="reference genomes for the species task")
     ap.add_argument("--preset", default="full",
-                    choices=["full", "paper12", "minimal"],
+                    choices=["full", "paper12", "minimal", "kernel"],
                     help="paper12: reduced grid for a ~12h A100 budget. "
                          "minimal: paper12 without the 32K vision tier. "
                          "Genomics is kept: it is what makes the paper's "
