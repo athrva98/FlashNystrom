@@ -34,7 +34,12 @@ std::vector<torch::Tensor> nystrom_fwd(
     int64_t num_landmarks,
     int64_t newton_iter,
     double kappa_star,
-    bool use_tc_pinv
+    bool use_tc_pinv,
+    // Whether the caller will run a backward. Cannot be inferred here:
+    // torch.autograd.Function.forward runs with grad mode DISABLED, so
+    // at::GradMode would report false during training. Defaults to true so any
+    // caller that does not pass it keeps the old, always-materialize behaviour.
+    bool need_scaled_qk_arg
 ) {
     // Input validation
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
@@ -96,12 +101,20 @@ std::vector<torch::Tensor> nystrom_fwd(
     // mutating the user's inputs; folding the scale into it removes a full
     // redundant read+write of Q and K). The user's q, k are read-only. q_s, k_s
     // are saved for the backward, which still consumes the SCALED values.
-    auto q_s = torch::empty_like(q);
-    auto k_s = torch::empty_like(k);
+    // Only the BACKWARD consumes the scaled copies. In inference they cost a
+    // full read+write of Q and K (25% of the forward at N=1M) for nothing, so
+    // they are materialized only when a backward can actually run.
+    const bool need_scaled_qk = need_scaled_qk_arg;
+    auto q_s = need_scaled_qk ? torch::empty_like(q) : torch::empty({0}, opts);
+    auto k_s = need_scaled_qk ? torch::empty_like(k) : torch::empty({0}, opts);
 
     auto output       = torch::empty({B, H, N, D}, opts);
     auto q_tilde      = torch::empty({B, H, m, D}, opts);
     auto k_tilde      = torch::empty({B, H, m, D}, opts);
+    // scale^2 landmarks: see the note in flash_nystrom.h. m*D each, a rounding
+    // error against the (B, H, N, D) copies they replace.
+    auto q_tilde2     = torch::empty({B, H, m, D}, opts);
+    auto k_tilde2     = torch::empty({B, H, m, D}, opts);
     auto kernel2_inv  = torch::empty({B, H, m, m}, opts_f32);
     auto step2        = torch::empty({B, H, m, D}, opts);
     auto softmax1_lse = torch::empty({B, H, N}, opts_f32);
@@ -127,12 +140,16 @@ std::vector<torch::Tensor> nystrom_fwd(
 
     params.q_in_ptr = q.data_ptr();   // unscaled user Q (landmark + scaled_copy source)
     params.k_in_ptr = k.data_ptr();   // unscaled user K
-    params.q_ptr = q_s.data_ptr();    // scaled Q (filled by scaled_copy, saved for bwd)
-    params.k_ptr = k_s.data_ptr();    // scaled K
+    // null when no backward will run, so the pipeline can skip the copy
+    params.q_ptr = need_scaled_qk ? q_s.data_ptr() : nullptr;
+    params.k_ptr = need_scaled_qk ? k_s.data_ptr() : nullptr;
+    params.need_scaled_qk = need_scaled_qk;
     params.v_ptr = v.data_ptr();
     params.o_ptr = output.data_ptr();
     params.q_tilde_ptr = q_tilde.data_ptr();
     params.k_tilde_ptr = k_tilde.data_ptr();
+    params.q_tilde2_ptr = q_tilde2.data_ptr();
+    params.k_tilde2_ptr = k_tilde2.data_ptr();
     params.kernel2_inv_ptr = kernel2_inv.data_ptr<float>();
     params.step2_ptr = step2.data_ptr();
     params.b_ptr = b_saved.data_ptr();
@@ -618,7 +635,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("num_landmarks") = 64,
           py::arg("newton_iter") = 6,
           py::arg("kappa_star") = 0.0,
-          py::arg("use_tc_pinv") = false);
+          py::arg("use_tc_pinv") = false,
+          py::arg("need_scaled_qk") = true);
     m.def("backward", &flash_nystrom::nystrom_bwd,
           "FlashNystrom backward (CUDA). Pass b_saved = softmax(Q_tilde @ K^T) "
           "@ V from the forward to skip the N-walk in compute_dk2inv. "

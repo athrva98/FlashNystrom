@@ -195,8 +195,10 @@ static void run_nystrom_fwd_half(NystromParams &p) {
     auto* kt  = static_cast<elem_type*>(p.k_tilde_ptr);
     auto* s2  = static_cast<elem_type*>(p.step2_ptr);
     auto* b   = static_cast<elem_type*>(p.b_ptr);
-    auto* q_m = static_cast<elem_type*>(p.q_ptr);            // scaled Q (dst)
-    auto* k_m = static_cast<elem_type*>(p.k_ptr);            // scaled K (dst)
+    auto* q_m = static_cast<elem_type*>(p.q_ptr);            // scaled Q (bwd only)
+    auto* k_m = static_cast<elem_type*>(p.k_ptr);            // scaled K (bwd only)
+    auto* qt2 = static_cast<elem_type*>(p.q_tilde2_ptr);     // scale^2 landmarks
+    auto* kt2 = static_cast<elem_type*>(p.k_tilde2_ptr);
 
     KernelProfiler prof(p.stream);
     int total = p.BH * p.seq_len * p.head_dim;
@@ -205,12 +207,23 @@ static void run_nystrom_fwd_half(NystromParams &p) {
         launch_landmarks<elem_type>(q_in, k_in, qt, kt,
             p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
     });
-    // Scaled copy q_in -> q_m, k_in -> k_m (folds the softmax scale into the
-    // clone the backward needs anyway, replacing a separate scale_inplace pass).
-    prof.run("scaled_copy(q,k)", [&] {
-        launch_scaled_copy<elem_type>(q_in, q_m, total, p.scale, p.stream);
-        launch_scaled_copy<elem_type>(k_in, k_m, total, p.scale, p.stream);
+    // kernel1 and kernel3 read the RAW user Q and K and pair them with a
+    // scale^2 landmark, which puts the same scale^2 on their scores as the old
+    // scaled_copy did while touching m*D elements instead of N*D. kernel2 pairs
+    // two landmarks and keeps the scale^1 versions, or it would see scale^4.
+    const int tilde_total = p.BH * p.num_landmarks * p.head_dim;
+    prof.run("landmarks_scale2", [&] {
+        launch_scaled_copy<elem_type>(qt, qt2, tilde_total, p.scale, p.stream);
+        launch_scaled_copy<elem_type>(kt, kt2, tilde_total, p.scale, p.stream);
     });
+    // The full-size scaled copies exist ONLY for the backward. Skipping them in
+    // inference removes a read+write of Q and K, 25% of the forward at N=1M.
+    if (p.need_scaled_qk) {
+        prof.run("scaled_copy(q,k) [bwd]", [&] {
+            launch_scaled_copy<elem_type>(q_in, q_m, total, p.scale, p.stream);
+            launch_scaled_copy<elem_type>(k_in, k_m, total, p.scale, p.stream);
+        });
+    }
     // Tikhonov ridge target condition number, threaded from the Python API.
     // The kernel computes lambda = (||K2||_1 ||K2||_inf)/kappa_star internally
     // and inverts M = K2^T K2 + lambda*I (non-normality-proof). 0 = no ridge.
@@ -224,13 +237,13 @@ static void run_nystrom_fwd_half(NystromParams &p) {
         });
     });
     prof.run("kernel3_output_fused", [&] {
-        launch_kernel3_output_fused<elem_type>(qt, k_m, v,
+        launch_kernel3_output_fused<elem_type>(qt2, k_in, v,
             p.kernel2_inv_ptr, s2, b, p.softmax3_lse_ptr,
             p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
     });
     prof.run("kernel1_output_fused", [&] {
         // Tensor-core kernel1 (the main performance kernel)
-        launch_kernel1_output_fused<elem_type>(q_m, kt, s2,
+        launch_kernel1_output_fused<elem_type>(q_in, kt2, s2,
             o, p.softmax1_lse_ptr,
             p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
     });
@@ -248,26 +261,36 @@ static void run_nystrom_fwd_fp32_impl(NystromParams &p) {
     auto* kt  = static_cast<T*>(p.k_tilde_ptr);
     auto* s2  = static_cast<T*>(p.step2_ptr);
     auto* b   = static_cast<T*>(p.b_ptr);
-    auto* q_m = static_cast<T*>(p.q_ptr);            // scaled Q (dst)
-    auto* k_m = static_cast<T*>(p.k_ptr);            // scaled K (dst)
+    auto* q_m = static_cast<T*>(p.q_ptr);            // scaled Q (bwd only)
+    auto* k_m = static_cast<T*>(p.k_ptr);            // scaled K (bwd only)
+    auto* qt2 = static_cast<T*>(p.q_tilde2_ptr);     // scale^2 landmarks
+    auto* kt2 = static_cast<T*>(p.k_tilde2_ptr);
 
     launch_landmarks<T>(q_in, k_in, qt, kt,
         p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.scale, p.stream);
 
+    // see the fp16 path: scale^2 on the landmarks lets kernel1/kernel3 read raw
+    // Q and K, so the full-size scaled copies are needed only by the backward
+    const int tilde_total = p.BH * p.num_landmarks * p.head_dim;
+    launch_scaled_copy<T>(qt, qt2, tilde_total, p.scale, p.stream);
+    launch_scaled_copy<T>(kt, kt2, tilde_total, p.scale, p.stream);
+
     int total = p.BH * p.seq_len * p.head_dim;
-    launch_scaled_copy<T>(q_in, q_m, total, p.scale, p.stream);
-    launch_scaled_copy<T>(k_in, k_m, total, p.scale, p.stream);
+    if (p.need_scaled_qk) {
+        launch_scaled_copy<T>(q_in, q_m, total, p.scale, p.stream);
+        launch_scaled_copy<T>(k_in, k_m, total, p.scale, p.stream);
+    }
 
     const float kappa_star = p.kappa_star;
     launch_kernel2_inv<T>(qt, kt,
         p.kernel2_inv_ptr, p.softmax2_lse_ptr, p.ns_iterates_ptr, p.k2_softmax_ptr,
         p.BH, p.head_dim, p.num_landmarks, p.newton_iter, p.stream, kappa_star);
 
-    launch_kernel3_scalar<T>(qt, k_m, v,
+    launch_kernel3_scalar<T>(qt2, k_in, v,
         p.kernel2_inv_ptr, s2, b, p.softmax3_lse_ptr,
         p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
 
-    launch_kernel1_scalar<T>(q_m, kt, s2,
+    launch_kernel1_scalar<T>(q_in, kt2, s2,
         o, p.softmax1_lse_ptr,
         p.BH, p.seq_len, p.head_dim, p.num_landmarks, p.stream);
 }

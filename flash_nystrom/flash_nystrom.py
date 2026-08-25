@@ -70,8 +70,15 @@ class FlashNystromFunction(torch.autograd.Function):
                 kappa_star, use_tc_pinv):
         assert _C is not None, "CUDA extension not available"
 
+        # The scaled Q/K copies exist only for the backward; producing them
+        # costs a read+write of both tensors, 25% of the forward at N=1M. Grad
+        # mode is disabled inside Function.forward, so this cannot be inferred
+        # in C++ -- but the inputs keep their requires_grad flags here.
+        need_scaled_qk = bool(q.requires_grad or k.requires_grad
+                              or v.requires_grad)
+        ctx.need_scaled_qk = need_scaled_qk
         results = _C.forward(q, k, v, num_landmarks, newton_iter,
-                             kappa_star, use_tc_pinv)
+                             kappa_star, use_tc_pinv, need_scaled_qk)
         # results: [output, q_s, k_s, q_tilde, k_tilde, k2inv, step2,
         #           lse1, lse2, lse3, ns_iterates, k2_softmax, b_saved]
         # b_saved = softmax(Q_tilde @ K_s^T) @ V (K_s = scaled K) is reused in

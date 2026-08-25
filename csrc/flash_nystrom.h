@@ -32,12 +32,17 @@ struct NystromParams {
     // kernel is used otherwise regardless of this flag.
     bool use_tc_pinv;
 
-    // q_ptr/k_ptr hold the SCALED copies (q*scale, k*scale) that the forward
-    // kernels read and that are saved for the backward. q_in_ptr/k_in_ptr are
-    // the ORIGINAL unscaled user tensors, read by the landmark kernel and used
-    // as the source of the scaled copy. Folding the scale into that copy (one
-    // scaled_copy pass) removes the redundant clone + scale_inplace double pass
-    // over Q and K, which was ~44% of the forward at high batch*head.
+    // q_in_ptr/k_in_ptr are the ORIGINAL unscaled user tensors, and they are
+    // what the forward kernels read: kernel1 and kernel3 pair them with a
+    // scale^2 landmark (q_tilde2/k_tilde2 below) so the score carries the same
+    // scale^2 it always did.
+    //
+    // q_ptr/k_ptr hold the scaled copies q*scale, k*scale. ONLY the backward
+    // consumes them, so the forward materializes them only when a backward can
+    // run (need_scaled_qk). Producing them unconditionally cost a full
+    // read+write of Q and K: 2.45 of 9.75 ms, 25% of the forward, at N=1M on an
+    // A100. Folding the scale onto the m*D landmarks instead is ~N/m times less
+    // traffic and took the forward to 7.38 ms.
     const void* __restrict__ q_in_ptr;    // (B, H, N, D) unscaled
     const void* __restrict__ k_in_ptr;    // (B, H, N, D) unscaled
     void* __restrict__ q_ptr;             // (B, H, N, D) scaled (written by scaled_copy)
@@ -45,8 +50,20 @@ struct NystromParams {
     void* __restrict__ v_ptr;             // (B, H, N, D)
     void* __restrict__ o_ptr;             // (B, H, N, D)
 
-    void* __restrict__ q_tilde_ptr;       // (B, H, m, D)
-    void* __restrict__ k_tilde_ptr;       // (B, H, m, D)
+    void* __restrict__ q_tilde_ptr;       // (B, H, m, D)  scale^1
+    void* __restrict__ k_tilde_ptr;       // (B, H, m, D)  scale^1
+
+    // Landmarks carrying scale^2, so kernel1 and kernel3 can read the RAW user
+    // Q and K and still see the same scale^2 on their scores. The alternative
+    // was a scaled_copy pass over the full (B, H, N, D) Q and K, which measured
+    // 25% of the forward at N=1M; scaling m*D landmarks instead is ~N/m times
+    // less traffic. kernel2 keeps the scale^1 pair, since it pairs two
+    // landmarks and would otherwise see scale^4.
+    void* __restrict__ q_tilde2_ptr;      // (B, H, m, D)  scale^2
+    void* __restrict__ k_tilde2_ptr;      // (B, H, m, D)  scale^2
+    // Whether the forward must also materialize the scaled Q/K copies. Only the
+    // backward consumes them; in inference they are pure overhead.
+    bool need_scaled_qk;
     float* __restrict__ kernel2_inv_ptr;  // (B, H, m, m) FP32
     void* __restrict__ step2_ptr;         // (B, H, m, D)
     // B = softmax(Q_tilde @ K^T) @ V — saved from forward so the backward can

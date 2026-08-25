@@ -103,3 +103,55 @@ def triton_vs_cuda():
 @app.local_entrypoint()
 def run_triton_bench():
     triton_vs_cuda.remote()
+
+
+@app.function(gpu="A100-80GB", image=triton_image, timeout=60 * 40)
+def kernel_tests():
+    """Kernel correctness on A100, including the BACKWARD.
+
+    The forward benchmark runs without requires_grad, so it exercises only the
+    need_scaled_qk=False path. This covers the training path, where the scaled
+    Q/K copies are still materialized for the backward.
+    """
+    import subprocess
+    # the three vision test modules import torchvision, which this image lacks
+    r = subprocess.run(
+        ["python", "-m", "pytest", "-q", "--no-header", "-x", "tests/",
+         "--ignore=tests/test_train_frac_seeds.py",
+         "--ignore=tests/test_train_loop_cov.py",
+         "--ignore=tests/test_train_three_way_cov.py"],
+        cwd="/root/FlashNystrom", capture_output=True, text=True)
+    print(r.stdout[-6000:])
+    if r.returncode:
+        print(r.stderr[-3000:])
+        raise RuntimeError(f"pytest exit {r.returncode}")
+
+
+@app.function(gpu="A100-80GB", image=triton_image, timeout=60 * 30)
+def grad_check():
+    """Explicit train-path check: gradients must match the reference."""
+    import torch
+    sys.path.insert(0, "/root/FlashNystrom")
+    from flash_nystrom import flash_nystrom_attention as fn
+    from flash_nystrom.reference import nystrom_attention_reference as ref
+
+    print("training path (requires_grad=True -> need_scaled_qk=True)\n")
+    for N in (2048, 16384, 65536):
+        torch.manual_seed(0)
+        base = [torch.randn(1, 4, N, 64, device="cuda", dtype=torch.float16)
+                for _ in range(3)]
+        a = [t.clone().requires_grad_(True) for t in base]
+        b = [t.clone().requires_grad_(True) for t in base]
+        g = torch.randn(1, 4, N, 64, device="cuda", dtype=torch.float16)
+
+        fn(*a, num_landmarks=64, kappa_star=0.0).backward(g)
+        ref(*b, 64, 6, None, 0, kappa_star=0.0).backward(g)
+
+        errs = []
+        for nm, x, y in zip("qkv", a, b):
+            rel = ((x.grad.float() - y.grad.float()).norm()
+                   / y.grad.float().norm()).item()
+            errs.append(f"d{nm} {rel:.2e}")
+            assert torch.isfinite(x.grad).all(), f"d{nm} non-finite at N={N}"
+        print(f"  N={N:6d}  " + "   ".join(errs))
+    print("\ngradients finite and matching the reference")
