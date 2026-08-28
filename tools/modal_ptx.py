@@ -208,3 +208,69 @@ def profile_forward():
             ms = e.self_device_time_total / 10 / 1000
             print(f"  {e.key[:48]:<50}{ms:10.3f}{100*e.self_device_time_total/total:7.1f}%")
         print()
+
+
+@app.function(gpu="A100-80GB", image=ptx_image, timeout=60 * 40)
+def anatomy():
+    """Side by side: what each implementation actually does, kernel by kernel.
+
+    Pairs the comparable stages, counts global-memory passes over the (N, D)
+    tensors, and prints the inner loop of each side's generated code. The
+    question this answers is not "who is faster" but "what is different".
+    """
+    import os, re, glob
+    os.environ["TRITON_CACHE_DIR"] = "/tmp/anat"
+    import torch
+    from torch.profiler import profile, ProfilerActivity
+    sys.path.insert(0, "/root/FlashNystrom")
+    from benchmarks.triton_nystrom import triton_nystrom_forward
+    from flash_nystrom import flash_nystrom_attention as fn
+
+    B, H, N, D, M = 1, 8, 1048576, 64, 64
+    one_pass_gb = B * H * N * D * 2 / 1e9
+    q, k, v = [torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+               for _ in range(3)]
+    print(f"N={N}  one pass over one (N,D) tensor = {one_pass_gb:.2f} GB")
+    print(f"A100 achievable ~1550 GB/s -> {one_pass_gb/1.55*1000:.2f} ms per pass\n")
+
+    def prof(f, label):
+        for _ in range(5):
+            f()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as pr:
+            for _ in range(10):
+                f()
+            torch.cuda.synchronize()
+        evs = [e for e in pr.key_averages() if e.self_device_time_total > 0]
+        evs.sort(key=lambda e: -e.self_device_time_total)
+        tot = sum(e.self_device_time_total for e in evs) / 10 / 1000
+        print(f"{label}: {tot:.3f} ms")
+        for e in evs[:9]:
+            nm = e.key.replace("void flash_nystrom::", "").replace("void ", "")[:46]
+            ms = e.self_device_time_total / 10 / 1000
+            print(f"   {nm:48s} {ms:7.3f} ms   {ms/(one_pass_gb/1.55):5.2f} passes")
+        print()
+        return tot
+
+    prof(lambda: fn(q, k, v, num_landmarks=M, kappa_star=0.0, use_tc_pinv=True),
+         "FLASHNYSTROM")
+    prof(lambda: triton_nystrom_forward(q, k, v, num_landmarks=M), "TRITON")
+
+    # ---- the generated inner loops ----------------------------------------
+    print("=" * 74)
+    print("TRITON PTX: the main loop of _kernel_p1_z (our kernel1_fused_tc twin)")
+    print("=" * 74)
+    for pf in sorted(glob.glob("/tmp/anat/**/*.ptx", recursive=True)):
+        ptx = open(pf).read()
+        if "p1_z" not in ptx:
+            continue
+        lines = ptx.splitlines()
+        # the hot block: from the first mma to the last
+        idx = [i for i, l in enumerate(lines) if "mma.sync" in l]
+        if not idx:
+            continue
+        lo, hi = max(0, idx[0] - 12), min(len(lines), idx[0] + 26)
+        for l in lines[lo:hi]:
+            print("   " + l.strip()[:100])
+        print(f"\n   ... {len(idx)} mma.sync total in this kernel")
+        break
