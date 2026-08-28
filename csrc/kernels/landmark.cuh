@@ -55,35 +55,61 @@ __global__ void landmark_kernel(
     scalar_t* qt_out = q_tilde + (static_cast<size_t>(bh) * m + landmark) * D;
     scalar_t* kt_out = k_tilde + (static_cast<size_t>(bh) * m + landmark) * D;
 
-    // tpd threads cooperate on each column d (blockDim.x is a multiple of D).
-    const int tpd = blockDim.x / D;
-    const int d   = threadIdx.x % D;
-    const int grp = threadIdx.x / D;          // 0 .. tpd-1
+    // VECTORIZED over the head dim: each thread owns VEC consecutive columns
+    // and loads them as one 16-byte access.
+    //
+    // The scalar version issued one 2-byte load per thread per row. That is
+    // perfectly coalesced (two warps cover a 128-byte line) but it moves only
+    // 64 bytes per warp-instruction, and this kernel is limited by load-issue
+    // rate rather than by wasted bandwidth: it measured 3.69 passes over Q and
+    // K where the algorithm needs 2. A 16-byte load moves 512 bytes per
+    // warp-instruction, so the same issue rate carries 8x the traffic.
+    constexpr int VEC = 16 / sizeof(scalar_t);   // 8 fp16/bf16, 4 fp32
+    const int nvec = D / VEC;                    // vector-columns per row
+    const int tpd  = blockDim.x / nvec;          // threads cooperating per column
+    const int vc   = threadIdx.x % nvec;
+    const int grp  = threadIdx.x / nvec;         // 0 .. tpd-1
 
-    // Each thread sums a strided slice of the segment for its column.
-    float q_sum = 0.0f, k_sum = 0.0f;
+    float qacc[VEC], kacc[VEC];
+    #pragma unroll
+    for (int j = 0; j < VEC; j++) { qacc[j] = 0.0f; kacc[j] = 0.0f; }
+
     for (int i = grp; i < seg_len; i += tpd) {
         const int n = seg_start + i;
-        q_sum += to_float(q_bh[n * D + d]);
-        k_sum += to_float(k_bh[n * D + d]);
+        const uint4 qv = *reinterpret_cast<const uint4*>(q_bh + (size_t)n * D + vc * VEC);
+        const uint4 kv = *reinterpret_cast<const uint4*>(k_bh + (size_t)n * D + vc * VEC);
+        const scalar_t* qe = reinterpret_cast<const scalar_t*>(&qv);
+        const scalar_t* ke = reinterpret_cast<const scalar_t*>(&kv);
+        #pragma unroll
+        for (int j = 0; j < VEC; j++) {
+            qacc[j] += to_float(qe[j]);
+            kacc[j] += to_float(ke[j]);
+        }
     }
 
     // Reduce the tpd partials per column through SMEM.
     extern __shared__ float smem_lm[];        // [tpd*D] for Q, then [tpd*D] for K
     float* sq = smem_lm;
     float* sk = smem_lm + static_cast<size_t>(tpd) * D;
-    sq[grp * D + d] = q_sum;
-    sk[grp * D + d] = k_sum;
+    #pragma unroll
+    for (int j = 0; j < VEC; j++) {
+        sq[grp * D + vc * VEC + j] = qacc[j];
+        sk[grp * D + vc * VEC + j] = kacc[j];
+    }
     __syncthreads();
 
     if (grp == 0) {
-        float qs = 0.0f, ks = 0.0f;
-        for (int g = 0; g < tpd; g++) {
-            qs += sq[g * D + d];
-            ks += sk[g * D + d];
+        #pragma unroll
+        for (int j = 0; j < VEC; j++) {
+            const int d = vc * VEC + j;
+            float qs = 0.0f, ks = 0.0f;
+            for (int g = 0; g < tpd; g++) {
+                qs += sq[g * D + d];
+                ks += sk[g * D + d];
+            }
+            qt_out[d] = from_float<scalar_t>(qs * inv_len * scale);
+            kt_out[d] = from_float<scalar_t>(ks * inv_len * scale);
         }
-        qt_out[d] = from_float<scalar_t>(qs * inv_len * scale);
-        kt_out[d] = from_float<scalar_t>(ks * inv_len * scale);
     }
 }
 
@@ -144,9 +170,17 @@ void launch_landmarks(
     // tpd threads per output column, block capped at 1024. D is 64 or 128, both
     // divide 1024, so block.x is an exact multiple of D (tpd = 16 or 8). More
     // threads per landmark = the long segment reduction is split, not serial.
-    int tpd = 1024 / D;
+    // The kernel is vectorized 16 bytes per thread, so a row is covered by
+    // D/VEC threads, not D. Block 256 keeps the SMEM reduction buffer at
+    // 2*tpd*D floats = 16 KB while still giving the segment loop enough
+    // concurrent groups; grid is (BH, m) so the GPU is filled by blocks.
+    constexpr int kVec = 16 / sizeof(scalar_t);
+    FN_CHECK(D % kVec == 0, "launch_landmarks: head_dim must be a multiple of "
+                            "the 16-byte vector width");
+    const int nvec = D / kVec;
+    const int block = 256;
+    int tpd = block / nvec;
     if (tpd < 1) tpd = 1;
-    const int block = tpd * D;
     dim3 grid(BH, m);
     const size_t smem = static_cast<size_t>(2) * tpd * D * sizeof(float);
 
