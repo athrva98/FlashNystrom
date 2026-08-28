@@ -854,21 +854,41 @@ __global__ void kernel3_combine_kernel(
     float* sO = scomb_;            // m * D
     float* sM = sO + m * D;        // m  (combined max)
     float* sL = sM + m;            // m  (combined denom)
+    float* sW = sL + m;            // num_splits * m  (per-split rescale weight)
 
-    // Step 1: per-row combined max and denominator across splits.
+    // Step 1a: per-row combined max across splits.
     for (int i = tidx; i < m; i += nthreads) {
         float M = fp32_neg_inf();
         for (int s = 0; s < num_splits; s++)
             M = fmaxf(M, partial_max_ptr[(size_t)(s * BH + bh) * m + i]);
-        float L = 0.0f;
-        if (M > fp32_neg_inf()) {
-            for (int s = 0; s < num_splits; s++) {
-                float pm = partial_max_ptr[(size_t)(s * BH + bh) * m + i];
-                float ps = partial_sum_ptr[(size_t)(s * BH + bh) * m + i];
-                L += expf(pm - M) * ps;
-            }
-        }
         sM[i] = M;
+    }
+    __syncthreads();
+
+    // Step 1b: stage the per-(split, row) weight ONCE.
+    //
+    // w depends on (s, i) only, but the output loop below is over (i, d), so
+    // reading it there re-loaded the same two globals and recomputed the same
+    // exp D times per row: 64x redundant at D=64, and with only BH blocks of
+    // 128 threads resident there is nothing to hide that latency behind. This
+    // was 0.391 ms and flat in N, roughly half the B200 forward at N=16384.
+    for (int si = tidx; si < num_splits * m; si += nthreads) {
+        const int s = si / m, i = si - s * m;
+        const float M = sM[i];
+        if (M > fp32_neg_inf()) {
+            const float pm = partial_max_ptr[(size_t)(s * BH + bh) * m + i];
+            const float ps = partial_sum_ptr[(size_t)(s * BH + bh) * m + i];
+            sW[si] = __expf(pm - M) * ps;
+        } else {
+            sW[si] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Step 1c: the denominator is now just the column sum of those weights.
+    for (int i = tidx; i < m; i += nthreads) {
+        float L = 0.0f;
+        for (int s = 0; s < num_splits; s++) L += sW[s * m + i];
         sL[i] = L;
     }
     __syncthreads();
@@ -882,11 +902,11 @@ __global__ void kernel3_combine_kernel(
         float M = sM[i];
         float acc = 0.0f;
         if (M > fp32_neg_inf()) {
+            // weights come from shared memory now; the only global read left in
+            // this loop is the partial output itself, which is genuinely per-d
             for (int s = 0; s < num_splits; s++) {
-                float pm = partial_max_ptr[(size_t)(s * BH + bh) * m + i];
-                float ps = partial_sum_ptr[(size_t)(s * BH + bh) * m + i];
-                float w  = expf(pm - M) * ps;
-                acc += w * partial_o_ptr[((size_t)(s * BH + bh) * m + i) * D + d];
+                acc += sW[s * m + i]
+                     * partial_o_ptr[((size_t)(s * BH + bh) * m + i) * D + d];
             }
         }
         float Li = sL[i];
@@ -1044,8 +1064,11 @@ void launch_kernel3_output_fused(
 
         // Phase B: combine.
         dim3 gridB(BH);
-        dim3 blockB(128);
-        size_t smemB = ((size_t)m * D + 2 * m) * sizeof(float);
+        // 256, not 128: only BH blocks are resident (8 at B=1,H=8), so warps
+        // per block are the only lever on latency hiding here.
+        dim3 blockB(256);
+        size_t smemB = ((size_t)m * D + 2 * m
+                        + (size_t)num_splits * m) * sizeof(float);
         if (smemB > 48 * 1024) {
             FN_CHECK(smemB <= get_max_smem_per_block(), "kernel3 combine: insufficient smem");
             FN_CUDA_CHECK(cudaFuncSetAttribute(kernel3_combine_kernel<scalar_t>,
