@@ -24,12 +24,19 @@ using namespace cute;
 // GEMM2: O[kBlockM, kHeadDim] = P[kBlockM, kBlockN] @ step2[kBlockN, kHeadDim]
 //        P stays in registers; step2 from SMEM
 
-template <int kHeadDim_, typename elem_type>
+// kBlockM_ is a PARAMETER because the forward and the backward want different
+// Q tile heights from the same traits. The forward re-reads k_tilde and step2
+// (m*D each) in every block on top of its own Q tile, so at kBlockM=64 with
+// D=64 half of a block's traffic was those fixed operands and the kernel
+// measured 3.42 passes where 2 suffice; a taller tile amortizes them. The
+// backward instantiates the same struct and is NOT tolerant of the taller tile
+// (it produced NaN gradients across 21 tests), so it keeps the default.
+template <int kHeadDim_, typename elem_type, int kBlockM_ = 64>
 struct K1Traits {
     using Element = elem_type;
     using ElementAccum = float;
 
-    static constexpr int kBlockM   = 64;       // Q tile rows
+    static constexpr int kBlockM   = kBlockM_;  // Q tile rows
     static constexpr int kBlockN   = 64;       // landmarks (must be >= m)
     static constexpr int kHeadDim  = kHeadDim_;
     static constexpr int kNWarps   = 4;
@@ -385,7 +392,10 @@ void launch_kernel1_output_fused(
 
     auto launch = [&](auto HeadDimTag) {
         constexpr int kHeadDim = decltype(HeadDimTag)::value;
-        using Traits = K1Traits<kHeadDim, scalar_t>;
+        // 128 rows at D=64 (sQ 16 KB + sKV 8 KB); at D=128 the Q tile
+        // alone would be 32 KB and push the block past the SMEM limit.
+        constexpr int kFwdBlockM = (kHeadDim == 64) ? 128 : 64;
+        using Traits = K1Traits<kHeadDim, scalar_t, kFwdBlockM>;
 
         int num_tiles = (N + Traits::kBlockM - 1) / Traits::kBlockM;
         dim3 grid(num_tiles, BH);
