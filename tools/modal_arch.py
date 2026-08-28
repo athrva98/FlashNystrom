@@ -155,3 +155,59 @@ def h100():
 @app.local_entrypoint()
 def b200():
     _b200.remote()
+
+
+def _profile(lens):
+    """Per-kernel forward time. At short N the N-independent kernels dominate,
+    which is a different bottleneck from the one visible at N=1M."""
+    import torch
+    from torch.profiler import profile, ProfilerActivity
+    sys.path.insert(0, "/root/FlashNystrom")
+    from flash_nystrom import flash_nystrom_attention as fn
+
+    p = torch.cuda.get_device_properties(0)
+    print(f"{p.name}  sm_{torch.cuda.get_device_capability()[0]}"
+          f"{torch.cuda.get_device_capability()[1]}\n")
+    B, H, D, M = 1, 8, 64, 64
+    for N in lens:
+        q, k, v = [torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+                   for _ in range(3)]
+        f = lambda: fn(q, k, v, num_landmarks=M, kappa_star=0.0, use_tc_pinv=True)
+        for _ in range(10):
+            f()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for _ in range(20):
+                f()
+            torch.cuda.synchronize()
+        evs = [e for e in prof.key_averages() if e.self_device_time_total > 0]
+        evs.sort(key=lambda e: -e.self_device_time_total)
+        tot = sum(e.self_device_time_total for e in evs)
+        print(f"  N={N}   total {tot/20/1000:.3f} ms")
+        for e in evs[:7]:
+            nm = e.key.replace("void flash_nystrom::", "")[:44]
+            print(f"    {nm:46s} {e.self_device_time_total/20/1000:7.3f} ms"
+                  f" {100*e.self_device_time_total/tot:6.1f}%")
+        print()
+        del q, k, v
+        torch.cuda.empty_cache()
+
+
+@app.function(gpu="B200", image=arch_image, timeout=60 * 30)
+def _prof_b200():
+    _profile([16384, 65536, 1048576])
+
+
+@app.function(gpu="A100-80GB", image=arch_image, timeout=60 * 30)
+def _prof_a100():
+    _profile([16384, 65536, 1048576])
+
+
+@app.local_entrypoint()
+def prof_b200():
+    _prof_b200.remote()
+
+
+@app.local_entrypoint()
+def prof_a100():
+    _prof_a100.remote()
