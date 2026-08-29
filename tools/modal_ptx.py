@@ -274,3 +274,51 @@ def anatomy():
             print("   " + l.strip()[:100])
         print(f"\n   ... {len(idx)} mma.sync total in this kernel")
         break
+
+
+@app.function(gpu="A100-80GB", image=ptx_image, timeout=60 * 40)
+def profile_backward():
+    """Per-kernel BACKWARD time at N=1M, with pass accounting.
+
+    The forward work so far has not touched the backward, which is roughly 80%
+    of a training step. Minimum traffic for the backward is 7 passes over an
+    (N, D) tensor: read q, k, v, dO and write dq, dk, dv.
+    """
+    import torch
+    from torch.profiler import profile, ProfilerActivity
+    sys.path.insert(0, "/root/FlashNystrom")
+    from flash_nystrom import flash_nystrom_attention as fn
+
+    B, H, N, D, M = 1, 8, 1048576, 64, 64
+    one_pass = B * H * N * D * 2 / 1e9 / 1.55        # ms at ~1550 GB/s
+    q, k, v = [torch.randn(B, H, N, D, device="cuda", dtype=torch.float16,
+                           requires_grad=True) for _ in range(3)]
+    g = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
+    print(f"N={N}  one pass = {one_pass:.3f} ms   backward needs >= 7 passes "
+          f"({7*one_pass:.2f} ms)\n")
+
+    def step():
+        for t in (q, k, v):
+            t.grad = None
+        fn(q, k, v, num_landmarks=M, kappa_star=0.0, use_tc_pinv=True).backward(g)
+
+    for _ in range(3):
+        step()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as pr:
+        for _ in range(5):
+            step()
+        torch.cuda.synchronize()
+
+    evs = [e for e in pr.key_averages() if e.self_device_time_total > 0]
+    evs.sort(key=lambda e: -e.self_device_time_total)
+    tot = sum(e.self_device_time_total for e in evs) / 5 / 1000
+    fwd = sum(e.self_device_time_total for e in evs
+              if not any(t in e.key for t in ("bwd", "_dq", "_dk", "_dv",
+                                              "precompute", "dk2inv"))) / 5 / 1000
+    print(f"fwd+bwd total {tot:.3f} ms   (forward-side kernels ~{fwd:.3f})")
+    print(f"{'kernel':52s} {'ms':>8s} {'passes':>8s} {'share':>7s}")
+    for e in evs[:14]:
+        nm = e.key.replace("void flash_nystrom::", "").replace("void ", "")[:50]
+        ms = e.self_device_time_total / 5 / 1000
+        print(f"{nm:52s} {ms:8.3f} {ms/one_pass:8.2f} {100*ms/tot:6.1f}%")
