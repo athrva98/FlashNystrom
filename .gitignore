@@ -58,3 +58,6 @@ runs_smoke/
 logs/
 logs_smoke/
 .coverage
+
+# Local Claude Code MCP server config: developer workflow, not part of the library
+.mcp.json
