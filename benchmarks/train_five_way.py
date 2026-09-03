@@ -12,8 +12,14 @@
 # If config 5 matches Nystrom-Ref → CUDA backward is correct.
 # If config 4 differs → bug in FN forward.
 # If config 5 differs → bug in FN backward.
+import os
 import sys, time, json
-sys.path.insert(0, "C:/Users/athrv/Documents/FlashNystrom/benchmarks")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))   # .../benchmarks
+_REPO = os.path.dirname(_HERE)                       # repo root
+sys.path.insert(0, _REPO)
+sys.path.insert(0, _HERE)
+_DATA = os.environ.get("FN_DATA_DIR", os.path.join(_REPO, "data"))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -221,10 +227,10 @@ def train_one(label, attn_factory, epochs=20, batch_size=128, lr=1e-3,
                            T.ToTensor(), T.Normalize((0.5,)*3, (0.5,)*3)])
     transform_test = T.Compose([T.ToTensor(), T.Normalize((0.5,)*3, (0.5,)*3)])
     trainset = torchvision.datasets.CIFAR10(
-        root="C:/Users/athrv/Documents/FlashNystrom/data",
+        root=_DATA,
         train=True, download=False, transform=transform)
     testset = torchvision.datasets.CIFAR10(
-        root="C:/Users/athrv/Documents/FlashNystrom/data",
+        root=_DATA,
         train=False, download=False, transform=transform_test)
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=batch_size, shuffle=True, num_workers=0,

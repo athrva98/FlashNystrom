@@ -6,8 +6,14 @@
 CUDA-event timing, 10 warmup + 50 timed runs, median reported.
 Config: B=1, H=4, D=64 (CIFAR-10 ViT setup), FP16, newton_iter=6, num_landmarks=32.
 """
+import os
 import sys
-sys.path.insert(0, "C:/Users/athrv/Documents/FlashNystrom/benchmarks")
+
+_HERE = os.path.dirname(os.path.abspath(__file__))   # .../benchmarks
+_REPO = os.path.dirname(_HERE)                       # repo root
+sys.path.insert(0, _REPO)
+sys.path.insert(0, _HERE)
+_DATA = os.environ.get("FN_DATA_DIR", os.path.join(_REPO, "data"))
 import torch
 import torch.nn.functional as F
 import flash_nystrom._C as _C

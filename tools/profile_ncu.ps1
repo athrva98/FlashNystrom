@@ -23,7 +23,8 @@
     ./tools/profile_ncu.ps1 -Python "C:\path\to\python.exe"
 #>
 param(
-    [string]$Python = "C:\Users\athrv\miniconda3\envs\gpusamcts\python.exe",
+    # Resolves "python" from PATH; pass -Python for a specific interpreter.
+    [string]$Python = "python",
     [int]$B = 1, [int]$H = 8, [int]$N = 4096, [int]$D = 128, [int]$M = 64,
     [string]$OutDir = "$env:TEMP\fn_ncu"
 )

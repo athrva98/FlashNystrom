@@ -22,10 +22,15 @@ Methodology:
 """
 
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, asdict
 from typing import Optional
+
+_HERE = os.path.dirname(os.path.abspath(__file__))   # .../benchmarks
+_REPO = os.path.dirname(_HERE)                       # repo root
+_DATA = os.environ.get("FN_DATA_DIR", os.path.join(_REPO, "data"))
 
 import torch
 import torch.nn as nn
@@ -433,8 +438,8 @@ def section_training():
                                T.ToTensor(), T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
         transform_test = T.Compose([T.ToTensor(), T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
-        trainset = torchvision.datasets.CIFAR10(root="C:/Users/athrv/Documents/FlashNystrom/data", train=True, download=False, transform=transform)
-        testset = torchvision.datasets.CIFAR10(root="C:/Users/athrv/Documents/FlashNystrom/data", train=False, download=False, transform=transform_test)
+        trainset = torchvision.datasets.CIFAR10(root=_DATA, train=True, download=False, transform=transform)
+        testset = torchvision.datasets.CIFAR10(root=_DATA, train=False, download=False, transform=transform_test)
         # drop_last=True keeps batch shape constant -> torch.compile (CUDA graphs) avoids recapture
         trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True,
                                                    num_workers=0, pin_memory=True, drop_last=True)
