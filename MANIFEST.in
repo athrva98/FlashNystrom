@@ -7,6 +7,7 @@
 # CUTLASS include directory explicitly here.
 
 include LICENSE
+include NOTICE
 include README.md
 include CHANGELOG.md
 include pyproject.toml
@@ -14,10 +15,11 @@ include pyproject.toml
 # All CUDA / C++ source and headers under csrc/.
 recursive-include csrc *.cu *.cuh *.h
 
-# CUTLASS is a git submodule pinned at NVIDIA/cutlass@b78588d (CUTLASS 3.7).
-# The sdist needs the include tree (header-only library) so users without
-# the submodule can still build. We deliberately exclude the rest of the
-# CUTLASS repo (tools, examples, tests, docs) to keep the sdist small.
+# CUTLASS is a git submodule (see .gitmodules for the URL and the repo
+# for the pinned revision). The sdist needs the include tree (header-only
+# library) so users without the submodule can still build. The rest of the
+# CUTLASS repo (tools, examples, tests, docs) is deliberately excluded to
+# keep the sdist small.
 recursive-include third_party/cutlass/include *.h *.hpp *.cuh *.inl
 include third_party/cutlass.BUILD
 include third_party/cutlass/LICENSE.txt

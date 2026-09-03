@@ -29,6 +29,9 @@ python run_all_paper_experiments.py --preset paper12
 | `bench_fwd_bwd.py` | per-pass latency sweeps |
 | `profile_scaling.py` | per-kernel breakdown vs N/BH (uses `FLASH_NYSTROM_PROFILE`) |
 | `autobatch.py` | autobatch cap behavior |
+| `bench_memory.py` | peak memory: FN vs the same algorithm unfused, vs exact attention |
+| `bench_5060_refresh.py` | local FN / SDPA / cuBLAS latency sweep at the current defaults |
+| `triton_nystrom.py` | hand-written Triton Nystrom forward, the compiler-baseline arm |
 | `plot_benchmarks.py` / `make_figures.py` | turn the JSON/CSV outputs into plots |
 
 ## Correctness / numerics
@@ -41,6 +44,7 @@ These back specific claims in the paper; keep them runnable.
 | `grad_bias.py` | FN gradients are zero-mean unbiased vs the fp16 reference |
 | `measure_bwd_ranges.py` | magnitude ranges of every backward intermediate |
 | `train_mnist_seeds.py` | paired multi-seed MNIST: FN vs reference, the comparison instrument |
+| `train_five_way.py` | splits FN forward from FN backward against the reference, to localize a discrepancy to one side |
 
 Use multi-seed runs for any FN-vs-reference comparison; single seeds sit inside
 the run-to-run noise band.
