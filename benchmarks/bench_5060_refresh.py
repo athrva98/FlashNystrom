@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 # Refresh the README RTX-5060 latency table with the CURRENT default config
 # (kappa_star=5, tf32 TC pinv, fast_dk2inv=True). FN vs SDPA vs cuBLAS reference,
 # fwd and fwd+bwd, B=1 H=4 D=64 m=32 newton=6 fp16 — matching the README footnote.

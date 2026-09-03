@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 # Adversarial FN-vs-reference sweep. For each (N,B,H,m,d,dtype,kappa,regime):
 # run the FN kernels and the fp32 reference on identical inputs, log a PER-STAGE
 # error breakdown (landmarks -> K2 -> pinv -> step1 -> step2 -> output), grad

@@ -21,8 +21,8 @@ FP16_MIN_SUB  = 2.0 ** -24      # 5.96e-8    smallest subnormal (below -> flush 
 torch.manual_seed(0)
 dev = "cuda"
 M, NEWTON, DIM, HEADS, DEPTH = 64, 6, 256, 4, 4
-BATCH = int(os.environ.get("BWD_BATCH", "8"))
-WARMUP_STEPS = int(os.environ.get("BWD_WARMUP", "40"))
+BATCH = int(os.environ.get("FN_BWD_BATCH", "8"))
+WARMUP_STEPS = int(os.environ.get("FN_BWD_WARMUP", "40"))
 
 # ---- instrumented attention: capture q,k,v and the real grad of the nystrom output ----
 CAP = {}   # layer_idx -> dict(q,k,v,dO)
@@ -53,7 +53,7 @@ for i, blk in enumerate(model.blocks):
     blk["attn"].idx = i; blk["attn"]._capture = False
 
 tf = T.Compose([T.ToTensor(), T.Normalize((0.5,)*3, (0.5,)*3)])
-DATA_ROOT = os.environ.get("BWD_DATA_ROOT", "./data")
+DATA_ROOT = os.environ.get("FN_DATA_DIR", "./data")
 ds = torchvision.datasets.STL10(root=DATA_ROOT, split="train", download=True, transform=tf)
 dl = torch.utils.data.DataLoader(ds, batch_size=BATCH, shuffle=True, num_workers=0, drop_last=True)
 opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.05)

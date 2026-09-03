@@ -4,8 +4,12 @@
  ******************************************************************************/
 #pragma once
 
-// cute utilities ripped from FlashAttention (thanks Tri Dao)
-// handles the tensor core gemms and in-register softmax stuff
+// CuTe helpers for the tensor-core GEMMs and the in-register softmax.
+//
+// The GEMM wrappers, the MMA accumulator layout conversions and the softmax
+// primitives below are adapted from FlashAttention (Tri Dao and collaborators,
+// https://github.com/Dao-AILab/flash-attention), which remains under its own
+// license. See the NOTICE file at the repository root.
 
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_types.h>

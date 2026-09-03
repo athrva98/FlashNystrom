@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Exhaustive coverage of benchmarks.autobatch.
 
 The batch-doubling search must NEVER run a real OOM here (an actual OOM on the

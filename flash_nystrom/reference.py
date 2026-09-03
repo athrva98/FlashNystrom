@@ -3,8 +3,8 @@
 
 """
 Pure PyTorch reference implementation of NystromFormer attention.
-This is the ground truth we test all the CUDA kernels agaisnt.
-Deliberately kept simple and readable, no fancy optimizations here.
+This is the ground truth the CUDA kernels are tested against.
+Deliberately kept simple and readable; it is not optimized.
 """
 
 import torch
@@ -16,7 +16,7 @@ def iterative_pinverse(matrix: torch.Tensor, n_iter: int = 6) -> torch.Tensor:
     """Newton-Schulz pseudoinverse (third-order convergence).
 
     Must be float32 — fp16 will diverge. 6 iterations is plenty for m<=64.
-    The formula looks scary but its just matrix multiply in a loop.
+    The formula is dense but it is matrix multiplication in a loop.
 
     Z_0 init: Z_0 = A^T / (||A||_1 * ||A||_inf). This is the standard
     Cauchy-interpolation bound that guarantees ||Z_0 A - I|| < 1 in operator
@@ -59,7 +59,8 @@ def nystrom_attention_reference(  # noqa: C901
     """Reference nystrom attention — the one that actually does math correctly.
 
     Compute right-to-left: kernel_1 @ kernel_2_inv @ kernel_3 @ V
-    so we never materialize an (N, N) matrix. Thats the whole point.
+    so an (N, N) matrix is never materialized, which is the point of the
+    factorization.
     """
     B, H, N, D = q.shape
     m = num_landmarks

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 # Controlled cond(K2) sweep of the pinv backward: FN's kernel2_inv_bwd (fp32 debug
 # hook) vs an autograd UNROLL of FN's EXACT ridge forward. Same forward function ->
 # if FN's hand-derived backward is correct, rel ~ 1e-5 at every cond. Reports rel,

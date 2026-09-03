@@ -3,7 +3,7 @@
  * Licensed under the Apache License, Version 2.0
  *
  * FlashNystrom - CUDA utility helpers, type conversions, warp reductions etc.
- * Most of the heavy lifitng for type dispatch happens here.
+ * Most of the heavy lifting for type dispatch happens here.
  ******************************************************************************/
 #pragma once
 
@@ -60,8 +60,8 @@
         }                                                                      \
     } while (0)
 
-// hard limits — kernels actualy only support D in {64, 128} and m <= 64
-// but these are the theoretical maxiums for validation
+// Hard limits. The kernels support D in {64, 128} and m <= 64; the
+// constants below are the theoretical maxima used for validation.
 
 namespace flash_nystrom {
 
@@ -72,7 +72,7 @@ constexpr int kMaxHeadDim = 256;
 constexpr int kMaxLandmarks = 64;
 constexpr float kLog2e = 1.4426950408889634f;  // log2(e) for exp2-based softmax trick
 
-// gpu arch detection — cached after first call so we dont keep querying the driver
+// GPU arch detection, cached after the first call so the driver is not re-queried.
 
 inline int get_sm_version() {
     static int cached = -1;
@@ -167,7 +167,7 @@ __device__ __forceinline__ cutlass::bfloat16_t from_float<cutlass::bfloat16_t>(f
 }
 
 // warp-level reductions — butterfly pattern with shfl_xor
-// these get used everwhere in softmax and the backward
+// Used throughout the softmax and the backward.
 
 __device__ __forceinline__ float warp_reduce_max(float val) {
     #pragma unroll
@@ -186,7 +186,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 
 // block-wide reductions — warp reduces first, then inter-warp via smem
-// scratch needs at least (blockDim.x / 32) floats, dont forget to allocate
+// scratch needs at least (blockDim.x / 32) floats; the caller must allocate it
 __device__ __forceinline__ float block_reduce_max(float val, float* scratch) {
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;

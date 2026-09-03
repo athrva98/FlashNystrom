@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 # Is the FN-vs-reference gradient difference a BIAS or zero-mean noise? Over many
 # MNIST batches x layers, in PRODUCTION precision (FN fp16/tf32 vs reference fp16
 # autocast), measure for dq/dk:
@@ -37,7 +39,7 @@ class Net(nn.Module):
         for b in s.blocks: x=b(x)
         return s.head(s.norm(x)[:,0])
 model=Net().to(dev)
-ds=torchvision.datasets.MNIST(root=os.environ.get("CAP_DATA_ROOT","./data"),train=True,download=True,transform=T.ToTensor())
+ds=torchvision.datasets.MNIST(root=os.environ.get("FN_DATA_DIR", "./data"),train=True,download=True,transform=T.ToTensor())
 dl=torch.utils.data.DataLoader(ds,batch_size=64,shuffle=True,num_workers=0,drop_last=True)
 opt=torch.optim.AdamW(model.parameters(),lr=1e-3);scaler=torch.amp.GradScaler("cuda"); it=iter(dl)
 def step_batch(cap):

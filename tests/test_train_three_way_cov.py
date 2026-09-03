@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Coverage of benchmarks.train_three_way helpers and modules.
 
 subset_indices / _margin_batch are pure. SDPAAttention / NystromRefAttention /

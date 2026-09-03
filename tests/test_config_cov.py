@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Exhaustive coverage of flash_nystrom.nystrom_config.NystromConfig.
 
 Every field, every default, and every branch of __post_init__ (each assertion,

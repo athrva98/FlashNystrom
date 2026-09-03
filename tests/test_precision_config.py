@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 # Regression tests for the config refactor and the precision findings:
 #  - kappa_star is threaded identically to the kernel and the reference, is
 #    validated, and actually changes the output (guards review #10/#20).

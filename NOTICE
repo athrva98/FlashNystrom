@@ -1,0 +1,73 @@
+FlashNystrom
+Copyright (c) 2026 Athrva Pandhare
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+Third-party material
+================================================================================
+
+This project incorporates or adapts material from the projects below. Each
+remains under its own license, which governs that material; the terms are
+those of the upstream project, not this one. Consult each project for the
+authoritative text.
+
+--------------------------------------------------------------------------------
+NVIDIA CUTLASS / CuTe
+    https://github.com/NVIDIA/cutlass
+    SPDX-License-Identifier: BSD-3-Clause
+    Copyright (c) 2017-2025 NVIDIA CORPORATION & AFFILIATES
+
+Vendored as a git submodule at third_party/cutlass and used as a header-only
+dependency. Its full license text ships with the submodule at
+third_party/cutlass/LICENSE.txt. The tensor-core MMA atoms, the tiled copy
+machinery, the swizzled shared-memory layouts and the CuTe tensor algebra used
+throughout csrc/ are CUTLASS APIs.
+
+--------------------------------------------------------------------------------
+FlashAttention
+    https://github.com/Dao-AILab/flash-attention
+    Tri Dao and collaborators
+
+The IO-aware attention design this project applies to a different attention
+math. Specific adaptations, each marked at its site in the source:
+
+  * csrc/static_switch.h        adapted from FlashAttention's static_switch.h
+  * csrc/nystrom_utils.h        the CuTe GEMM helpers, the MMA accumulator
+                                layout conversions, and the in-register
+                                softmax primitives follow FlashAttention's
+                                implementations
+  * csrc/kernels/*.cuh          the tiling structure, the online (running
+                                maximum) softmax, the transposed shared-memory
+                                views for the second GEMM's B operand, and the
+                                warp-partitioned TiledMma shapes follow
+                                FlashAttention's patterns
+
+Refer to the upstream repository for its license terms.
+
+--------------------------------------------------------------------------------
+Zoology
+    https://github.com/HazyResearch/zoology
+
+paper/mqar/ ports Zoology's multi-query associative recall task: the data
+generator, the model layout, and the training protocol. Refer to the upstream
+repository for its license terms.
+
+--------------------------------------------------------------------------------
+Baselines used for comparison only
+
+The following are imported as optional dependencies for benchmarking. No code
+from them is vendored here; each is installed from its own distribution under
+its own license.
+
+  * flash-attn         https://github.com/Dao-AILab/flash-attention
+                       (FlashAttention-2/3, and its fused windowed kernel used
+                       as the sliding-window baseline)
+  * flash_bla          https://github.com/fla-org/flash-bidirectional-linear-attention
+                       (fused bidirectional linear attention baseline)
+  * mamba-ssm, causal-conv1d, and the Hyena reference implementation, for the
+    MQAR baselines

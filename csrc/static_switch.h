@@ -4,7 +4,9 @@
  ******************************************************************************/
 #pragma once
 
-// Adapted from FlashAttention's static_switch.h (Tri Dao, 2024)
+// Adapted from FlashAttention's static_switch.h (Tri Dao and collaborators,
+// https://github.com/Dao-AILab/flash-attention), which remains under its own
+// license. See the NOTICE file at the repository root.
 
 #define BOOL_SWITCH(COND, CONST_NAME, ...)      \
   [&] {                                         \

@@ -181,7 +181,8 @@ def flash_nystrom_attention(
     q, k, v, num_landmarks=64, newton_iter=6, conv_weight=None, conv_kernel_size=0,
     fast_dk2inv=True, kappa_star=0.0, use_tc_pinv=False,
 ):
-    """main entry point — uses CUDA kernels if available, falls back to pytorch.
+    """Main entry point. Uses the CUDA kernels when available and falls back
+    to the pure-PyTorch reference otherwise.
 
     The conv residual (when enabled) is computed via cuDNN through F.conv1d,
     OUTSIDE the FlashNystromFunction autograd boundary. PyTorch handles its

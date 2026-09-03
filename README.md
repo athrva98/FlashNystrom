@@ -415,6 +415,39 @@ for x, y in loader:
 | `use_tc_pinv`      |   False | Route the pseudoinverse through the tf32 tensor-core NS chain. Default `False` is the faithful path: the fp32 scalar Newton-Schulz matches the pure-torch reference to ~3e-4 at every N and the full fwd+bwd is still ~3x the reference. `True` is ~4x the reference but carries an N-independent 1-3% pinv error from tf32 truncation when forming `M = K2ᵀK2`, which measured ~5 accuracy points on 3-seed STL-10 at N=2304. `m == 64` only; the fp32 scalar kernel is used otherwise. |
 | `fast_dk2inv`      |    True | Tensor-core `compute_dk2inv` in the backward (fp16/bf16 only). Casts the softmax output P to 16-bit before GEMM2 — verified zero-mean unbiased vs the exact fp32 path. Set `False` for the fp32 scalar fallback. |
 
+## Environment variables
+
+Two naming conventions, deliberately split: `FLASH_NYSTROM_*` are supported
+knobs for building and running the library, `FN_*` are diagnostics and
+benchmark-script settings that carry no compatibility promise.
+
+Build time (read by `setup.py`):
+
+| Variable | Effect |
+|---|---|
+| `FLASH_NYSTROM_CUDA_ARCH_LIST` | Compute capabilities to build for, overriding `nvidia-smi` detection. Accepts PyTorch's forms (`"8.0 9.0a"`, `"80;90a"`) and the arch-specific `90a` / `100a` tokens. `TORCH_CUDA_ARCH_LIST` is honoured as a fallback. |
+| `FLASH_NYSTROM_LAX_BUILD` | Set to disable the strict build (`-Werror`, MSVC `/permissive-` and `/WX`). The strict build is the default because it catches a real bug class; use this only when a transient toolchain warning blocks you. |
+| `FLASH_NYSTROM_VERBOSE` | Set to add `-Xptxas=-v --resource-usage`, printing per-kernel register and shared-memory usage. Off by default because it is noisy and slows compilation. |
+
+Run time (read by the library):
+
+| Variable | Effect |
+|---|---|
+| `FLASH_NYSTROM_REFERENCE_MAX_BYTES` | Byte ceiling on the `(N, m)` softmax intermediates the `m > 64` reference dispatch may materialize. Default 8 GiB; exceeding it raises a clear Python error rather than a CUDA OOM. |
+| `FLASH_NYSTROM_PROFILE` | Set to `1` for a per-kernel timing breakdown of each forward and backward. |
+| `FLASH_NYSTROM_BWD_WIDE` | Override the automatic wide/narrow shared-memory choice in the backward kernels: `0` forces narrow, `1` forces wide. Unset uses the occupancy query, which is what you want; this exists for A/B measurement. |
+| `FLASH_NYSTROM_KERNEL3_SPLITS` | Override the split-N decomposition in the kernel3 forward. `1` forces the single-CTA path; `N > 1` forces that many splits, clamped to the tile count. |
+| `FLASH_NYSTROM_K1_SPLITS` | Override the split-K slot count for the `kernel1_bwd` accumulators. `0` restores the direct `atomicAdd`. |
+
+Diagnostics and benchmark scripts:
+
+| Variable | Effect |
+|---|---|
+| `FN_BWD_DEBUG` | Set to `1` to log finiteness and magnitude of every backward intermediate at the kernel boundary. Forces device syncs, so it is for diagnosis only. |
+| `FN_FP32_BWD` | Set to `1` to route a 16-bit backward through the FP32 scalar path, separating precision effects from nondeterministic `atomicAdd` accumulation. `head_dim=64` only. Diagnostic, never a shipping path. |
+| `FN_DATA_DIR` | Dataset root for the training benchmarks. Defaults to `data/` under the repository root. |
+| `FN_BENCH_NS`, `FN_BWD_BATCH`, `FN_BWD_WARMUP` | Sequence lengths, batch size and warmup count for individual benchmark scripts. |
+
 ## Limitations
 
 * `head_dim` is restricted to 64 or 128.
@@ -434,10 +467,13 @@ csrc/                          CUDA source
   kernels/                     forward kernels
   kernels/backward/            backward kernels and isolation hooks
 flash_nystrom/                 Python package (autograd Function, config, reference)
-tests/                         95 pytest tests
-benchmarks/                    latency and CIFAR-10 training scripts
+tests/                         pytest suite
+benchmarks/                    latency, memory and training scripts
+paper/mqar/                    multi-query associative recall harness
+tools/                         profiling, occupancy reports, Modal GPU runners
 examples/                      end-to-end usage examples
 notebooks/                     Colab quickstart
+assets/                        figures used by this README
 third_party/cutlass/           CUTLASS submodule
 ```
 

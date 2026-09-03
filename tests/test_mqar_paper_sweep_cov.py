@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Coverage for paper.mqar.paper_sweep, the certified paper driver.
 
 No GPU and no training: job construction, protocol pinning, aggregation and

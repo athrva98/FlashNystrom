@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Coverage of flash_nystrom.flash_nystrom (the package entry point).
 
 Splits into (a) pure-Python / CPU paths that run without the CUDA extension

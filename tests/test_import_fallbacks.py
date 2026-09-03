@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Coverage for import-time fallback branches that only execute in a degraded
 environment (package not pip-installed, or the _C CUDA extension not built).
 

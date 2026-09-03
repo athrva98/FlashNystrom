@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 # Paired 3-seed MNIST per-pixel training: FlashNystrom vs reference. For each seed,
 # BOTH methods get identical init + identical data order (seed reset before each),
 # so the only difference is the attention kernel. Compare test accuracy per seed:
@@ -37,7 +39,7 @@ class Net(nn.Module):
         for b in s.blocks: x=b(x)
         return s.head(s.norm(x)[:,0])
 
-root=os.environ.get("CAP_DATA_ROOT","./data")
+root=os.environ.get("FN_DATA_DIR", "./data")
 train=torchvision.datasets.MNIST(root=root,train=True,download=True,transform=T.ToTensor())
 test=torchvision.datasets.MNIST(root=root,train=False,download=True,transform=T.ToTensor())
 testdl=torch.utils.data.DataLoader(test,batch_size=512,shuffle=False,num_workers=0)

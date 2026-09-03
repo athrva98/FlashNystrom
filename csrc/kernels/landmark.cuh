@@ -8,8 +8,8 @@
 
 namespace flash_nystrom {
 
-// landmark kernel: segment-mean over Q and K to produce the nystrom landmarks
-// pretty simple — each landmark is just the average of its segment
+// Landmark kernel: segment-mean over Q and K to produce the Nystrom
+// landmarks. Each landmark is the mean of its segment.
 //
 // For each landmark l in [0, m):
 //   segment = [l * seg_len, min((l+1) * seg_len, N))

@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """GPU numerical-correctness tests: the CUDA kernels vs the pure-PyTorch
 reference (the same Nystrom math via cuBLAS/autograd).
 

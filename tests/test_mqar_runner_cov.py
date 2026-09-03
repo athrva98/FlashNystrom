@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Coverage for paper.mqar.runner, the shared MQAR subprocess driver.
 
 Runs on CPU with no GPU and no real training: the subprocess layer is stubbed,

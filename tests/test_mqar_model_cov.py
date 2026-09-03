@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Exhaustive coverage of paper.mqar.model (the MQAR model + backends).
 
 Runs on CPU in fp32. The sdpa and nystrom_reference backends are pure torch;

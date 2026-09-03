@@ -2,8 +2,8 @@
  * Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
  * Licensed under the Apache License, Version 2.0
  ******************************************************************************/
-// kernel orchestration — this is where the actual forward/backward pipelines
-// get assembled from individual kernel launches. nothing fancy, just sequencing.
+// Kernel orchestration: the forward and backward pipelines are assembled here
+// from the individual kernel launches, in order.
 
 #include "flash_nystrom.h"
 #include "utils.h"

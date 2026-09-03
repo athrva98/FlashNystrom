@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Coverage of benchmarks.train_three_way train_one() and main().
 
 main() is orchestration -> smoke-tested on CPU with train_one/_max_batch_for

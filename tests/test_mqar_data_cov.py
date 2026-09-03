@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Athrva Pandhare (athrva98@gmail.com)
+# Licensed under the Apache License, Version 2.0
 """Exhaustive coverage of paper.mqar.data (MQAR dataset generation).
 
 Pure numpy/torch, CPU, fully deterministic. Covers _topk_without_replacement,
