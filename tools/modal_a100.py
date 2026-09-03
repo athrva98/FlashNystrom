@@ -51,6 +51,13 @@ image = (
         "pytest",
         "ninja",
         "numpy",
+        # Test dependencies. Without these pytest aborts at COLLECTION (exit
+        # code 2) and no kernel is ever exercised, which is a silent pass in
+        # any wrapper that only checks "did tests fail". torchvision is needed
+        # by the training-harness coverage modules, einops by the MQAR
+        # baselines.
+        "torchvision",
+        "einops",
         # setuptools + wheel are required at build time because we use
         # --no-build-isolation (pip won't provision its own build env, so
         # bdist_wheel must already be importable).
@@ -74,10 +81,18 @@ image = (
             "**/.git", "**/__pycache__", "**/*.pyc", "**/*.pyd", "**/*.so",
             "**/*.o", "**/*.a", "build/", "dist/", "**/*.egg-info",
             ".venv*/", "**/.pytest_cache",
-            # The manuscript is local-only and no kernel needs it; it also gets
-            # rewritten by latexmk, which fails the build if a compile happens
-            # to overlap the directory hash.
-            "paper/", "runs/",
+            # Exclude the MANUSCRIPT, not the paper/ package: paper/mqar/ is
+            # tracked source that the test suite imports, so pruning the whole
+            # directory makes collection fail with "No module named 'paper'".
+            # What must go is the LaTeX tree, which latexmk rewrites in place
+            # and which fails the build ("was modified during build process")
+            # if a compile overlaps the directory hash.
+            "paper/**/*.tex", "paper/**/*.pdf", "paper/**/*.bib",
+            "paper/**/*.sty", "paper/**/*.bst", "paper/**/*.aux",
+            "paper/**/*.bbl", "paper/**/*.blg", "paper/**/*.log",
+            "paper/**/*.out", "paper/**/*.toc", "paper/**/*.fls",
+            "paper/**/*.fdb_latexmk", "paper/**/*.synctex.gz",
+            "paper/.bak_*", "runs/",
             # Trim the CUTLASS tree to the header-only include/ we actually need.
             "third_party/cutlass/test", "third_party/cutlass/examples",
             "third_party/cutlass/tools", "third_party/cutlass/docs",
@@ -169,6 +184,14 @@ def _run_tests():
         ["python", "-m", "pytest", "tests/", "-q", "--tb=short"],
         cwd=REMOTE,
     )
+    if r.returncode == 2:
+        # Collection error, not test failure. Nothing ran, so this says nothing
+        # about the kernels; it is a missing test dependency in the image or an
+        # over-broad add_local_dir ignore. Both have happened, so name it.
+        raise RuntimeError(
+            "pytest exited 2: COLLECTION failed, no test executed and no kernel "
+            "was exercised. Check the image's test dependencies and the "
+            "add_local_dir ignore list above.")
     if r.returncode != 0:
         raise RuntimeError(f"pytest failed with exit code {r.returncode}")
     print(f"all tests passed on {torch.cuda.get_device_name(0)}")
