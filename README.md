@@ -22,7 +22,7 @@ The kernels borrow the FA2-era CUTLASS SM80 mma atom and the tiled-softmax with 
 
 ## Status
 
-20-epoch CIFAR-10 ViT (default settings, FP16 autocast, num_landmarks=32, newton_iter=6) reaches the same test accuracy as the SDPA and pure-PyTorch Nystromformer baselines:
+20-epoch CIFAR-10 ViT (FP16 autocast, `num_landmarks=32`, `newton_iter=6`) reaches the same test accuracy as the SDPA and pure-PyTorch Nystromformer baselines:
 
 | Config                          | test acc |
 |---------------------------------|---------:|
@@ -30,7 +30,7 @@ The kernels borrow the FA2-era CUTLASS SM80 mma atom and the tiled-softmax with 
 | Pure-PyTorch Nystromformer      |    66.3% |
 | FlashNystrom (this repo)        |    66.7% |
 
-99 tests cover forward, backward, kernel-level isolation, the production cuBLAS + CUDA-graph NS backward path, per-kernel regression against autograd-derived references, the `m > 64` reference-dispatch path, and the `kappa_star` / `fast_dk2inv` precision contracts (kernel-vs-reference consistency and gradient unbiasedness).
+1,182 tests cover forward, backward, kernel-level isolation, the production cuBLAS + CUDA-graph NS backward path, per-kernel regression against autograd-derived references, the `m > 64` reference-dispatch path, the `kappa_star` / `use_tc_pinv` / `fast_dk2inv` precision contracts (kernel-vs-reference consistency and gradient unbiasedness), and the training / MQAR / genomics harnesses.
 
 ## Install
 
@@ -60,11 +60,13 @@ Module form:
 import torch
 from flash_nystrom import FlashNystromAttention, NystromConfig
 
-# kappa_star is the Tikhonov ridge target condition number (default 5.0);
-# it keeps the Newton-Schulz pseudoinverse well-conditioned as N grows.
-# Set kappa_star=0.0 to disable the ridge (original Nystromformer formulation).
-cfg = NystromConfig(num_landmarks=64, newton_iter=6, conv_kernel_size=3,
-                    kappa_star=5.0)
+# The Tikhonov ridge (kappa_star) is OFF by default, which is the original
+# Nystromformer formulation. Three-seed sweeps found it never improved
+# end-task accuracy and sometimes cost 1-3 points: the unrolled
+# Newton-Schulz backward gives exact gradients whether or not the pinv has
+# converged, so trainability does not depend on conditioning. Set
+# kappa_star>0 only if you need a well-conditioned operator in its own right.
+cfg = NystromConfig(num_landmarks=64, newton_iter=6, conv_kernel_size=3)
 attn = FlashNystromAttention(dim=512, heads=8, config=cfg).cuda()
 
 x = torch.randn(4, 4096, 512, device="cuda", dtype=torch.float16)
@@ -81,13 +83,12 @@ q = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
 k = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
 v = torch.randn(B, H, N, D, device="cuda", dtype=torch.float16)
 
-out = flash_nystrom_attention(q, k, v, num_landmarks=64, newton_iter=6,
-                              kappa_star=5.0)
+out = flash_nystrom_attention(q, k, v, num_landmarks=64, newton_iter=6)
 ```
 
 ## Latency
 
-Forward and backward latency in milliseconds on an RTX 5060 Laptop (Blackwell consumer, 8 GB VRAM, sm_120), FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6, measured with the current default config (Tikhonov ridge `kappa_star=5`, tf32 tensor-core pseudoinverse, `fast_dk2inv`). CUDA-event timed, median of 30 fwd+bwd runs after 5 warmups; reduced rep counts at N ≥ 16384 to keep wall-clock manageable. Three implementations:
+Forward and backward latency in milliseconds on an RTX 5060 Laptop (Blackwell consumer, 8 GB VRAM, sm_120), FP16, B=1, H=4, head_dim=64, num_landmarks=32, newton_iter=6, measured with the Tikhonov ridge at `kappa_star=5`, the tf32 tensor-core pseudoinverse, and `fast_dk2inv`. Those were the defaults when this table was produced; the defaults are now `kappa_star=0` and the fp32 scalar pseudoinverse, so a rerun at stock settings would differ slightly. CUDA-event timed, median of 30 fwd+bwd runs after 5 warmups; reduced rep counts at N ≥ 16384 to keep wall-clock manageable. Three implementations:
 
 - **FN**: this repo (custom CUDA forward + cuBLAS-graphs backward).
 - **Ref**: the same Nyström algorithm written in plain PyTorch. Each matmul dispatches to cuBLAS via the `@` operator, each softmax to `torch.softmax`, each elementwise op to a torch CUDA kernel. No fusion across stages: every op is a separate launch with HBM round-trips between them, and the three softmaxes are not folded into a single pass. See `flash_nystrom/reference.py`.
@@ -410,8 +411,8 @@ for x, y in loader:
 | `newton_iter`      |       6 | NS iterations for the pseudoinverse. Backward correctness is independent of convergence. |
 | `conv_kernel_size` |       3 | Depthwise conv1d residual on V. Set to 0 to disable. |
 | `use_conv_residual`|    True | Master switch for the conv residual. |
-| `kappa_star`       |     5.0 | Tikhonov ridge target condition number: the pinv inverts `M = K2ᵀK2 + λI` with `λ = (‖K2‖₁‖K2‖∞)/kappa_star`, so `cond(M) ≤ kappa_star`. Keeps Newton-Schulz well-conditioned as `cond(K2)` grows with N. `0.0` disables the ridge (raw-K2 pinv). |
-| `use_tc_pinv`      |    True | Route the pseudoinverse through the tf32 tensor-core NS chain (faster; floor ~6e-4 vs the fp16 reference's ~1.2e-3). `m == 64` only; the fp32 scalar kernel is used otherwise. |
+| `kappa_star`       |     0.0 | Tikhonov ridge target condition number, OFF by default. When >0 the pinv inverts `M = K2ᵀK2 + λI` with `λ = (‖K2‖₁‖K2‖∞)/kappa_star`, so `cond(M) ≤ kappa_star`, keeping Newton-Schulz well-conditioned as `cond(K2)` grows with N. Three-seed sweeps found this never helps end-task accuracy and can cost 1-3 points, because the exact unrolled backward does not need a converged pinv; enable it only when the application needs a well-conditioned operator per se. |
+| `use_tc_pinv`      |   False | Route the pseudoinverse through the tf32 tensor-core NS chain. Default `False` is the faithful path: the fp32 scalar Newton-Schulz matches the pure-torch reference to ~3e-4 at every N and the full fwd+bwd is still ~3x the reference. `True` is ~4x the reference but carries an N-independent 1-3% pinv error from tf32 truncation when forming `M = K2ᵀK2`, which measured ~5 accuracy points on 3-seed STL-10 at N=2304. `m == 64` only; the fp32 scalar kernel is used otherwise. |
 | `fast_dk2inv`      |    True | Tensor-core `compute_dk2inv` in the backward (fp16/bf16 only). Casts the softmax output P to 16-bit before GEMM2 — verified zero-mean unbiased vs the exact fp32 path. Set `False` for the fp32 scalar fallback. |
 
 ## Limitations
