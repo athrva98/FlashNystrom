@@ -74,6 +74,10 @@ image = (
             "**/.git", "**/__pycache__", "**/*.pyc", "**/*.pyd", "**/*.so",
             "**/*.o", "**/*.a", "build/", "dist/", "**/*.egg-info",
             ".venv*/", "**/.pytest_cache",
+            # The manuscript is local-only and no kernel needs it; it also gets
+            # rewritten by latexmk, which fails the build if a compile happens
+            # to overlap the directory hash.
+            "paper/", "runs/",
             # Trim the CUTLASS tree to the header-only include/ we actually need.
             "third_party/cutlass/test", "third_party/cutlass/examples",
             "third_party/cutlass/tools", "third_party/cutlass/docs",
